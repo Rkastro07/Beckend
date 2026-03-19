@@ -41,9 +41,10 @@ from collections import Counter
 # CONFIGURAÇÃO
 # =========================
 TIPOS_INTERESSE = (
-    "IfcWall", "IfcSlab", "IfcDoor", "IfcWindow",
+    "IfcWall", "IfcSlab",
     "IfcColumn", "IfcBeam", "IfcStair", "IfcRoof", "IfcSanitaryTerminal"
 )
+# "IfcDoor" e "IfcWindow" removidos — bboxes sobrepõem paredes e causam leaking
 
 # Margens de tolerância
 MARGEM_PADRAO = 0.02      # 2cm
@@ -64,11 +65,11 @@ COBERTURA_CONEXAO_MIN = 0.05
 
 # Detecção de fantasma (T-junction)
 PHANTOM_NUM_BINS = 10            # bins ao longo do eixo principal
-PHANTOM_COBERTURA_MIN = 0.30     # mínimo 30% dos bins ocupados
-PHANTOM_CONCENTRACAO_MAX = 0.80  # máximo 80% dos pontos numa extremidade
-PHANTOM_FRAC_EXTREMIDADE = 0.25  # zona de extremidade = 25% de cada ponta
-PHANTOM_MIN_COMPRIMENTO = 0.50   # ignorar paredes < 50cm
-PHANTOM_MIN_PTS_POR_BIN = 5      # mínimo de pontos para bin contar
+PHANTOM_COBERTURA_MIN = 0.40     # mínimo 40% dos bins ocupados (era 30%)
+PHANTOM_CONCENTRACAO_MAX = 0.65  # máximo 65% dos pontos numa extremidade (era 80%)
+PHANTOM_FRAC_EXTREMIDADE = 0.30  # zona de extremidade = 30% de cada ponta (era 25%)
+PHANTOM_MIN_COMPRIMENTO = 0.40   # ignorar paredes < 40cm (era 50cm)
+PHANTOM_MIN_PTS_POR_BIN = 3      # mínimo de pontos para bin contar (era 5)
 
 # Escalas para teste de alinhamento
 SCALES_TO_TEST = (0.001, 0.01, 1.0, 100.0, 1000.0)
@@ -475,45 +476,48 @@ def alinhar_nuvem_com_ifc(
                 S = (P * np.array(sign)) * scl
                 # centro correto
                 center_rot = pts_center[list(perm)] * np.array(sign) * scl
-                t = ifc_center - center_rot
-                pts_test = S + t
-                score_total = 0.0
-                for obj in objetos_teste:
-                    bbox = obj['bbox']
-                    dx = bbox['xmax'] - bbox['xmin']
-                    dy = bbox['ymax'] - bbox['ymin']
-                    dz = bbox['zmax'] - bbox['zmin']
-                    volume = max(dx * dy * dz, 1e-6)
-                    m = 0.15
-                    mask = (
-                        (pts_test[:, 0] >= bbox['xmin'] - m) &
-                        (pts_test[:, 0] <= bbox['xmax'] + m) &
-                        (pts_test[:, 1] >= bbox['ymin'] - m) &
-                        (pts_test[:, 1] <= bbox['ymax'] + m) &
-                        (pts_test[:, 2] >= bbox['zmin'] - m) &
-                        (pts_test[:, 2] <= bbox['zmax'] + m)
-                    )
-                    pts_in = pts_test[mask]
-                    count = len(pts_in)
-                    if count < 5:
-                        continue
-                    # =========================
-                    # SCORE INTELIGENTE
-                    # =========================
-                    densidade = count / volume
-                    # dispersão (quanto mais compacto melhor)
-                    std = np.std(pts_in, axis=0).mean()
-                    # penaliza espalhamento absurdo
-                    penal_spread = 1.0 / (1.0 + std)
-                    score_local = densidade * penal_spread
-                    score_total += score_local
-                if score_total > melhor['score']:
-                    melhor = {
-                        'score': score_total,
-                        'R': _perm_sign_to_R(perm, sign, scl),
-                        't': t,
-                        'scale': scl
-                    }
+                t_centro = ifc_center - center_rot
+
+                # estratégia base Z (chão com chão)
+                smin = S.min(axis=0)
+                t_base = t_centro.copy()
+                t_base[2] = ifc_min[2] - smin[2]
+
+                for t in (t_centro, t_base):
+                    pts_test = S + t
+                    score_total = 0.0
+                    for obj in objetos_teste:
+                        bbox = obj['bbox']
+                        dx = bbox['xmax'] - bbox['xmin']
+                        dy = bbox['ymax'] - bbox['ymin']
+                        dz = bbox['zmax'] - bbox['zmin']
+                        volume = max(dx * dy * dz, 1e-6)
+                        m = 0.15
+                        mask = (
+                            (pts_test[:, 0] >= bbox['xmin'] - m) &
+                            (pts_test[:, 0] <= bbox['xmax'] + m) &
+                            (pts_test[:, 1] >= bbox['ymin'] - m) &
+                            (pts_test[:, 1] <= bbox['ymax'] + m) &
+                            (pts_test[:, 2] >= bbox['zmin'] - m) &
+                            (pts_test[:, 2] <= bbox['zmax'] + m)
+                        )
+                        pts_in = pts_test[mask]
+                        count = len(pts_in)
+                        if count < 5:
+                            continue
+                        # SCORE INTELIGENTE
+                        densidade = count / volume
+                        std = np.std(pts_in, axis=0).mean()
+                        penal_spread = 1.0 / (1.0 + std)
+                        score_local = densidade * penal_spread
+                        score_total += score_local
+                    if score_total > melhor['score']:
+                        melhor = {
+                            'score': score_total,
+                            'R': _perm_sign_to_R(perm, sign, scl),
+                            't': t,
+                            'scale': scl
+                        }
     # =========================
     # 6. VALIDAÇÃO FINAL
     # =========================
@@ -857,7 +861,7 @@ def classificar_status(
 
 
 # =========================
-# PÓS-PROCESSAMENTO: FANTASMA T-JUNCTION
+# PÓS-PROCESSAMENTO: FANTASMA (v3 - SUBTRAÇÃO DE PONTOS)
 # =========================
 def detectar_objetos_fantasma(
     resultados: List[Dict],
@@ -865,126 +869,85 @@ def detectar_objetos_fantasma(
     pts: np.ndarray
 ) -> List[Dict]:
     """
-    Pós-processamento que detecta paredes "fantasma" em T-junctions.
-    Uma parede fantasma é aquela classificada como COMPLETO/PARCIAL
-    mas cujos pontos estão concentrados numa única extremidade,
-    próxima a uma parede vizinha existente — indicando leaking.
+    Detecta paredes fantasma via subtração de pontos compartilhados.
+    Se a maioria dos pontos de uma parede também pertence a outra parede
+    com MAIS pontos, ela é fantasma (leaking de T-junction).
     """
     if len(resultados) == 0 or len(pts) == 0:
         return resultados
 
-    # Mapear guid → obj IFC e guid → resultado
     ifc_map = {obj['guid']: obj for obj in objetos_ifc}
-    result_map = {r['guid']: r for r in resultados}
-
     reclassificados = 0
 
-    print("\n=== DETECCAO DE OBJETOS FANTASMA (T-JUNCTION) ===")
-
+    # Pré-calcula pontos por parede (só paredes existentes)
+    wall_data = {}
     for resultado in resultados:
-        guid = resultado['guid']
-        tipo = resultado.get('tipo', '')
-        status_code = resultado['status']['code']
-
-        # Só analisar paredes classificadas como existentes
-        if tipo != 'IfcWall':
+        if resultado.get('tipo') != 'IfcWall':
             continue
-        if status_code not in ('COMPLETO', 'PARCIAL'):
+        if resultado['status']['code'] not in ('COMPLETO', 'PARCIAL', 'INICIADO'):
             continue
-
-        obj = ifc_map.get(guid)
+        obj = ifc_map.get(resultado['guid'])
         if obj is None:
             continue
+        pts_obj = filtrar_pontos_aabb(pts, obj['bbox'], MARGEM_PADRAO)
+        wall_data[resultado['guid']] = {
+            'resultado': resultado,
+            'obj': obj,
+            'num_pontos': len(pts_obj),
+            'pts': pts_obj
+        }
 
+    print("\n=== DETECCAO FANTASMA v3 (SUBTRACAO DE PONTOS) ===")
+
+    for guid, data in wall_data.items():
+        resultado = data['resultado']
+        obj = data['obj']
         bbox = obj['bbox']
-
-        # --- Determinar eixo principal via bbox ---
-        dx = bbox['xmax'] - bbox['xmin']
-        dy = bbox['ymax'] - bbox['ymin']
-
-        if dx >= dy:
-            # Eixo principal em X
-            ep1_xy = np.array([bbox['xmin'], (bbox['ymin'] + bbox['ymax']) / 2])
-            ep2_xy = np.array([bbox['xmax'], (bbox['ymin'] + bbox['ymax']) / 2])
-            axis_len = dx
-        else:
-            # Eixo principal em Y
-            ep1_xy = np.array([(bbox['xmin'] + bbox['xmax']) / 2, bbox['ymin']])
-            ep2_xy = np.array([(bbox['xmin'] + bbox['xmax']) / 2, bbox['ymax']])
-            axis_len = dy
-
-        # Skip paredes muito curtas
-        if axis_len < PHANTOM_MIN_COMPRIMENTO:
-            continue
-
-        axis_vec = ep2_xy - ep1_xy
-        axis_unit = axis_vec / axis_len
-
-        # --- Filtrar pontos dentro da bbox desta parede ---
-        margem = MARGEM_PADRAO
-        pts_obj = filtrar_pontos_aabb(pts, bbox, margem)
-
-        if len(pts_obj) < PHANTOM_MIN_PTS_POR_BIN:
-            continue
-
-        # --- Projetar pontos no eixo principal ---
-        pts_xy = pts_obj[:, :2]
-        projections = ((pts_xy - ep1_xy) @ axis_unit) / axis_len
-        projections = np.clip(projections, 0.0, 1.0)
-
-        # --- Histograma ao longo do eixo ---
-        bins = np.linspace(0.0, 1.0, PHANTOM_NUM_BINS + 1)
-        hist, _ = np.histogram(projections, bins=bins)
-
-        bins_com_pontos = int(np.count_nonzero(hist >= PHANTOM_MIN_PTS_POR_BIN))
-        cobertura_eixo = bins_com_pontos / PHANTOM_NUM_BINS
-
-        # --- Concentração nas extremidades ---
-        total_pontos = len(projections)
-        mask_inicio = projections <= PHANTOM_FRAC_EXTREMIDADE
-        mask_fim = projections >= (1.0 - PHANTOM_FRAC_EXTREMIDADE)
-
-        concentracao_inicio = float(np.count_nonzero(mask_inicio)) / total_pontos
-        concentracao_fim = float(np.count_nonzero(mask_fim)) / total_pontos
-
-        # --- Avaliar se é fantasma ---
-        eh_fantasma = False
-        extremidade_concentrada = None
-
-        if cobertura_eixo < PHANTOM_COBERTURA_MIN:
-            if concentracao_inicio > PHANTOM_CONCENTRACAO_MAX:
-                extremidade_concentrada = 'inicio'
-            elif concentracao_fim > PHANTOM_CONCENTRACAO_MAX:
-                extremidade_concentrada = 'fim'
-
-        if extremidade_concentrada is None:
-            nome = resultado.get('nome', guid[:8])
-            print(f"  Parede \"{nome}\" ({status_code}): "
-                  f"cobertura_eixo={cobertura_eixo:.2f}, "
-                  f"conc_inicio={concentracao_inicio:.2f}, "
-                  f"conc_fim={concentracao_fim:.2f} -> OK")
-            continue
-
-        # --- Verificar se a extremidade está perto de um vizinho existente ---
-        check_point = ep1_xy if extremidade_concentrada == 'inicio' else ep2_xy
-        tol = 0.30  # 30cm de tolerância
-
-        vizinho_encontrado = None
-        for other_obj in objetos_ifc:
-            if other_obj['guid'] == guid or other_obj['tipo'] != 'IfcWall':
-                continue
-            ob = other_obj['bbox']
-            if (ob['xmin'] - tol <= check_point[0] <= ob['xmax'] + tol and
-                    ob['ymin'] - tol <= check_point[1] <= ob['ymax'] + tol):
-                vizinho_result = result_map.get(other_obj['guid'])
-                if vizinho_result and vizinho_result['status']['code'] in ('COMPLETO', 'PARCIAL'):
-                    vizinho_encontrado = other_obj.get('nome', other_obj['guid'][:8])
-                    eh_fantasma = True
-                    break
-
         nome = resultado.get('nome', guid[:8])
+        status_code = resultado['status']['code']
+        meus_pontos = data['pts']
 
-        if eh_fantasma:
+        if len(meus_pontos) == 0:
+            continue
+
+        # Para cada ponto desta parede, verifica se está TAMBÉM
+        # dentro de outra parede que tem MAIS pontos
+        pontos_compartilhados = np.zeros(len(meus_pontos), dtype=bool)
+        vizinho_principal = None
+        max_pontos_vizinho = 0
+
+        for other_guid, other_data in wall_data.items():
+            if other_guid == guid:
+                continue
+            # Só compara se o outro tem mais pontos
+            if other_data['num_pontos'] <= data['num_pontos']:
+                continue
+
+            other_bbox = other_data['obj']['bbox']
+            m = MARGEM_PADRAO
+
+            # Verifica quais dos MEUS pontos estão dentro do bbox do outro
+            mask_in_other = (
+                (meus_pontos[:, 0] >= other_bbox['xmin'] - m) &
+                (meus_pontos[:, 0] <= other_bbox['xmax'] + m) &
+                (meus_pontos[:, 1] >= other_bbox['ymin'] - m) &
+                (meus_pontos[:, 1] <= other_bbox['ymax'] + m) &
+                (meus_pontos[:, 2] >= other_bbox['zmin'] - m) &
+                (meus_pontos[:, 2] <= other_bbox['zmax'] + m)
+            )
+            pontos_compartilhados |= mask_in_other
+
+            n_shared = int(np.count_nonzero(mask_in_other))
+            if n_shared > max_pontos_vizinho:
+                max_pontos_vizinho = n_shared
+                vizinho_principal = other_data['resultado'].get('nome', other_guid[:8])
+
+        total = len(meus_pontos)
+        compartilhados = int(np.count_nonzero(pontos_compartilhados))
+        frac_compartilhada = compartilhados / total
+
+        # Se >60% dos pontos são compartilhados com parede maior → fantasma
+        if frac_compartilhada > 0.60:
             resultado['status'] = {
                 'code': "AUSENTE",
                 'emoji': "❌",
@@ -993,18 +956,12 @@ def detectar_objetos_fantasma(
             }
             resultado['phantom'] = True
             reclassificados += 1
-            conc_val = concentracao_inicio if extremidade_concentrada == 'inicio' else concentracao_fim
-            print(f"  Parede \"{nome}\" ({status_code}): "
-                  f"cobertura_eixo={cobertura_eixo:.2f}, "
-                  f"conc_{extremidade_concentrada}={conc_val:.2f}")
-            print(f"    -> Vizinho \"{vizinho_encontrado}\" detectado na extremidade")
-            print(f"    -> RECLASSIFICADO: {status_code} -> AUSENTE (fantasma T-junction)")
+            print(f"  \"{nome}\" ({status_code}): {compartilhados}/{total} pontos "
+                  f"({frac_compartilhada:.0%}) compartilhados com \"{vizinho_principal}\"")
+            print(f"    -> RECLASSIFICADO -> AUSENTE (fantasma)")
         else:
-            conc_val = concentracao_inicio if extremidade_concentrada == 'inicio' else concentracao_fim
-            print(f"  Parede \"{nome}\" ({status_code}): "
-                  f"cobertura_eixo={cobertura_eixo:.2f}, "
-                  f"conc_{extremidade_concentrada}={conc_val:.2f}")
-            print(f"    -> Concentrada mas SEM vizinho existente -> MANTIDO")
+            print(f"  \"{nome}\" ({status_code}): {compartilhados}/{total} "
+                  f"({frac_compartilhada:.0%}) compartilhados -> OK")
 
     print(f"  Total reclassificados: {reclassificados}")
     print("=" * 60)
@@ -1031,13 +988,17 @@ def analisar_pavimento_completo(
     print("\n📦 Carregando nuvem de pontos...")
     pcd = o3d.io.read_point_cloud(ply_path)
     pts = np.asarray(pcd.points, dtype=float)
-    print(f"   ✓ {len(pts):,} pontos")
+    print(f"   ✓ {len(pts):,} pontos brutos")
+
+    # 1b. Deduplicação (remove pontos repetidos)
+    pts = np.unique(pts, axis=0)
+    print(f"   ✓ {len(pts):,} pontos únicos")
 
     # 2. Detecta conexões
     objetos_ifc, num_conexoes = detectar_paredes_conexao(objetos_ifc)
     objetos_ifc = marcar_conexoes_piso_teto(objetos_ifc)
 
-    # 3. Alinhamento robusto (HÍBRIDO 2.0)
+    # 3. Alinhamento robusto (v2.1)
     pts, _ = alinhar_nuvem_com_ifc(pts, objetos_ifc)
 
     # 4. Correção de orientação
