@@ -133,7 +133,7 @@ def salvar_cena(
 
 def listar_cenas() -> List[Path]:
     """Lista todos os .npz disponíveis para treino."""
-    return sorted(DATA_DIR.glob("cena_*.npz"))
+    return sorted(DATA_DIR.glob("*.npz"))
 
 
 def carregar_cena(path: Path):

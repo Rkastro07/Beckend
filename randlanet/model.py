@@ -83,7 +83,7 @@ class EncoderBlock(nn.Module):
         super().__init__()
         self.ratio = ratio
         self.lfa = LocalFeatureAggregation(in_ch, out_ch, k=k)
-        self.mlp = SharedMLP([out_ch, out_ch])
+        self.mlp = SharedMLP([in_ch, out_ch])
 
     def forward(self, xyz, features, knn_idx):
         """Random downsample + aggregate."""

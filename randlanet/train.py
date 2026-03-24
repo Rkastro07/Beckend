@@ -19,6 +19,12 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 from pathlib import Path
 
+import sys
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+sys.path.insert(0, str(Path(__file__).parent))
+
 from model import RandLANetBIM, NUM_CLASSES
 from dataset_generator import listar_cenas, carregar_cena
 
