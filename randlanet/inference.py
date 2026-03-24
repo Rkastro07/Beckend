@@ -12,12 +12,15 @@ Uso integrado (dentro do app.py):
   resultados = classificar_com_modelo(pts_alinhado, objetos_ifc, output_dir)
 """
 
+import sys
 import argparse
 import numpy as np
 import torch
 import open3d as o3d
 from pathlib import Path
 from typing import List, Dict, Optional
+
+sys.path.insert(0, str(Path(__file__).parent))
 
 from model import RandLANetBIM, NUM_CLASSES
 from dataset_generator import _estimar_normais, LABEL_MAP
@@ -32,6 +35,15 @@ NOMES_CLASSES = [
 
 # Mapa inverso: classe int → tipo IFC
 LABEL_TO_TIPO = {v: k for k, v in LABEL_MAP.items()}
+
+
+def _ifc_bbox_to_threejs(bbox: Dict) -> Dict:
+    """Converte bbox IFC (Z=altura) → Three.js (Y=altura). Y/Z swap."""
+    return {
+        'xmin': bbox['xmin'], 'xmax': bbox['xmax'],
+        'ymin': bbox['zmin'], 'ymax': bbox['zmax'],
+        'zmin': bbox['ymin'], 'zmax': bbox['ymax'],
+    }
 
 
 def _carregar_modelo(checkpoint: Path, device: torch.device) -> RandLANetBIM:
@@ -191,7 +203,7 @@ def classificar_com_modelo(
             'phantom':  False,
             'ply_file': ply_filename,
             'json_file': json_filename,
-            'bbox_normalized': bbox
+            'bbox_normalized': _ifc_bbox_to_threejs(bbox)
         })
 
         print(f"  {obj['nome']:<25} {tipo:<12} {n_pts:>8,} pts  {status['emoji']} {status['texto']}")

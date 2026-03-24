@@ -4,7 +4,7 @@ import { DataView } from './components/DataView';
 import { ReportView } from './components/ReportView';
 import { VoiceAssistant } from './components/VoiceAssistant';
 import { AppTab, Floor, AnalysisResult } from './types';
-import { listFloors, analyzeFloor } from './services/api';
+import { listFloors, analyzeFloor, analyzeFloorAI, AnalysisMode } from './services/api';
 import { LayoutDashboard, FileText, Mic } from 'lucide-react';
 
 export default function App() {
@@ -16,6 +16,8 @@ export default function App() {
   const [floors, setFloors] = useState<Floor[]>([]);
   const [selectedFloorId, setSelectedFloorId] = useState<string>('');
   const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null);
+  const [analysisResultAI, setAnalysisResultAI] = useState<AnalysisResult | null>(null);
+  const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('bbox');
   
   // File State
   const [ifcFile, setIfcFile] = useState<File | null>(null);
@@ -52,10 +54,25 @@ export default function App() {
     if (!ifcFile || !plyFile || !selectedFloorId) return;
 
     setIsProcessing(true);
+    setAnalysisResult(null);
+    setAnalysisResultAI(null);
     try {
-      const result = await analyzeFloor(ifcFile, plyFile, selectedFloorId);
-      setAnalysisResult(result);
-      setActiveTab(AppTab.VISTORIA); // Switch to results view
+      if (analysisMode === 'bbox') {
+        const result = await analyzeFloor(ifcFile, plyFile, selectedFloorId);
+        setAnalysisResult(result);
+      } else if (analysisMode === 'ai') {
+        const result = await analyzeFloorAI(ifcFile, plyFile, selectedFloorId);
+        setAnalysisResultAI(result);
+      } else {
+        // both — roda em paralelo
+        const [bbox, ai] = await Promise.all([
+          analyzeFloor(ifcFile, plyFile, selectedFloorId),
+          analyzeFloorAI(ifcFile, plyFile, selectedFloorId)
+        ]);
+        setAnalysisResult(bbox);
+        setAnalysisResultAI(ai);
+      }
+      setActiveTab(AppTab.VISTORIA);
     } catch (e) {
       console.error(e);
       alert("Falha ao processar a análise do pavimento.");
@@ -77,6 +94,8 @@ export default function App() {
         isProcessing={isProcessing}
         hasIfc={!!ifcFile}
         hasPly={!!plyFile}
+        analysisMode={analysisMode}
+        onModeChange={setAnalysisMode}
       />
 
       <main className="flex-1 ml-80 flex flex-col h-screen overflow-hidden">
@@ -121,7 +140,7 @@ export default function App() {
 
         {/* Content Area */}
         <div className="flex-1 overflow-auto bg-slate-50">
-          {activeTab === AppTab.VISTORIA && <DataView result={analysisResult} />}
+          {activeTab === AppTab.VISTORIA && <DataView result={analysisResult} resultAI={analysisResultAI} analysisMode={analysisMode} />}
           {activeTab === AppTab.RELATORIO && <ReportView result={analysisResult} csvContent={csvContent} />}
           {activeTab === AppTab.VOICE && <VoiceAssistant result={analysisResult} csvContent={csvContent} />}
         </div>

@@ -32,10 +32,13 @@ export const listFloors = async (ifcFile: File): Promise<Floor[]> => {
   }
 };
 
-export const analyzeFloor = async (
+export type AnalysisMode = 'bbox' | 'ai' | 'both';
+
+const _doAnalysis = async (
   ifcFile: File,
   plyFile: File,
-  floorId: string
+  floorId: string,
+  endpoint: string
 ): Promise<AnalysisResult> => {
   const formData = new FormData();
   formData.append('ifc_file', ifcFile);
@@ -43,7 +46,7 @@ export const analyzeFloor = async (
   formData.append('pavimento', floorId);
 
   try {
-    const response = await fetch(`${API_BASE_URL}/api/analisar_pavimento`, {
+    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
       method: 'POST',
       body: formData,
     });
@@ -107,3 +110,11 @@ export const analyzeFloor = async (
     throw error;
   }
 };
+
+export const analyzeFloor = (
+  ifcFile: File, plyFile: File, floorId: string
+): Promise<AnalysisResult> => _doAnalysis(ifcFile, plyFile, floorId, '/api/analisar_pavimento');
+
+export const analyzeFloorAI = (
+  ifcFile: File, plyFile: File, floorId: string
+): Promise<AnalysisResult> => _doAnalysis(ifcFile, plyFile, floorId, '/api/analisar_ai');

@@ -28,13 +28,26 @@ import tempfile
 import numpy as np
 
 # Hook RandLA-Net (opcional — só ativa se PyTorch estiver instalado)
+_RANDLANET_DISPONIVEL = False
+_RANDLANET_INFERENCE = False
 try:
     import sys as _sys
-    _sys.path.insert(0, str(Path(__file__).parent / "randlanet"))
+    import os.path as _osp
+    _sys.path.insert(0, _osp.join(_osp.dirname(_osp.abspath(__file__)), "randlanet"))
     from randlanet.dataset_generator import salvar_cena as _salvar_cena_dataset
     _RANDLANET_DISPONIVEL = True
-except Exception:
-    _RANDLANET_DISPONIVEL = False
+    # Tenta carregar inferência (requer PyTorch + checkpoint)
+    from randlanet.inference import classificar_com_modelo as _classificar_ai
+    import os as _os
+    _CHECKPOINT = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "randlanet", "checkpoints", "best.pth")
+    _CHECKPOINT_EXISTS = _os.path.exists(_CHECKPOINT)
+    if _CHECKPOINT_EXISTS:
+        _RANDLANET_INFERENCE = True
+        print("🤖 RandLA-Net: modelo carregado (use_ai disponível)")
+    else:
+        print("🤖 RandLA-Net: checkpoint não encontrado, use_ai indisponível")
+except Exception as _e:
+    print(f"⚠️  RandLA-Net não disponível: {_e}")
 import ifcopenshell
 import ifcopenshell.geom
 import open3d as o3d
@@ -1237,6 +1250,7 @@ def analisar_pavimento():
         ifc_file = request.files.get('ifc_file')
         ply_file = request.files.get('ply_file')
         pav_alvo = request.form.get('pavimento')
+        use_ai = request.form.get('use_ai', 'false').lower() == 'true'
 
         if not ifc_file:
             return jsonify({'error': 'Arquivo IFC não enviado'}), 400
@@ -1263,17 +1277,38 @@ def analisar_pavimento():
         output_session = OUTPUT_FOLDER / session_id
         output_session.mkdir(parents=True, exist_ok=True)
 
-        # Análise completa
+        # Análise completa (bbox-based)
         resultados, estatisticas, pts_alinhados, objetos_processados = analisar_pavimento_completo(
             objetos,
             str(ply_path),
             output_session
         )
 
-        # Pós-processamento separado: detectar fantasmas T-junction
-        resultados = detectar_objetos_fantasma(resultados, objetos_processados, pts_alinhados)
+        # ── MODO AI (opcional) ─────────────────────────────────
+        modo_usado = "bbox"
+        if use_ai and _RANDLANET_INFERENCE:
+            print("\n🤖 Modo AI ativado — rodando RandLA-Net...")
+            try:
+                resultados_ai = _classificar_ai(
+                    pts_alinhados, objetos_processados, output_session
+                )
+                if resultados_ai is not None:
+                    resultados = resultados_ai
+                    modo_usado = "ai"
+                    print("✅ Análise AI concluída")
+                else:
+                    print("⚠️  AI retornou None — usando bbox")
+            except Exception as e_ai:
+                print(f"❌ Erro AI: {e_ai} — usando bbox")
+        elif use_ai and not _RANDLANET_INFERENCE:
+            print("⚠️  use_ai=true mas modelo não disponível — usando bbox")
 
-        # Recalcular estatísticas após detecção de fantasma
+        # ── PÓS-PROCESSAMENTO ──────────────────────────────────
+        if modo_usado == "bbox":
+            # Phantom detection só faz sentido no modo bbox
+            resultados = detectar_objetos_fantasma(resultados, objetos_processados, pts_alinhados)
+
+        # Recalcular estatísticas
         stats = Counter([r['status']['code'] for r in resultados])
         total = len(resultados)
         estatisticas = {
@@ -1292,14 +1327,104 @@ def analisar_pavimento():
 
         # Ajusta caminhos dos arquivos
         for r in resultados:
-            if r['json_file']:
+            if r.get('json_file'):
                 r['json_file'] = f"{session_id}/{r['json_file']}"
-            if r['ply_file']:
+            if r.get('ply_file'):
                 r['ply_file'] = f"{session_id}/{r['ply_file']}"
 
         return jsonify({
             'pavimento': pav_alvo,
             'session_id': session_id,
+            'modo': modo_usado,
+            'estatisticas': estatisticas,
+            'resultados': resultados
+        })
+
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/analisar_ai', methods=['POST'])
+def analisar_ai():
+    """Análise usando SOMENTE RandLA-Net (sem bbox/phantom). Para comparação."""
+    try:
+        if not _RANDLANET_INFERENCE:
+            return jsonify({'error': 'RandLA-Net não disponível (checkpoint ausente)'}), 503
+
+        ifc_file = request.files.get('ifc_file')
+        ply_file = request.files.get('ply_file')
+        pav_alvo = request.form.get('pavimento')
+
+        if not ifc_file:
+            return jsonify({'error': 'Arquivo IFC não enviado'}), 400
+        if not ply_file:
+            return jsonify({'error': 'Arquivo PLY não enviado'}), 400
+        if not pav_alvo:
+            return jsonify({'error': 'Pavimento não especificado'}), 400
+
+        session_id = str(uuid.uuid4())
+        ifc_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ifc_file.filename)}"
+        ply_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ply_file.filename)}"
+        ifc_file.save(str(ifc_path))
+        ply_file.save(str(ply_path))
+
+        objetos = extrair_objetos_por_pavimento(str(ifc_path), pav_alvo)
+        if not objetos:
+            return jsonify({'error': f'Nenhum objeto no pavimento "{pav_alvo}"'}), 400
+
+        output_session = OUTPUT_FOLDER / session_id
+        output_session.mkdir(parents=True, exist_ok=True)
+
+        # Pipeline de alinhamento (mesmo do bbox)
+        print("\n" + "=" * 70)
+        print("ANALISE AI-ONLY (RandLA-Net)")
+        print("=" * 70)
+
+        pcd = o3d.io.read_point_cloud(str(ply_path))
+        pts = np.asarray(pcd.points, dtype=float)
+        pts = np.unique(pts, axis=0)
+        print(f"   Pontos: {len(pts):,}")
+
+        objetos, _ = detectar_paredes_conexao(objetos)
+        objetos = marcar_conexoes_piso_teto(objetos)
+        pts, _ = alinhar_nuvem_com_ifc(pts, objetos)
+        pts, _, _ = corrigir_orientacao_por_pico_vertical(pts, objetos)
+        pts, _, objetos = normalizar_coordenadas(pts, objetos)
+
+        # Somente AI — sem bbox analysis, sem phantom
+        resultados = _classificar_ai(pts, objetos, output_session)
+
+        if resultados is None:
+            return jsonify({'error': 'Inferência AI falhou'}), 500
+
+        # Estatísticas
+        stats = Counter([r['status']['code'] for r in resultados])
+        total = len(resultados)
+        estatisticas = {
+            'total': total,
+            'completos': stats.get('COMPLETO', 0),
+            'parciais': stats.get('PARCIAL', 0),
+            'iniciados': stats.get('INICIADO', 0),
+            'ausentes': stats.get('AUSENTE', 0),
+            'conexoes': 0,
+            'progresso_geral': round(
+                (stats.get('COMPLETO', 0) +
+                 stats.get('PARCIAL', 0) * 0.5 +
+                 stats.get('INICIADO', 0) * 0.1) /
+                total * 100, 1) if total > 0 else 0
+        }
+
+        for r in resultados:
+            if r.get('json_file'):
+                r['json_file'] = f"{session_id}/{r['json_file']}"
+            if r.get('ply_file'):
+                r['ply_file'] = f"{session_id}/{r['ply_file']}"
+
+        return jsonify({
+            'pavimento': pav_alvo,
+            'session_id': session_id,
+            'modo': 'ai',
             'estatisticas': estatisticas,
             'resultados': resultados
         })

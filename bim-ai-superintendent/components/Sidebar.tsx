@@ -1,6 +1,7 @@
 import React from 'react';
-import { Upload, FileText, Layers, Key, PlayCircle } from 'lucide-react';
+import { Upload, FileText, Layers, Key, PlayCircle, Box, Brain, GitCompare } from 'lucide-react';
 import { Floor } from '../types';
+import { AnalysisMode } from '../services/api';
 
 interface SidebarProps {
   floors: Floor[];
@@ -13,6 +14,8 @@ interface SidebarProps {
   isProcessing: boolean;
   hasIfc: boolean;
   hasPly: boolean;
+  analysisMode: AnalysisMode;
+  onModeChange: (mode: AnalysisMode) => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -25,7 +28,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onProcess,
   isProcessing,
   hasIfc,
-  hasPly
+  hasPly,
+  analysisMode,
+  onModeChange
 }) => {
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>, callback: (f: File) => void) => {
     if (e.target.files && e.target.files[0]) {
@@ -112,6 +117,36 @@ export const Sidebar: React.FC<SidebarProps> = ({
           {floors.length === 0 && (
             <p className="text-[10px] text-amber-500">* Carregue um IFC para listar andares</p>
           )}
+        </div>
+
+        {/* Analysis Mode */}
+        <div className="space-y-2">
+          <label className="text-sm font-medium text-slate-300">Modo de Análise</label>
+          <div className="flex rounded-lg overflow-hidden border border-slate-600">
+            {([
+              { mode: 'bbox' as AnalysisMode, label: 'BBox', icon: Box },
+              { mode: 'ai' as AnalysisMode, label: 'AI', icon: Brain },
+              { mode: 'both' as AnalysisMode, label: 'Ambos', icon: GitCompare },
+            ]).map(({ mode, label, icon: Icon }) => (
+              <button
+                key={mode}
+                onClick={() => onModeChange(mode)}
+                className={`flex-1 py-2 px-2 text-xs font-semibold flex items-center justify-center gap-1 transition-colors
+                  ${analysisMode === mode
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
+                  }`}
+              >
+                <Icon className="w-3.5 h-3.5" />
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="text-[10px] text-slate-500">
+            {analysisMode === 'bbox' && 'Geometria (bounding box + anti-leaking)'}
+            {analysisMode === 'ai' && 'RandLA-Net (rede neural por ponto)'}
+            {analysisMode === 'both' && 'Compara BBox vs AI lado a lado'}
+          </p>
         </div>
 
         {/* CSV Optional */}

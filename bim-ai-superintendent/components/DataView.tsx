@@ -598,24 +598,44 @@ const BimBoundingBox: React.FC<{ item: any }> = ({ item }) => {
 };
 
 // --- COMPONENTE PRINCIPAL ---
-export const DataView: React.FC<{ result: AnalysisResult | null }> = ({ result }) => {
+export const DataView: React.FC<{
+  result: AnalysisResult | null;
+  resultAI?: AnalysisResult | null;
+  analysisMode?: 'bbox' | 'ai' | 'both';
+}> = ({ result, resultAI, analysisMode = 'bbox' }) => {
 
-  console.log("DADOS CHEGANDO NO DATAVIEW:", result);
+  // Determina qual resultado exibir
+  const activeResult = analysisMode === 'ai' ? resultAI : result;
 
-  if (!result) {
+  console.log("DADOS CHEGANDO NO DATAVIEW:", activeResult, "modo:", analysisMode);
+
+  if (!activeResult && analysisMode !== 'both') {
+    return <div className="p-10 text-slate-500">Aguardando dados...</div>;
+  }
+  if (analysisMode === 'both' && !result && !resultAI) {
+    return <div className="p-10 text-slate-500">Aguardando dados...</div>;
+  }
+
+  // No modo "both", mostra comparação
+  const displayResult = activeResult || result || resultAI;
+  if (!displayResult) {
     return <div className="p-10 text-slate-500">Aguardando dados...</div>;
   }
 
   // Suporta ambos os formatos: novo (resultados/estatisticas) e antigo (items/summary)
-  const resultados = result.resultados || result.items || [];
-  const estatisticas = result.estatisticas || {
-    total: result.summary?.total_elements || 0,
+  const resultados = displayResult.resultados || displayResult.items || [];
+  const estatisticas = displayResult.estatisticas || {
+    total: displayResult.summary?.total_elements || 0,
     completos: 0,
     parciais: 0,
     iniciados: 0,
     ausentes: 0,
-    progresso_geral: result.summary?.progress_percentage || 0
+    progresso_geral: displayResult.summary?.progress_percentage || 0
   };
+
+  // Dados AI para comparação no modo "both"
+  const resultadosAI = resultAI?.resultados || resultAI?.items || [];
+  const estatisticasAI = resultAI?.estatisticas || null;
 
   if (resultados.length === 0) {
     return <div className="p-10 text-slate-500">Nenhum objeto encontrado.</div>;
@@ -771,13 +791,22 @@ export const DataView: React.FC<{ result: AnalysisResult | null }> = ({ result }
           {/* Cards */}
           <div className="grid grid-cols-2 gap-4">
             <div className="bg-white p-4 rounded shadow border border-slate-200">
-              <div className="text-xs text-slate-500">Progresso</div>
+              <div className="text-xs text-slate-500">
+                {analysisMode === 'both' ? 'Progresso BBox' : 'Progresso'}
+              </div>
               <div className="text-2xl font-bold">{estatisticas.progresso_geral.toFixed(0)}%</div>
             </div>
-            <div className="bg-white p-4 rounded shadow border border-slate-200">
-              <div className="text-xs text-slate-500">Elementos</div>
-              <div className="text-2xl font-bold">{estatisticas.completos + estatisticas.parciais}/{estatisticas.total}</div>
-            </div>
+            {analysisMode === 'both' && estatisticasAI ? (
+              <div className="bg-white p-4 rounded shadow border border-purple-300">
+                <div className="text-xs text-purple-500">Progresso AI</div>
+                <div className="text-2xl font-bold text-purple-700">{estatisticasAI.progresso_geral.toFixed(0)}%</div>
+              </div>
+            ) : (
+              <div className="bg-white p-4 rounded shadow border border-slate-200">
+                <div className="text-xs text-slate-500">Elementos</div>
+                <div className="text-2xl font-bold">{estatisticas.completos + estatisticas.parciais}/{estatisticas.total}</div>
+              </div>
+            )}
           </div>
 
           {/* Gráfico */}
@@ -835,6 +864,7 @@ export const DataView: React.FC<{ result: AnalysisResult | null }> = ({ result }
                 <th className="text-left px-4 py-2 font-medium text-slate-600">Nome</th>
                 <th className="text-left px-4 py-2 font-medium text-slate-600">Tipo</th>
                 <th className="text-center px-4 py-2 font-medium text-slate-600">Status</th>
+                {analysisMode === 'both' && <th className="text-center px-4 py-2 font-medium text-purple-600">Status AI</th>}
                 <th className="text-center px-2 py-2 font-medium text-slate-600" title="Visibilidade">👁️</th>
                 <th className="text-center px-4 py-2 font-medium text-slate-600">Cobertura</th>
                 <th className="text-center px-4 py-2 font-medium text-slate-600">Altura (Exec/Plan)</th>
@@ -856,6 +886,24 @@ export const DataView: React.FC<{ result: AnalysisResult | null }> = ({ result }
                       {item.status.emoji} {item.status.texto}
                     </span>
                   </td>
+                  {analysisMode === 'both' && (() => {
+                    const aiItem = resultadosAI.find((ai: any) => ai.guid === item.guid);
+                    const aiStatus = aiItem?.status;
+                    return (
+                      <td className="px-4 py-2 text-center">
+                        {aiStatus ? (
+                          <span className={`px-2 py-1 rounded text-xs font-medium ${
+                            aiStatus.code === 'COMPLETO' ? 'bg-purple-100 text-purple-700' :
+                            aiStatus.code === 'PARCIAL' ? 'bg-purple-50 text-purple-600' :
+                            aiStatus.code === 'INICIADO' ? 'bg-purple-50 text-purple-500' :
+                            'bg-red-50 text-red-600'
+                          }`}>
+                            {aiStatus.emoji} {aiStatus.texto}
+                          </span>
+                        ) : <span className="text-slate-400">-</span>}
+                      </td>
+                    );
+                  })()}
                   <td
                     className="px-2 py-2 text-center cursor-pointer hover:bg-slate-100 text-lg"
                     onClick={() => toggleItemVisibility(item.guid, item.status.code)}
