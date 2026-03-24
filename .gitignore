@@ -3,3 +3,13 @@ __pycache__/
 *.pyc
 .env
 .env.local
+
+# Dataset (muito grande para git)
+dataset/
+randlanet/data/*.npz
+randlanet/data/debug_report.json
+randlanet/checkpoints/
+
+# Temp
+nul
+server_test_output.txt

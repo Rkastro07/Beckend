@@ -26,6 +26,15 @@ if sys.stderr.encoding != 'utf-8':
 import random
 import tempfile
 import numpy as np
+
+# Hook RandLA-Net (opcional — só ativa se PyTorch estiver instalado)
+try:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent / "randlanet"))
+    from randlanet.dataset_generator import salvar_cena as _salvar_cena_dataset
+    _RANDLANET_DISPONIVEL = True
+except Exception:
+    _RANDLANET_DISPONIVEL = False
 import ifcopenshell
 import ifcopenshell.geom
 import open3d as o3d
@@ -1160,6 +1169,13 @@ def analisar_pavimento_completo(
     print(f"   ❌ Ausentes:  {estatisticas['ausentes']}")
     print(f"   🔗 Conexões:  {estatisticas['conexoes']}")
     print(f"   📈 Progresso: {estatisticas['progresso_geral']:.1f}%")
+
+    # === HOOK RANDLA-NET: salva cena rotulada para treino ===
+    if _RANDLANET_DISPONIVEL:
+        try:
+            _salvar_cena_dataset(pts, objetos_ifc)
+        except Exception as _e:
+            print(f"  ⚠️ [Dataset] Erro ao salvar cena: {_e}")
 
     return resultados, estatisticas, pts, objetos_ifc
 

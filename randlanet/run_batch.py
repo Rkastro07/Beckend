@@ -37,7 +37,7 @@ try:
         corrigir_orientacao_por_pico_vertical,
         normalizar_coordenadas,
         detectar_paredes_conexao,
-        markar_conexoes_piso_teto,
+        marcar_conexoes_piso_teto,
     )
 except ImportError as e:
     print(f"❌ Erro ao importar app.py: {e}")
@@ -66,18 +66,35 @@ MIN_PONTOS_PLY = 1_000        # PLY vazio se tiver menos que isso
 def _scan_dataset(dataset_dir: Path):
     """
     Escaneia o diretório e retorna pares matched + arquivos sem par.
+    Suporta estrutura plana (raiz) ou com subdirs ifc/ e ply/.
+
     Retorna:
         matched   : dict {stem: (ifc_path, ply_path)}
         ifc_only  : list de stems com .ifc mas sem .ply
         ply_only  : list de stems com .ply mas sem .ifc
     """
-    ifc_files = {p.stem.lower(): p for p in dataset_dir.glob("*.ifc")}
-    ply_files = {p.stem.lower(): p for p in dataset_dir.glob("*.ply")}
+    # Detecta automaticamente subdirs ifc/ e ply/
+    ifc_dir = dataset_dir / "ifc" if (dataset_dir / "ifc").is_dir() else dataset_dir
+    ply_dir = dataset_dir / "ply" if (dataset_dir / "ply").is_dir() else dataset_dir
+
+    print(f"   📂 IFC dir : {ifc_dir}")
+    print(f"   📂 PLY dir : {ply_dir}")
+
+    ifc_files = {p.stem.lower(): p for p in ifc_dir.glob("*.ifc")}
+    ply_files = {p.stem.lower(): p for p in ply_dir.glob("*.ply")}
+
+    print(f"   📄 IFC encontrados : {len(ifc_files)}")
+    print(f"   📄 PLY encontrados : {len(ply_files)}")
 
     # Match case-insensitive pelo stem
     matched_keys = set(ifc_files.keys()) & set(ply_files.keys())
     ifc_only = sorted(set(ifc_files.keys()) - matched_keys)
     ply_only = sorted(set(ply_files.keys()) - matched_keys)
+
+    if ifc_only:
+        print(f"   ⚠️  Sem PLY ({len(ifc_only)}): {', '.join(ifc_only)}")
+    if ply_only:
+        print(f"   ⚠️  Sem IFC ({len(ply_only)}): {', '.join(ply_only)}")
 
     matched = {
         k: (ifc_files[k], ply_files[k])
@@ -203,7 +220,7 @@ def _processar_pavimento(stem: str, pav: str, ifc_path: Path,
 
         # ── Detecta conexões ────────────────────────────────
         objetos, _ = detectar_paredes_conexao(objetos)
-        objetos = markar_conexoes_piso_teto(objetos)
+        objetos = marcar_conexoes_piso_teto(objetos)
 
         # ── Alinhamento ─────────────────────────────────────
         pts_alinhado, transf = alinhar_nuvem_com_ifc(pts, objetos)
