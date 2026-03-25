@@ -394,94 +394,84 @@ def segmentar_instancias(
         if cnt > 0:
             print(f"    {i}: {nome:<22} {cnt:>8,} pts")
 
-    # ── 3. DBSCAN → instâncias ────────────────────────────────────────
+    # ── 3. DBSCAN → instâncias (100% independente do IFC) ─────────────
     inst_ids = _clusterizar_instancias(pts_alinhado, pred_labels, pred_offsets)
-    n_dbscan = int(inst_ids.max()) if inst_ids.max() > 0 else 0
-    print(f"  {n_dbscan} clusters brutos pelo DBSCAN")
+    n_inst = int(inst_ids.max()) if inst_ids.max() > 0 else 0
+    print(f"  {n_inst} instancias detectadas pela IA")
 
-    # ── 3b. Fusão por IFC (une fragmentos do mesmo objeto) ────────────
-    if objetos_ifc:
-        inst_ids = _fundir_por_ifc(pts_alinhado, pred_labels, inst_ids, objetos_ifc)
-        n_fundido = int(inst_ids.max()) if inst_ids.max() > 0 else 0
-        print(f"  {n_fundido} instancias apos fusao por bbox IFC  (eram {n_dbscan})")
-    else:
-        n_fundido = n_dbscan
-
-    # ── 4. Cruza com IFC ──────────────────────────────────────────────
-    inst_to_ifc = _cruzar_com_ifc(pts_alinhado, pred_labels, inst_ids, objetos_ifc)
-
-    # ── 5. Monta resultados ───────────────────────────────────────────
+    # ── 4. Monta resultados — cada cluster = 1 objeto detectado ──────
+    #    Nomes automáticos: Parede_1, Parede_2, Laje_1, etc.
+    #    Bbox calculada dos próprios pontos (sem IFC)
     output_dir = Path(output_dir)
     resultados = []
 
-    for iid in sorted(inst_to_ifc.keys()):
-        obj    = inst_to_ifc[iid]
-        mask   = (inst_ids == iid)
+    # Contador por tipo para nomes legíveis
+    contadores_tipo = {}
+
+    def _n(v):
+        return v.item() if hasattr(v, 'item') else v
+
+    for iid in range(1, n_inst + 1):
+        mask = (inst_ids == iid)
+        if mask.sum() == 0:
+            continue
+
         pts_obj = pts_alinhado[mask]
+        n_pts   = int(mask.sum())
         classe  = int(np.bincount(pred_labels[mask].astype(np.int64)).argmax())
+        tipo    = NOMES_CLASSES[classe] if classe < len(NOMES_CLASSES) else "unknown"
 
-        ply_f, json_f, _ = _exportar_instancia(pts_obj, iid, obj, classe, output_dir)
+        # Nome automático: Parede_1, Parede_2, Laje_1...
+        NOMES_PT = {
+            'IfcWall': 'Parede', 'IfcSlab': 'Laje', 'IfcColumn': 'Coluna',
+            'IfcBeam': 'Viga', 'IfcStair': 'Escada', 'IfcRoof': 'Cobertura',
+            'IfcSanitaryTerminal': 'Sanitario', 'background': 'Fundo',
+        }
+        nome_tipo = NOMES_PT.get(tipo, tipo)
+        contadores_tipo[tipo] = contadores_tipo.get(tipo, 0) + 1
+        nome = f"{nome_tipo}_{contadores_tipo[tipo]}"
+        guid = f"ai_inst_{iid:04d}"
 
-        n_pts  = len(pts_obj)
-        tipo   = NOMES_CLASSES[classe] if classe < len(NOMES_CLASSES) else "unknown"
+        # Bbox dos próprios pontos do cluster
+        mn = pts_obj.min(axis=0)
+        mx = pts_obj.max(axis=0)
+        bbox_raw = {
+            'xmin': float(mn[0]), 'xmax': float(mx[0]),
+            'ymin': float(mn[1]), 'ymax': float(mx[1]),
+            'zmin': float(mn[2]), 'zmax': float(mx[2]),
+        }
+        bbox_3js = _ifc_bbox_to_threejs(bbox_raw)
 
-        # Volume e cobertura a partir do IFC se disponível
-        if obj:
-            bbox = obj['bbox']
-            vol  = max(
-                (bbox['xmax'] - bbox['xmin']) *
-                (bbox['ymax'] - bbox['ymin']) *
-                (bbox['zmax'] - bbox['zmin']),
-                1e-6
-            )
-            cobertura = min(n_pts / (vol * 50), 1.0)
-            nome      = obj['nome']
-            guid      = obj['guid']
-            pavimento = obj.get('pavimento', '')
-            bbox_3js  = _ifc_bbox_to_threejs(bbox)
-        else:
-            # Instância sem correspondência IFC — bbox pelo próprio cluster
-            vol       = 1.0
-            cobertura = 1.0   # detectada pela IA, sem referência IFC
-            nome      = f"{tipo}_inst{iid:03d}"
-            guid      = f"inst_{iid:06d}"
-            pavimento = ''
-            # Bbox pelo bounding box dos pontos do cluster
-            mn = pts_obj.min(axis=0)
-            mx = pts_obj.max(axis=0)
-            bbox_raw = {'xmin': mn[0], 'xmax': mx[0],
-                        'ymin': mn[1], 'ymax': mx[1],
-                        'zmin': mn[2], 'zmax': mx[2]}
-            bbox_3js = _ifc_bbox_to_threejs(bbox_raw)
+        # Volume do cluster
+        dx = float(mx[0] - mn[0])
+        dy = float(mx[1] - mn[1])
+        dz = float(mx[2] - mn[2])
+        vol = max(dx * dy * dz, 1e-6)
 
-        if cobertura >= 0.80:
-            status = {'code': 'COMPLETO', 'emoji': 'ok', 'texto': 'Completo', 'cor': '#4caf50'}
-        elif cobertura >= 0.40:
-            status = {'code': 'PARCIAL',  'emoji': 'av', 'texto': 'Parcial',  'cor': '#ff9800'}
-        elif cobertura >= 0.10:
-            status = {'code': 'INICIADO', 'emoji': 'in', 'texto': 'Iniciado', 'cor': '#2196f3'}
-        else:
-            status = {'code': 'AUSENTE',  'emoji': 'xx', 'texto': 'Ausente',  'cor': '#f44336'}
+        ply_f, json_f, _ = _exportar_instancia(pts_obj, iid, None, classe, output_dir)
+
+        # Status baseado na quantidade de pontos (sem referência IFC)
+        status = {'code': 'DETECTADO', 'emoji': 'ok', 'texto': 'Detectado', 'cor': '#4caf50'}
 
         resultados.append({
-            'guid':          guid,
-            'nome':          nome,
-            'tipo':          tipo,
-            'pavimento':     pavimento,
-            'inst_id':       iid,
-            'volume_ifc':    round(vol, 2),
-            'pontos':        n_pts,
-            'densidade':     round(n_pts / vol, 1),
-            'cobertura':     round(cobertura * 100, 1),
-            'status':        status,
-            'eh_conexao':    obj.get('eh_conexao', False) if obj else False,
-            'phantom':       False,
-            'ply_file':      ply_f,
-            'json_file':     json_f,
-            'bbox_normalized': bbox_3js,
+            'guid':            guid,
+            'nome':            nome,
+            'tipo':            tipo,
+            'pavimento':       '',
+            'inst_id':         int(_n(iid)),
+            'volume_ifc':      float(round(vol, 2)),
+            'pontos':          n_pts,
+            'densidade':       float(round(n_pts / vol, 1)),
+            'cobertura':       100.0,
+            'status':          status,
+            'eh_conexao':      False,
+            'phantom':         False,
+            'ply_file':        ply_f,
+            'json_file':       json_f,
+            'bbox_normalized': {k: float(v) for k, v in bbox_3js.items()},
         })
 
-        print(f"  [{iid:3d}] {nome:<28} {tipo:<22} {n_pts:>7,} pts  {status['texto']}")
+        print(f"  [{iid:3d}] {nome:<28} {tipo:<22} {n_pts:>7,} pts  dims={dx:.2f}x{dy:.2f}x{dz:.2f}")
 
     return resultados
 

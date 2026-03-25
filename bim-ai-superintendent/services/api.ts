@@ -1,6 +1,6 @@
 import { Floor, AnalysisResult, BimItem } from '../types';
 
-const API_BASE_URL = 'http://localhost:8080';
+const API_BASE_URL = 'http://localhost:9090';
 
 export const listFloors = async (ifcFile: File): Promise<Floor[]> => {
   const formData = new FormData();
@@ -32,7 +32,7 @@ export const listFloors = async (ifcFile: File): Promise<Floor[]> => {
   }
 };
 
-export type AnalysisMode = 'bbox' | 'ai' | 'both';
+export type AnalysisMode = 'bbox' | 'ai' | 'both' | 'instances';
 
 const _doAnalysis = async (
   ifcFile: File,
@@ -57,11 +57,38 @@ const _doAnalysis = async (
     }
     
     const json = await response.json();
-    
+
     // Garante que o frontend receba o formato certo
     const items: BimItem[] = json.resultados || [];
-    
-    // Calcula estatísticas para o gráfico
+    const modo = json.modo || '';
+
+    // Instâncias: estatísticas simplificadas (só conta detectados)
+    if (modo === 'instancias') {
+      const detectados = items.filter((i: any) => i.status.code === 'DETECTADO').length;
+      return {
+        pavimento: floorId,
+        floor_id: floorId,
+        session_id: json.session_id || 'unknown',
+        timestamp: new Date().toISOString(),
+        items, resultados: items,
+        modo: 'instancias',
+        estatisticas: {
+          total: items.length,
+          completos: 0, parciais: 0, iniciados: 0, ausentes: 0,
+          detectados,
+          progresso_geral: detectados > 0 ? 100 : 0
+        },
+        summary: {
+          total_elements: items.length,
+          executed_elements: detectados,
+          progress_percentage: 100,
+          status_by_category: {},
+          risks_detected: []
+        }
+      };
+    }
+
+    // Calcula estatísticas para o gráfico (bbox/ai)
     const total = items.length;
     const executed = items.filter((i: any) => i.status.code === 'COMPLETO' || i.status.code === 'PARCIAL').length;
     const percentage = total > 0 ? (executed / total) * 100 : 0;
@@ -118,3 +145,7 @@ export const analyzeFloor = (
 export const analyzeFloorAI = (
   ifcFile: File, plyFile: File, floorId: string
 ): Promise<AnalysisResult> => _doAnalysis(ifcFile, plyFile, floorId, '/api/analisar_ai');
+
+export const analyzeFloorInstances = (
+  ifcFile: File, plyFile: File, floorId: string
+): Promise<AnalysisResult> => _doAnalysis(ifcFile, plyFile, floorId, '/api/analisar_instancias');

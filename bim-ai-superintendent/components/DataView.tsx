@@ -555,6 +555,44 @@ const MeasureTool: React.FC = () => {
 
 // --- COMPONENTE DE BOUNDING BOX ---
 
+// --- HITBOX CLICÁVEL (seleção de objetos no 3D) ---
+const SelectableHitbox: React.FC<{
+  item: any;
+  isSelected: boolean;
+  onSelect: (guid: string) => void;
+}> = ({ item, isSelected, onSelect }) => {
+  const bbox = item.bbox_normalized || item.bbox;
+  if (!bbox) return null;
+
+  const { xmin, xmax, ymin, ymax, zmin, zmax } = bbox;
+  const width = Math.abs(xmax - xmin);
+  const height = Math.abs(ymax - ymin);
+  const depth = Math.abs(zmax - zmin);
+
+  if (width < 0.01 || height < 0.01 || depth < 0.01) return null;
+
+  const center = new THREE.Vector3(
+    xmin + width / 2, ymin + height / 2, zmin + depth / 2
+  );
+
+  return (
+    <group position={center}>
+      {/* Hitbox invisível para capturar cliques */}
+      <mesh onClick={(e) => { e.stopPropagation(); onSelect(item.guid); }}>
+        <boxGeometry args={[width, height, depth]} />
+        <meshBasicMaterial visible={false} />
+      </mesh>
+      {/* Highlight quando selecionado */}
+      {isSelected && (
+        <mesh>
+          <boxGeometry args={[width + 0.05, height + 0.05, depth + 0.05]} />
+          <meshBasicMaterial color="#00ffff" wireframe transparent opacity={0.8} />
+        </mesh>
+      )}
+    </group>
+  );
+};
+
 const BimBoundingBox: React.FC<{ item: any }> = ({ item }) => {
   // Verifica se bbox existe (compatibilidade com ambos formatos)
   const bbox = item.bbox_normalized || item.bbox;
@@ -601,7 +639,7 @@ const BimBoundingBox: React.FC<{ item: any }> = ({ item }) => {
 export const DataView: React.FC<{
   result: AnalysisResult | null;
   resultAI?: AnalysisResult | null;
-  analysisMode?: 'bbox' | 'ai' | 'both';
+  analysisMode?: 'bbox' | 'ai' | 'both' | 'instances';
 }> = ({ result, resultAI, analysisMode = 'bbox' }) => {
 
   // Determina qual resultado exibir
@@ -643,6 +681,17 @@ export const DataView: React.FC<{
 
   console.log("Primeiro objeto:", resultados[0]);
   console.log("Total de objetos:", resultados.length);
+
+  // --- ESTADO DE SELEÇÃO ---
+  const [selectedGuid, setSelectedGuid] = useState<string | null>(null);
+  const tableRowRefs = useRef<Record<string, HTMLTableRowElement | null>>({});
+
+  // Quando seleciona no 3D, scrolla até a linha na tabela
+  useEffect(() => {
+    if (selectedGuid && tableRowRefs.current[selectedGuid]) {
+      tableRowRefs.current[selectedGuid]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }, [selectedGuid]);
 
   // --- ESTADO DE VISIBILIDADE ---
   const [hiddenCategories, setHiddenCategories] = useState<Set<string>>(new Set());
@@ -714,10 +763,11 @@ export const DataView: React.FC<{
 
   // Agrupa por tipo para o gráfico
   const statusByType = resultados.reduce((acc: any, item) => {
-    if (!acc[item.tipo]) acc[item.tipo] = { total: 0, completo: 0, parcial: 0 };
+    if (!acc[item.tipo]) acc[item.tipo] = { total: 0, completo: 0, parcial: 0, detectado: 0 };
     acc[item.tipo].total++;
     if (item.status.code === 'COMPLETO') acc[item.tipo].completo++;
     if (item.status.code === 'PARCIAL') acc[item.tipo].parcial++;
+    if (item.status.code === 'DETECTADO') acc[item.tipo].detectado++;
     return acc;
   }, {});
 
@@ -726,6 +776,7 @@ export const DataView: React.FC<{
     Total: stats.total,
     Completo: stats.completo,
     Parcial: stats.parcial,
+    Detectado: stats.detectado || 0,
   }));
 
   // IMPORTANT: Removed h-full and overflow-y-auto from here to allow the parent container in App.tsx to handle scrolling.
@@ -767,14 +818,21 @@ export const DataView: React.FC<{
             {/* OBJETOS BIM: BOUNDING BOXES + PONTOS (filtrado por visibilidade) */}
             {resultados.filter(item => isItemVisible(item)).map((item, i) => (
               <group key={item.guid || i}>
-                {/* Bounding box — oculta no modo AI puro */}
-                {analysisMode !== 'ai' && <BimBoundingBox item={item} />}
+                {/* Hitbox clicável para seleção */}
+                <SelectableHitbox
+                  item={item}
+                  isSelected={selectedGuid === item.guid}
+                  onSelect={(guid) => setSelectedGuid(prev => prev === guid ? null : guid)}
+                />
+
+                {/* Bounding box — oculta no modo AI e Instâncias */}
+                {analysisMode !== 'ai' && analysisMode !== 'instances' && <BimBoundingBox item={item} />}
 
                 {/* Nuvem de pontos da execução (se existir) */}
                 {item.json_file && (
                   <ObjectPoints
                     jsonFile={item.json_file}
-                    color={item.status.cor || '#00ff00'}
+                    color={selectedGuid === item.guid ? '#00ffff' : (item.status.cor || '#00ff00')}
                   />
                 )}
               </group>
@@ -790,22 +848,37 @@ export const DataView: React.FC<{
         <div className="flex-[2] flex flex-col gap-4 overflow-y-auto">
           {/* Cards */}
           <div className="grid grid-cols-2 gap-4">
-            <div className="bg-white p-4 rounded shadow border border-slate-200">
-              <div className="text-xs text-slate-500">
-                {analysisMode === 'both' ? 'Progresso BBox' : 'Progresso'}
-              </div>
-              <div className="text-2xl font-bold">{estatisticas.progresso_geral.toFixed(0)}%</div>
-            </div>
-            {analysisMode === 'both' && estatisticasAI ? (
-              <div className="bg-white p-4 rounded shadow border border-purple-300">
-                <div className="text-xs text-purple-500">Progresso AI</div>
-                <div className="text-2xl font-bold text-purple-700">{estatisticasAI.progresso_geral.toFixed(0)}%</div>
-              </div>
+            {analysisMode === 'instances' ? (
+              <>
+                <div className="bg-white p-4 rounded shadow border border-cyan-300">
+                  <div className="text-xs text-cyan-600">Estruturas Detectadas</div>
+                  <div className="text-2xl font-bold text-cyan-700">{estatisticas.total}</div>
+                </div>
+                <div className="bg-white p-4 rounded shadow border border-cyan-200">
+                  <div className="text-xs text-cyan-500">Tipos Encontrados</div>
+                  <div className="text-2xl font-bold text-cyan-600">{Object.keys(statusByType).length}</div>
+                </div>
+              </>
             ) : (
-              <div className="bg-white p-4 rounded shadow border border-slate-200">
-                <div className="text-xs text-slate-500">Elementos</div>
-                <div className="text-2xl font-bold">{estatisticas.completos + estatisticas.parciais}/{estatisticas.total}</div>
-              </div>
+              <>
+                <div className="bg-white p-4 rounded shadow border border-slate-200">
+                  <div className="text-xs text-slate-500">
+                    {analysisMode === 'both' ? 'Progresso BBox' : 'Progresso'}
+                  </div>
+                  <div className="text-2xl font-bold">{estatisticas.progresso_geral.toFixed(0)}%</div>
+                </div>
+                {analysisMode === 'both' && estatisticasAI ? (
+                  <div className="bg-white p-4 rounded shadow border border-purple-300">
+                    <div className="text-xs text-purple-500">Progresso AI</div>
+                    <div className="text-2xl font-bold text-purple-700">{estatisticasAI.progresso_geral.toFixed(0)}%</div>
+                  </div>
+                ) : (
+                  <div className="bg-white p-4 rounded shadow border border-slate-200">
+                    <div className="text-xs text-slate-500">Elementos</div>
+                    <div className="text-2xl font-bold">{estatisticas.completos + estatisticas.parciais}/{estatisticas.total}</div>
+                  </div>
+                )}
+              </>
             )}
           </div>
 
@@ -817,9 +890,15 @@ export const DataView: React.FC<{
                 <XAxis dataKey="name" />
                 <YAxis />
                 <Tooltip />
-                <Bar dataKey="Total" fill="#cbd5e1" />
-                <Bar dataKey="Completo" fill="#4caf50" />
-                <Bar dataKey="Parcial" fill="#ff9800" />
+                {analysisMode === 'instances' ? (
+                  <Bar dataKey="Detectado" fill="#06b6d4" />
+                ) : (
+                  <>
+                    <Bar dataKey="Total" fill="#cbd5e1" />
+                    <Bar dataKey="Completo" fill="#4caf50" />
+                    <Bar dataKey="Parcial" fill="#ff9800" />
+                  </>
+                )}
               </BarChart>
             </ResponsiveContainer>
           </div>
@@ -831,30 +910,41 @@ export const DataView: React.FC<{
         <div className="px-4 py-3 bg-slate-50 border-b border-slate-200 flex justify-between items-center">
           <h3 className="font-semibold text-slate-700">📋 Lista de Objetos ({resultados.length} itens)</h3>
           <div className="flex gap-2 text-xs">
-            <span
-              onClick={() => toggleCategory('COMPLETO')}
-              className={`px-2 py-1 bg-green-100 text-green-700 rounded cursor-pointer hover:ring-2 flex items-center gap-1 ${hiddenCategories.has('COMPLETO') ? 'opacity-50' : ''}`}
-            >
-              ✅ Completo {hiddenCategories.has('COMPLETO') ? '👁️‍🗨️' : '👁️'}
-            </span>
-            <span
-              onClick={() => toggleCategory('PARCIAL')}
-              className={`px-2 py-1 bg-orange-100 text-orange-700 rounded cursor-pointer hover:ring-2 flex items-center gap-1 ${hiddenCategories.has('PARCIAL') ? 'opacity-50' : ''}`}
-            >
-              ⚠️ Parcial {hiddenCategories.has('PARCIAL') ? '👁️‍🗨️' : '👁️'}
-            </span>
-            <span
-              onClick={() => toggleCategory('INICIADO')}
-              className={`px-2 py-1 bg-blue-100 text-blue-700 rounded cursor-pointer hover:ring-2 flex items-center gap-1 ${hiddenCategories.has('INICIADO') ? 'opacity-50' : ''}`}
-            >
-              🔶 Iniciado {hiddenCategories.has('INICIADO') ? '👁️‍🗨️' : '👁️'}
-            </span>
-            <span
-              onClick={() => toggleCategory('AUSENTE')}
-              className={`px-2 py-1 bg-red-100 text-red-700 rounded cursor-pointer hover:ring-2 flex items-center gap-1 ${hiddenCategories.has('AUSENTE') ? 'opacity-50' : ''}`}
-            >
-              ❌ Ausente {hiddenCategories.has('AUSENTE') ? '👁️‍🗨️' : '👁️'}
-            </span>
+            {analysisMode === 'instances' ? (
+              <span
+                onClick={() => toggleCategory('DETECTADO')}
+                className={`px-2 py-1 bg-cyan-100 text-cyan-700 rounded cursor-pointer hover:ring-2 flex items-center gap-1 ${hiddenCategories.has('DETECTADO') ? 'opacity-50' : ''}`}
+              >
+                Detectado ({estatisticas.total}) {hiddenCategories.has('DETECTADO') ? '👁️‍🗨️' : '👁️'}
+              </span>
+            ) : (
+              <>
+                <span
+                  onClick={() => toggleCategory('COMPLETO')}
+                  className={`px-2 py-1 bg-green-100 text-green-700 rounded cursor-pointer hover:ring-2 flex items-center gap-1 ${hiddenCategories.has('COMPLETO') ? 'opacity-50' : ''}`}
+                >
+                  ✅ Completo {hiddenCategories.has('COMPLETO') ? '👁️‍🗨️' : '👁️'}
+                </span>
+                <span
+                  onClick={() => toggleCategory('PARCIAL')}
+                  className={`px-2 py-1 bg-orange-100 text-orange-700 rounded cursor-pointer hover:ring-2 flex items-center gap-1 ${hiddenCategories.has('PARCIAL') ? 'opacity-50' : ''}`}
+                >
+                  ⚠️ Parcial {hiddenCategories.has('PARCIAL') ? '👁️‍🗨️' : '👁️'}
+                </span>
+                <span
+                  onClick={() => toggleCategory('INICIADO')}
+                  className={`px-2 py-1 bg-blue-100 text-blue-700 rounded cursor-pointer hover:ring-2 flex items-center gap-1 ${hiddenCategories.has('INICIADO') ? 'opacity-50' : ''}`}
+                >
+                  🔶 Iniciado {hiddenCategories.has('INICIADO') ? '👁️‍🗨️' : '👁️'}
+                </span>
+                <span
+                  onClick={() => toggleCategory('AUSENTE')}
+                  className={`px-2 py-1 bg-red-100 text-red-700 rounded cursor-pointer hover:ring-2 flex items-center gap-1 ${hiddenCategories.has('AUSENTE') ? 'opacity-50' : ''}`}
+                >
+                  ❌ Ausente {hiddenCategories.has('AUSENTE') ? '👁️‍🗨️' : '👁️'}
+                </span>
+              </>
+            )}
           </div>
         </div>
         <div className="overflow-x-auto">
@@ -866,22 +956,35 @@ export const DataView: React.FC<{
                 <th className="text-center px-4 py-2 font-medium text-slate-600">Status</th>
                 {analysisMode === 'both' && <th className="text-center px-4 py-2 font-medium text-purple-600">Status AI</th>}
                 <th className="text-center px-2 py-2 font-medium text-slate-600" title="Visibilidade">👁️</th>
-                <th className="text-center px-4 py-2 font-medium text-slate-600">Cobertura</th>
-                <th className="text-center px-4 py-2 font-medium text-slate-600">Altura (Exec/Plan)</th>
+                <th className="text-center px-4 py-2 font-medium text-slate-600">
+                  {analysisMode === 'instances' ? 'Pontos' : 'Cobertura'}
+                </th>
+                <th className="text-center px-4 py-2 font-medium text-slate-600">
+                  {analysisMode === 'instances' ? 'Dimensoes (m)' : 'Altura (Exec/Plan)'}
+                </th>
               </tr>
             </thead>
             <tbody>
               {resultados.map((item: any, idx: number) => (
-                <tr key={item.guid || idx} className={`border-b border-slate-100 hover:bg-slate-50 ${item.status.code === 'AUSENTE' ? 'bg-red-50' :
-                  item.status.code === 'PARCIAL' ? 'bg-orange-50' : ''
+                <tr
+                  key={item.guid || idx}
+                  ref={(el) => { tableRowRefs.current[item.guid] = el; }}
+                  onClick={() => setSelectedGuid(prev => prev === item.guid ? null : item.guid)}
+                  className={`border-b border-slate-100 cursor-pointer transition-colors ${
+                    selectedGuid === item.guid ? 'bg-cyan-100 ring-2 ring-cyan-400' :
+                    item.status.code === 'AUSENTE' ? 'bg-red-50 hover:bg-slate-50' :
+                    item.status.code === 'PARCIAL' ? 'bg-orange-50 hover:bg-slate-50' :
+                    'hover:bg-slate-50'
                   }`}>
                   <td className="px-4 py-2 font-medium text-slate-800">{item.nome}</td>
                   <td className="px-4 py-2 text-slate-600">{item.tipo.replace('Ifc', '')}</td>
                   <td className="px-4 py-2 text-center">
-                    <span className={`px-2 py-1 rounded text-xs font-medium ${item.status.code === 'COMPLETO' ? 'bg-green-100 text-green-700' :
+                    <span className={`px-2 py-1 rounded text-xs font-medium ${
+                      item.status.code === 'DETECTADO' ? 'bg-cyan-100 text-cyan-700' :
+                      item.status.code === 'COMPLETO' ? 'bg-green-100 text-green-700' :
                       item.status.code === 'PARCIAL' ? 'bg-orange-100 text-orange-700' :
-                        item.status.code === 'INICIADO' ? 'bg-blue-100 text-blue-700' :
-                          'bg-red-100 text-red-700'
+                      item.status.code === 'INICIADO' ? 'bg-blue-100 text-blue-700' :
+                      'bg-red-100 text-red-700'
                       }`}>
                       {item.status.emoji} {item.status.texto}
                     </span>
@@ -912,11 +1015,19 @@ export const DataView: React.FC<{
                     {isItemVisible(item) ? '👁️' : '👁️‍🗨️'}
                   </td>
                   <td className="px-4 py-2 text-center text-slate-600">
-                    {item.cobertura_vertical !== undefined ? `${(item.cobertura_vertical * 100).toFixed(0)}%` :
-                      item.cobertura !== undefined ? `${item.cobertura}%` : '-'}
+                    {analysisMode === 'instances'
+                      ? (item.pontos?.toLocaleString() || '-')
+                      : (item.cobertura_vertical !== undefined ? `${(item.cobertura_vertical * 100).toFixed(0)}%` :
+                          item.cobertura !== undefined ? `${item.cobertura}%` : '-')
+                    }
                   </td>
                   <td className="px-4 py-2 text-center text-slate-600">
-                    {item.dimensoes ? `${item.dimensoes.executado?.z?.toFixed(1) || 0}m / ${item.dimensoes.planejado?.z?.toFixed(1) || 0}m` : '-'}
+                    {analysisMode === 'instances'
+                      ? (item.bbox_normalized
+                          ? `${(item.bbox_normalized.xmax - item.bbox_normalized.xmin).toFixed(2)} x ${(item.bbox_normalized.ymax - item.bbox_normalized.ymin).toFixed(2)} x ${(item.bbox_normalized.zmax - item.bbox_normalized.zmin).toFixed(2)}`
+                          : '-')
+                      : (item.dimensoes ? `${item.dimensoes.executado?.z?.toFixed(1) || 0}m / ${item.dimensoes.planejado?.z?.toFixed(1) || 0}m` : '-')
+                    }
                   </td>
                 </tr>
               ))}

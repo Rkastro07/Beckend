@@ -4,7 +4,7 @@ import { DataView } from './components/DataView';
 import { ReportView } from './components/ReportView';
 import { VoiceAssistant } from './components/VoiceAssistant';
 import { AppTab, Floor, AnalysisResult } from './types';
-import { listFloors, analyzeFloor, analyzeFloorAI, AnalysisMode } from './services/api';
+import { listFloors, analyzeFloor, analyzeFloorAI, analyzeFloorInstances, AnalysisMode } from './services/api';
 import { LayoutDashboard, FileText, Mic } from 'lucide-react';
 
 export default function App() {
@@ -63,6 +63,9 @@ export default function App() {
       } else if (analysisMode === 'ai') {
         const result = await analyzeFloorAI(ifcFile, plyFile, selectedFloorId);
         setAnalysisResultAI(result);
+      } else if (analysisMode === 'instances') {
+        const result = await analyzeFloorInstances(ifcFile, plyFile, selectedFloorId);
+        setAnalysisResult(result);
       } else {
         // both — roda em paralelo
         const [bbox, ai] = await Promise.all([

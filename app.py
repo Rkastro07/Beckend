@@ -30,6 +30,7 @@ import numpy as np
 # Hook RandLA-Net (opcional — só ativa se PyTorch estiver instalado)
 _RANDLANET_DISPONIVEL = False
 _RANDLANET_INFERENCE = False
+_INSTANCE_INFERENCE = False
 try:
     import sys as _sys
     import os.path as _osp
@@ -46,6 +47,15 @@ try:
         print("🤖 RandLA-Net: modelo carregado (use_ai disponível)")
     else:
         print("🤖 RandLA-Net: checkpoint não encontrado, use_ai indisponível")
+    # Inferência de instâncias (requer best_instance.pth)
+    _INSTANCE_INFERENCE = False
+    from randlanet.inference_instances import segmentar_instancias as _segmentar_instancias
+    _CHECKPOINT_INST = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "randlanet", "checkpoints", "best_instance.pth")
+    if _os.path.exists(_CHECKPOINT_INST):
+        _INSTANCE_INFERENCE = True
+        print("🤖 RandLA-Net Instance: modelo carregado (analisar_instancias disponível)")
+    else:
+        print("🤖 RandLA-Net Instance: checkpoint não encontrado")
 except Exception as _e:
     print(f"⚠️  RandLA-Net não disponível: {_e}")
 import ifcopenshell
@@ -114,6 +124,17 @@ OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
 app = Flask(__name__)
 CORS(app)
 app.config['MAX_CONTENT_LENGTH'] = 2048 * 1024 * 1024  # 2GB
+
+# JSON encoder que converte numpy types automaticamente (evita int32/float64 errors)
+import json as _json
+class _NumpyEncoder(_json.JSONEncoder):
+    def default(self, obj):
+        if hasattr(obj, 'item'):      # np.int32, np.float64, etc.
+            return obj.item()
+        if hasattr(obj, 'tolist'):     # np.ndarray
+            return obj.tolist()
+        return super().default(obj)
+app.json_encoder = _NumpyEncoder
 
 
 # =========================
@@ -1428,6 +1449,96 @@ def analisar_ai():
             'estatisticas': estatisticas,
             'resultados': resultados
         })
+
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/analisar_instancias', methods=['POST'])
+def analisar_instancias():
+    """Análise de instâncias individuais via RandLA-Net Instance + DBSCAN."""
+    try:
+        if not _INSTANCE_INFERENCE:
+            return jsonify({'error': 'RandLA-Net Instance não disponível (checkpoint ausente)'}), 503
+
+        ifc_file = request.files.get('ifc_file')
+        ply_file = request.files.get('ply_file')
+        pav_alvo = request.form.get('pavimento')
+
+        if not ifc_file:
+            return jsonify({'error': 'Arquivo IFC não enviado'}), 400
+        if not ply_file:
+            return jsonify({'error': 'Arquivo PLY não enviado'}), 400
+        if not pav_alvo:
+            return jsonify({'error': 'Pavimento não especificado'}), 400
+
+        session_id = str(uuid.uuid4())
+        ifc_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ifc_file.filename)}"
+        ply_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ply_file.filename)}"
+        ifc_file.save(str(ifc_path))
+        ply_file.save(str(ply_path))
+
+        objetos = extrair_objetos_por_pavimento(str(ifc_path), pav_alvo)
+        if not objetos:
+            return jsonify({'error': f'Nenhum objeto no pavimento "{pav_alvo}"'}), 400
+
+        output_session = OUTPUT_FOLDER / session_id
+        output_session.mkdir(parents=True, exist_ok=True)
+
+        print("\n" + "=" * 70)
+        print("ANALISE INSTANCIAS (RandLA-Net Instance + DBSCAN)")
+        print("=" * 70)
+
+        pcd = o3d.io.read_point_cloud(str(ply_path))
+        pts = np.asarray(pcd.points, dtype=float)
+        pts = np.unique(pts, axis=0)
+        print(f"   Pontos: {len(pts):,}")
+
+        objetos, _ = detectar_paredes_conexao(objetos)
+        objetos = marcar_conexoes_piso_teto(objetos)
+        pts, _ = alinhar_nuvem_com_ifc(pts, objetos)
+        pts, _, _ = corrigir_orientacao_por_pico_vertical(pts, objetos)
+        pts, _, objetos = normalizar_coordenadas(pts, objetos)
+
+        from pathlib import Path as _Path
+        resultados = _segmentar_instancias(pts, objetos, output_session, checkpoint=_Path(_CHECKPOINT_INST))
+
+        if resultados is None:
+            return jsonify({'error': 'Segmentação de instâncias falhou'}), 500
+
+        total = len(resultados)
+        detectados = sum(1 for r in resultados if r['status']['code'] == 'DETECTADO')
+        estatisticas = {
+            'total': total,
+            'detectados': detectados,
+            'completos': 0, 'parciais': 0, 'iniciados': 0, 'ausentes': 0,
+            'conexoes': 0,
+            'progresso_geral': 100.0 if total > 0 else 0
+        }
+
+        def _to_native(obj):
+            if isinstance(obj, dict):
+                return {k: _to_native(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_to_native(v) for v in obj]
+            if hasattr(obj, 'item'):
+                return obj.item()
+            return obj
+
+        for r in resultados:
+            if r.get('json_file'):
+                r['json_file'] = f"{session_id}/{r['json_file']}"
+            if r.get('ply_file'):
+                r['ply_file'] = f"{session_id}/{r['ply_file']}"
+
+        return jsonify(_to_native({
+            'pavimento': pav_alvo,
+            'session_id': session_id,
+            'modo': 'instancias',
+            'estatisticas': estatisticas,
+            'resultados': resultados
+        }))
 
     except Exception as e:
         print(traceback.format_exc())

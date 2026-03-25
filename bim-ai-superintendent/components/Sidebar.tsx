@@ -1,5 +1,5 @@
 import React from 'react';
-import { Upload, FileText, Layers, Key, PlayCircle, Box, Brain, GitCompare } from 'lucide-react';
+import { Upload, FileText, Layers, Key, PlayCircle, Box, Brain, GitCompare, Shapes } from 'lucide-react';
 import { Floor } from '../types';
 import { AnalysisMode } from '../services/api';
 
@@ -127,6 +127,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               { mode: 'bbox' as AnalysisMode, label: 'BBox', icon: Box },
               { mode: 'ai' as AnalysisMode, label: 'AI', icon: Brain },
               { mode: 'both' as AnalysisMode, label: 'Ambos', icon: GitCompare },
+              { mode: 'instances' as AnalysisMode, label: 'Inst.', icon: Shapes },
             ]).map(({ mode, label, icon: Icon }) => (
               <button
                 key={mode}
@@ -146,6 +147,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             {analysisMode === 'bbox' && 'Geometria (bounding box + anti-leaking)'}
             {analysisMode === 'ai' && 'RandLA-Net (rede neural por ponto)'}
             {analysisMode === 'both' && 'Compara BBox vs AI lado a lado'}
+            {analysisMode === 'instances' && 'RandLA-Net Instance — separa objetos individuais'}
           </p>
         </div>
 
