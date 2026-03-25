@@ -38,11 +38,17 @@ LABEL_TO_TIPO = {v: k for k, v in LABEL_MAP.items()}
 
 
 def _ifc_bbox_to_threejs(bbox: Dict) -> Dict:
-    """Converte bbox IFC (Z=altura) → Three.js (Y=altura). Y/Z swap."""
+    """
+    Converte bbox IFC (Z=altura) → Three.js (Y=altura).
+    Mesma transformação aplicada aos pontos:
+        X_3js =  X_ifc
+        Y_3js =  Z_ifc   (altura)
+        Z_3js = -Y_ifc   (negado — igual ao pts_3js[:, 2] = -pts_3js[:, 2])
+    """
     return {
-        'xmin': bbox['xmin'], 'xmax': bbox['xmax'],
-        'ymin': bbox['zmin'], 'ymax': bbox['zmax'],
-        'zmin': bbox['ymin'], 'zmax': bbox['ymax'],
+        'xmin':  bbox['xmin'], 'xmax':  bbox['xmax'],
+        'ymin':  bbox['zmin'], 'ymax':  bbox['zmax'],
+        'zmin': -bbox['ymax'], 'zmax': -bbox['ymin'],  # negado + min/max trocados
     }
 
 

@@ -767,8 +767,8 @@ export const DataView: React.FC<{
             {/* OBJETOS BIM: BOUNDING BOXES + PONTOS (filtrado por visibilidade) */}
             {resultados.filter(item => isItemVisible(item)).map((item, i) => (
               <group key={item.guid || i}>
-                {/* Bounding box do planejamento */}
-                <BimBoundingBox item={item} />
+                {/* Bounding box — oculta no modo AI puro */}
+                {analysisMode !== 'ai' && <BimBoundingBox item={item} />}
 
                 {/* Nuvem de pontos da execução (se existir) */}
                 {item.json_file && (
