@@ -1,6 +1,6 @@
 import { Floor, AnalysisResult, BimItem } from '../types';
 
-const API_BASE_URL = 'http://localhost:9090';
+const API_BASE_URL = 'http://localhost:8080';
 
 export const listFloors = async (ifcFile: File): Promise<Floor[]> => {
   const formData = new FormData();

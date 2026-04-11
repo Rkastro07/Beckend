@@ -825,8 +825,8 @@ export const DataView: React.FC<{
                   onSelect={(guid) => setSelectedGuid(prev => prev === guid ? null : guid)}
                 />
 
-                {/* Bounding box — oculta no modo AI e Instâncias */}
-                {analysisMode !== 'ai' && analysisMode !== 'instances' && <BimBoundingBox item={item} />}
+                {/* Bounding box — oculta apenas no modo Instâncias */}
+                {analysisMode !== 'instances' && <BimBoundingBox item={item} />}
 
                 {/* Nuvem de pontos da execução (se existir) */}
                 {item.json_file && (

@@ -108,6 +108,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
             disabled={floors.length === 0}
           >
             <option value="">Selecione um andar...</option>
+            {floors.length > 1 && (
+              <option value="__TODOS__">Todos os pavimentos</option>
+            )}
             {floors.map((f) => (
               <option key={f.id} value={f.id}>
                 {f.name}
@@ -125,7 +128,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <div className="flex rounded-lg overflow-hidden border border-slate-600">
             {([
               { mode: 'bbox' as AnalysisMode, label: 'BBox', icon: Box },
-              { mode: 'ai' as AnalysisMode, label: 'AI', icon: Brain },
+              { mode: 'ai' as AnalysisMode, label: 'ML', icon: Brain },
               { mode: 'both' as AnalysisMode, label: 'Ambos', icon: GitCompare },
               { mode: 'instances' as AnalysisMode, label: 'Inst.', icon: Shapes },
             ]).map(({ mode, label, icon: Icon }) => (
@@ -145,7 +148,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </div>
           <p className="text-[10px] text-slate-500">
             {analysisMode === 'bbox' && 'Geometria (bounding box + anti-leaking)'}
-            {analysisMode === 'ai' && 'RandLA-Net (rede neural por ponto)'}
+            {analysisMode === 'ai' && 'Random Forest treinado no dataset sintetico'}
             {analysisMode === 'both' && 'Compara BBox vs AI lado a lado'}
             {analysisMode === 'instances' && 'RandLA-Net Instance — separa objetos individuais'}
           </p>

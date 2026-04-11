@@ -125,6 +125,13 @@ app = Flask(__name__)
 CORS(app)
 app.config['MAX_CONTENT_LENGTH'] = 2048 * 1024 * 1024  # 2GB
 
+@app.after_request
+def _no_cache(response):
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
+
 # JSON encoder que converte numpy types automaticamente (evita int32/float64 errors)
 import json as _json
 class _NumpyEncoder(_json.JSONEncoder):
@@ -177,28 +184,44 @@ def extrair_pavimentos(ifc_path: str) -> List[str]:
 def extrair_objetos_por_pavimento(
         ifc_path: str,
         pavimento_alvo: str) -> List[Dict]:
-    """Extrai objetos IFC filtrados por pavimento com suas bounding boxes."""
+    """Extrai objetos IFC filtrados por pavimento com suas bounding boxes.
+
+    Se pavimento_alvo == "__TODOS__" (ou vazio), carrega todos os pavimentos.
+    """
     f = ifcopenshell.open(ifc_path)
     settings = ifcopenshell.geom.settings()
     settings.set(settings.USE_WORLD_COORDS, True)
 
+    todos = (not pavimento_alvo) or pavimento_alvo == "__TODOS__"
     objetos = []
-    print(f"Filtrando objetos para o pavimento: {pavimento_alvo}")
+    if todos:
+        print("Filtrando objetos: TODOS OS PAVIMENTOS")
+    else:
+        print(f"Filtrando objetos para o pavimento: {pavimento_alvo}")
 
     for product in f.by_type("IfcProduct"):
-        if product.is_a() not in TIPOS_INTERESSE:
+        # Subclass-aware: IfcWallStandardCase conta como IfcWall
+        tipo_base = None
+        for t in TIPOS_INTERESSE:
+            if product.is_a(t):
+                tipo_base = t
+                break
+        if tipo_base is None:
             continue
 
-        # Verifica se pertence ao pavimento alvo
-        eh_do_pavimento = False
+        # Verifica se pertence ao pavimento alvo (ou pega todos)
+        pav_do_objeto = None
         for rel in getattr(product, "ContainedInStructure", []):
             if rel.RelatingStructure.is_a("IfcBuildingStorey"):
-                if rel.RelatingStructure.Name == pavimento_alvo:
-                    eh_do_pavimento = True
-                    break
+                pav_do_objeto = rel.RelatingStructure.Name
+                break
 
-        if not eh_do_pavimento:
-            continue
+        if todos:
+            if pav_do_objeto is None:
+                pav_do_objeto = "sem_pavimento"
+        else:
+            if pav_do_objeto != pavimento_alvo:
+                continue
 
         try:
             shape = ifcopenshell.geom.create_shape(settings, product)
@@ -213,22 +236,37 @@ def extrair_objetos_por_pavimento(
             nome = getattr(product, 'Name',
                            None) or f"{product.is_a()}_{product.GlobalId[:8]}"
 
+            # Área de superfície real (usada como feature pelo ML)
+            try:
+                faces = np.array(shape.geometry.faces).reshape(-1, 3)
+                mesh_tmp = o3d.geometry.TriangleMesh()
+                mesh_tmp.vertices  = o3d.utility.Vector3dVector(verts)
+                mesh_tmp.triangles = o3d.utility.Vector3iVector(faces)
+                area_ifc = float(mesh_tmp.get_surface_area())
+            except Exception:
+                area_ifc = 2 * ((xmax-xmin)*(ymax-ymin) + (xmax-xmin)*(zmax-zmin) + (ymax-ymin)*(zmax-zmin))
+
             objetos.append({
                 'guid': product.GlobalId,
-                'tipo': product.is_a(),
+                'tipo': tipo_base,  # tipo base (IfcWall, nao IfcWallStandardCase)
                 'nome': nome,
-                'pavimento': pavimento_alvo,
+                'pavimento': pav_do_objeto or pavimento_alvo,
                 'bbox': {
                     'xmin': xmin, 'xmax': xmax,
                     'ymin': ymin, 'ymax': ymax,
                     'zmin': zmin, 'zmax': zmax
                 },
-                'volume_ifc': (xmax - xmin) * (ymax - ymin) * (zmax - zmin)
+                'volume_ifc': (xmax - xmin) * (ymax - ymin) * (zmax - zmin),
+                'area_ifc':   area_ifc,
             })
         except Exception:
             continue
 
-    print(f"Encontrados {len(objetos)} objetos no pavimento {pavimento_alvo}")
+    if todos:
+        pavs_unicos = sorted(set(o['pavimento'] for o in objetos))
+        print(f"Encontrados {len(objetos)} objetos em {len(pavs_unicos)} pavimentos: {pavs_unicos}")
+    else:
+        print(f"Encontrados {len(objetos)} objetos no pavimento {pavimento_alvo}")
     return objetos
 
 
@@ -500,12 +538,50 @@ def alinhar_nuvem_com_ifc(
     # =========================
     perms = list(permutations((0, 1, 2), 3))
     signs = list(product([-1, 1], repeat=3))
+
+    # Helper: score de um pts_test dado
+    def _score(pts_test):
+        s = 0.0
+        for obj in objetos_teste:
+            bbox = obj['bbox']
+            dx = bbox['xmax'] - bbox['xmin']
+            dy = bbox['ymax'] - bbox['ymin']
+            dz = bbox['zmax'] - bbox['zmin']
+            volume = max(dx * dy * dz, 1e-6)
+            mm = 0.15
+            mask = (
+                (pts_test[:, 0] >= bbox['xmin'] - mm) &
+                (pts_test[:, 0] <= bbox['xmax'] + mm) &
+                (pts_test[:, 1] >= bbox['ymin'] - mm) &
+                (pts_test[:, 1] <= bbox['ymax'] + mm) &
+                (pts_test[:, 2] >= bbox['zmin'] - mm) &
+                (pts_test[:, 2] <= bbox['zmax'] + mm)
+            )
+            pts_in = pts_test[mask]
+            count = len(pts_in)
+            if count < 5:
+                continue
+            densidade = count / volume
+            std = np.std(pts_in, axis=0).mean()
+            penal_spread = 1.0 / (1.0 + std)
+            s += densidade * penal_spread
+        return s
+
+    # Testa identidade PRIMEIRO (PLY ja pode estar em coords IFC).
+    # Fase inicial (few constructed objects) quebra centroid-matching,
+    # entao preferimos identidade se ela ja funcionar razoavelmente.
+    score_identity = _score(pts_sample)
+    print(f"   🆔 Score identidade: {score_identity:.4f}")
     melhor = {
-        'score': -1,
+        'score': score_identity,
         'R': np.eye(3),
         't': np.zeros(3),
         'scale': 1.0
     }
+    # Barrier: so trocamos por outra transformacao se ela superar a
+    # identidade por > 30% (evita desalinhar PLYs ja OK).
+    IDENTITY_BARRIER = 1.30
+
     for scl in SCALES_TO_TEST:
         ratio = (diag_pts * scl) / (diag_ifc + 1e-6)
         # 🔥 restrição mais forte
@@ -528,33 +604,10 @@ def alinhar_nuvem_com_ifc(
 
                 for t in (t_centro, t_base):
                     pts_test = S + t
-                    score_total = 0.0
-                    for obj in objetos_teste:
-                        bbox = obj['bbox']
-                        dx = bbox['xmax'] - bbox['xmin']
-                        dy = bbox['ymax'] - bbox['ymin']
-                        dz = bbox['zmax'] - bbox['zmin']
-                        volume = max(dx * dy * dz, 1e-6)
-                        m = 0.15
-                        mask = (
-                            (pts_test[:, 0] >= bbox['xmin'] - m) &
-                            (pts_test[:, 0] <= bbox['xmax'] + m) &
-                            (pts_test[:, 1] >= bbox['ymin'] - m) &
-                            (pts_test[:, 1] <= bbox['ymax'] + m) &
-                            (pts_test[:, 2] >= bbox['zmin'] - m) &
-                            (pts_test[:, 2] <= bbox['zmax'] + m)
-                        )
-                        pts_in = pts_test[mask]
-                        count = len(pts_in)
-                        if count < 5:
-                            continue
-                        # SCORE INTELIGENTE
-                        densidade = count / volume
-                        std = np.std(pts_in, axis=0).mean()
-                        penal_spread = 1.0 / (1.0 + std)
-                        score_local = densidade * penal_spread
-                        score_total += score_local
-                    if score_total > melhor['score']:
+                    score_total = _score(pts_test)
+                    # So troca identidade se ganhar com folga
+                    threshold = score_identity * IDENTITY_BARRIER if melhor['score'] == score_identity else melhor['score']
+                    if score_total > threshold:
                         melhor = {
                             'score': score_total,
                             'R': _perm_sign_to_R(perm, sign, scl),
@@ -1366,93 +1419,7 @@ def analisar_pavimento():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/analisar_ai', methods=['POST'])
-def analisar_ai():
-    """Análise usando SOMENTE RandLA-Net (sem bbox/phantom). Para comparação."""
-    try:
-        if not _RANDLANET_INFERENCE:
-            return jsonify({'error': 'RandLA-Net não disponível (checkpoint ausente)'}), 503
-
-        ifc_file = request.files.get('ifc_file')
-        ply_file = request.files.get('ply_file')
-        pav_alvo = request.form.get('pavimento')
-
-        if not ifc_file:
-            return jsonify({'error': 'Arquivo IFC não enviado'}), 400
-        if not ply_file:
-            return jsonify({'error': 'Arquivo PLY não enviado'}), 400
-        if not pav_alvo:
-            return jsonify({'error': 'Pavimento não especificado'}), 400
-
-        session_id = str(uuid.uuid4())
-        ifc_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ifc_file.filename)}"
-        ply_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ply_file.filename)}"
-        ifc_file.save(str(ifc_path))
-        ply_file.save(str(ply_path))
-
-        objetos = extrair_objetos_por_pavimento(str(ifc_path), pav_alvo)
-        if not objetos:
-            return jsonify({'error': f'Nenhum objeto no pavimento "{pav_alvo}"'}), 400
-
-        output_session = OUTPUT_FOLDER / session_id
-        output_session.mkdir(parents=True, exist_ok=True)
-
-        # Pipeline de alinhamento (mesmo do bbox)
-        print("\n" + "=" * 70)
-        print("ANALISE AI-ONLY (RandLA-Net)")
-        print("=" * 70)
-
-        pcd = o3d.io.read_point_cloud(str(ply_path))
-        pts = np.asarray(pcd.points, dtype=float)
-        pts = np.unique(pts, axis=0)
-        print(f"   Pontos: {len(pts):,}")
-
-        objetos, _ = detectar_paredes_conexao(objetos)
-        objetos = marcar_conexoes_piso_teto(objetos)
-        pts, _ = alinhar_nuvem_com_ifc(pts, objetos)
-        pts, _, _ = corrigir_orientacao_por_pico_vertical(pts, objetos)
-        pts, _, objetos = normalizar_coordenadas(pts, objetos)
-
-        # Somente AI — sem bbox analysis, sem phantom
-        resultados = _classificar_ai(pts, objetos, output_session)
-
-        if resultados is None:
-            return jsonify({'error': 'Inferência AI falhou'}), 500
-
-        # Estatísticas
-        stats = Counter([r['status']['code'] for r in resultados])
-        total = len(resultados)
-        estatisticas = {
-            'total': total,
-            'completos': stats.get('COMPLETO', 0),
-            'parciais': stats.get('PARCIAL', 0),
-            'iniciados': stats.get('INICIADO', 0),
-            'ausentes': stats.get('AUSENTE', 0),
-            'conexoes': 0,
-            'progresso_geral': round(
-                (stats.get('COMPLETO', 0) +
-                 stats.get('PARCIAL', 0) * 0.5 +
-                 stats.get('INICIADO', 0) * 0.1) /
-                total * 100, 1) if total > 0 else 0
-        }
-
-        for r in resultados:
-            if r.get('json_file'):
-                r['json_file'] = f"{session_id}/{r['json_file']}"
-            if r.get('ply_file'):
-                r['ply_file'] = f"{session_id}/{r['ply_file']}"
-
-        return jsonify({
-            'pavimento': pav_alvo,
-            'session_id': session_id,
-            'modo': 'ai',
-            'estatisticas': estatisticas,
-            'resultados': resultados
-        })
-
-    except Exception as e:
-        print(traceback.format_exc())
-        return jsonify({'error': str(e)}), 500
+# (RandLA-Net AI removido — substituido pelo Random Forest ML no final do arquivo)
 
 
 @app.route('/api/analisar_instancias', methods=['POST'])
@@ -1664,6 +1631,239 @@ def chat():
 
     except Exception as e:
         print(f"❌ Erro no chat: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# =========================
+# ANÁLISE ML (Random Forest)
+# =========================
+
+_ML_MODEL  = None
+_ML_SCALER = None
+_ML_MODEL_PATH = Path(__file__).parent / "ml" / "models" / "random_forest.pkl"
+
+def _carregar_modelo_ml():
+    global _ML_MODEL, _ML_SCALER
+    if _ML_MODEL is not None:
+        return True
+    try:
+        import pickle
+        with open(_ML_MODEL_PATH, 'rb') as f:
+            saved = pickle.load(f)
+        _ML_MODEL  = saved['model']
+        _ML_SCALER = saved['scaler']
+        print(f"ML: Random Forest carregado")
+        return True
+    except Exception as e:
+        print(f"ML: modelo nao disponivel — {e}")
+        return False
+
+_ML_DISPONIVEL = _carregar_modelo_ml()
+
+_ML_TIPO_MAP = {
+    "IfcWall": 0, "IfcSlab": 1, "IfcColumn": 2, "IfcBeam": 3,
+    "IfcStair": 4, "IfcRoof": 5, "IfcDoor": 6, "IfcWindow": 7,
+}
+_ML_EIXO_MAP  = {"z_up": 0, "horiz_longest": 1, "length_axis": 2}
+_ML_EIXO_TIPO = {
+    "IfcWall": "z_up", "IfcColumn": "z_up", "IfcStair": "z_up",
+    "IfcDoor": "z_up", "IfcWindow": "z_up",
+    "IfcSlab": "horiz_longest", "IfcRoof": "horiz_longest",
+    "IfcBeam": "length_axis",
+}
+_ML_STATUS = {
+    0: {'code': 'COMPLETO', 'texto': 'Executado',              'cor': '#22c55e'},
+    1: {'code': 'PARCIAL',  'texto': 'Parcialmente Executado', 'cor': '#f59e0b'},
+    2: {'code': 'AUSENTE',  'texto': 'Nao Executado',          'cor': '#ef4444'},
+}
+
+
+def _extrair_features_ml(pts_cena: np.ndarray, obj: Dict) -> np.ndarray:
+    bbox = obj['bbox']
+    area = float(obj.get('area_ifc') or obj.get('area') or 1.0)
+    vol  = float(obj.get('volume_ifc') or obj.get('volume') or 1.0)
+    tipo = _ML_TIPO_MAP.get(obj.get('tipo', ''), 0)
+    eixo = _ML_EIXO_MAP.get(_ML_EIXO_TIPO.get(obj.get('tipo', ''), 'z_up'), 0)
+
+    bw = max(bbox['xmax'] - bbox['xmin'], 1e-6)
+    bd = max(bbox['ymax'] - bbox['ymin'], 1e-6)
+    bh = max(bbox['zmax'] - bbox['zmin'], 1e-6)
+    expected_pts = max(area * 130, 1)
+
+    m = 0.05
+    if pts_cena is not None and len(pts_cena) > 0:
+        mask = (
+            (pts_cena[:, 0] >= bbox['xmin'] - m) & (pts_cena[:, 0] <= bbox['xmax'] + m) &
+            (pts_cena[:, 1] >= bbox['ymin'] - m) & (pts_cena[:, 1] <= bbox['ymax'] + m) &
+            (pts_cena[:, 2] >= bbox['zmin'] - m) & (pts_cena[:, 2] <= bbox['zmax'] + m)
+        )
+        pts_obj = pts_cena[mask]
+    else:
+        pts_obj = np.zeros((0, 3))
+
+    n = len(pts_obj)
+    if n > 0:
+        zp = pts_obj[:, 2]
+        zlo, zhi, zmean = float(zp.min()), float(zp.max()), float(zp.mean())
+        height_fill     = (zhi - zlo) / bh
+        z_bottom_norm   = (zlo  - bbox['zmin']) / bh
+        z_top_norm      = (zhi  - bbox['zmin']) / bh
+        centroid_z_norm = (zmean - bbox['zmin']) / bh
+        xy_spread_norm  = float(pts_obj[:, :2].std()) / max(bw, bd)
+        density_obs     = n / max(vol, 1e-6)
+        completeness_r  = n / expected_pts
+        is_empty        = 0.0
+    else:
+        height_fill = z_bottom_norm = z_top_norm = centroid_z_norm = 0.0
+        xy_spread_norm = density_obs = completeness_r = 0.0
+        is_empty = 1.0
+
+    density_area = n / max(area, 1e-6)
+
+    return np.array([
+        completeness_r, is_empty, height_fill,
+        z_bottom_norm, z_top_norm, centroid_z_norm, xy_spread_norm, density_area,
+        float(tipo), float(eixo), bh,
+    ], dtype=np.float32)
+
+
+@app.route('/api/analisar_ai', methods=['POST'])
+def analisar_ai_ml():
+    """Analisa pavimento usando Random Forest (substitui RandLA-Net no front)."""
+    try:
+        if not _ML_DISPONIVEL:
+            return jsonify({'error': 'Modelo ML nao disponivel. Rode ml/train.py primeiro.'}), 503
+
+        ifc_file = request.files.get('ifc_file')
+        ply_file = request.files.get('ply_file')
+        pav_alvo = request.form.get('pavimento')
+
+        if not ifc_file:
+            return jsonify({'error': 'IFC nao enviado'}), 400
+        if not ply_file:
+            return jsonify({'error': 'PLY nao enviado'}), 400
+        if not pav_alvo:
+            return jsonify({'error': 'Pavimento nao especificado'}), 400
+
+        session_id = str(uuid.uuid4())
+        ifc_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ifc_file.filename)}"
+        ply_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ply_file.filename)}"
+        ifc_file.save(str(ifc_path))
+        ply_file.save(str(ply_path))
+
+        # Mesmo pipeline de alinhamento do bbox
+        objetos = extrair_objetos_por_pavimento(str(ifc_path), pav_alvo)
+        if not objetos:
+            return jsonify({'error': f'Nenhum objeto no pavimento "{pav_alvo}"'}), 400
+
+        pcd = o3d.io.read_point_cloud(str(ply_path))
+        pts = np.asarray(pcd.points, dtype=float)
+        pts = np.unique(pts, axis=0)
+        objetos, _ = detectar_paredes_conexao(objetos)
+        objetos     = marcar_conexoes_piso_teto(objetos)
+        pts, _      = alinhar_nuvem_com_ifc(pts, objetos)
+        # Flip removido — desalinhava nuvens que ja estao orientadas corretamente
+        # pts, _, _   = corrigir_orientacao_por_pico_vertical(pts, objetos)
+        pts, _, objetos = normalizar_coordenadas(pts, objetos)
+
+        import sys as _s
+        print(f"ML: {len(pts):,} pts | {len(objetos)} objetos", flush=True)
+        _s.stdout.flush()
+
+        feats   = np.stack([_extrair_features_ml(pts, obj) for obj in objetos])
+
+        # DEBUG: mostra features de cada objeto para diagnostico
+        # Features: compl_r, empty, h_fill, z_bot, z_top, z_cent, xy_spr, dens_area, tipo, eixo, bh
+        print(f"ML DEBUG: features shape={feats.shape}")
+        for i, (obj, f) in enumerate(zip(objetos, feats)):
+            print(f"  [{i:>2}] {obj['nome'][:25]:<25} compl_r={f[0]:.3f}  "
+                  f"empty={f[1]:.0f}  h_fill={f[2]:.3f}  bh={f[10]:.2f}")
+
+        # RF foi treinado com dados SEM scaling (scaler eh so pro MLP)
+        preds   = _ML_MODEL.predict(feats)
+        probas  = _ML_MODEL.predict_proba(feats)
+
+        # DEBUG: mostra predicoes
+        _STATUS_NAMES = {0: 'COMPLETO', 1: 'PARCIAL', 2: 'AUSENTE'}
+        for i, (obj, pred, proba) in enumerate(zip(objetos, preds, probas)):
+            print(f"  [{i:>2}] {obj['nome'][:25]:<25} -> {_STATUS_NAMES[int(pred)]:<10} "
+                  f"conf={proba[int(pred)]:.3f}  probs=[C:{proba[0]:.2f} P:{proba[1]:.2f} A:{proba[2]:.2f}]")
+
+        # Cria pasta de output para os JSONs de pontos
+        output_dir = OUTPUT_FOLDER / session_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        resultados = []
+        m = 0.05
+        for i, (obj, pred, proba) in enumerate(zip(objetos, preds, probas)):
+            status = _ML_STATUS[int(pred)]
+            bbox_threejs = converter_ifc_para_threejs(obj['bbox'])
+            bbox = obj['bbox']
+
+            # Filtra pontos do objeto para visualizacao
+            mask = (
+                (pts[:, 0] >= bbox['xmin'] - m) & (pts[:, 0] <= bbox['xmax'] + m) &
+                (pts[:, 1] >= bbox['ymin'] - m) & (pts[:, 1] <= bbox['ymax'] + m) &
+                (pts[:, 2] >= bbox['zmin'] - m) & (pts[:, 2] <= bbox['zmax'] + m)
+            )
+            pts_obj = pts[mask]
+
+            json_filename = None
+            if len(pts_obj) > 0:
+                cor = {
+                    'COMPLETO': [0.2, 0.8, 0.2],
+                    'PARCIAL':  [1.0, 0.6, 0.0],
+                    'AUSENTE':  [0.8, 0.2, 0.2],
+                }.get(status['code'], [0.5, 0.5, 0.5])
+                nome_safe = secure_filename(obj.get('nome', 'obj'))[:30]
+                json_filename = f"{nome_safe}_{obj.get('guid', '')[:8]}.json"
+                pts_threejs = converter_pontos_ifc_para_threejs(pts_obj)
+                json_data = {
+                    'positions': pts_threejs.flatten().tolist(),
+                    'color': cor,
+                    'count': len(pts_obj)
+                }
+                with open(output_dir / json_filename, 'w') as f:
+                    json.dump(json_data, f)
+                json_filename = f"{session_id}/{json_filename}"
+
+            resultados.append({
+                'guid':         obj.get('guid', ''),
+                'nome':         obj.get('nome', obj.get('tipo', '')),
+                'tipo':         obj['tipo'],
+                'status':       status,
+                'confianca_ml': round(float(proba[int(pred)]), 3),
+                'bbox':         obj['bbox'],
+                'bbox_normalized': bbox_threejs,
+                'json_file':    json_filename,
+                'n_pts':        int(feats[i][0]),
+            })
+
+        stats = Counter(r['status']['code'] for r in resultados)
+        total = len(resultados)
+        estatisticas = {
+            'total':         total,
+            'completos':     stats.get('COMPLETO', 0),
+            'parciais':      stats.get('PARCIAL',  0),
+            'iniciados':     0,
+            'ausentes':      stats.get('AUSENTE',  0),
+            'progresso_geral': round(
+                (stats.get('COMPLETO', 0) + stats.get('PARCIAL', 0) * 0.5) / total * 100, 1
+            ) if total > 0 else 0,
+        }
+
+        print(f"ML: C={stats.get('COMPLETO',0)} P={stats.get('PARCIAL',0)} A={stats.get('AUSENTE',0)}", flush=True)
+
+        return jsonify({
+            'pavimento':    pav_alvo,
+            'session_id':   session_id,
+            'modo':         'ai',
+            'estatisticas': estatisticas,
+            'resultados':   resultados,
+        })
+
+    except Exception as e:
+        print(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
 
 

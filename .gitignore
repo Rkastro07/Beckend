@@ -8,7 +8,19 @@ __pycache__/
 dataset/
 randlanet/data/*.npz
 randlanet/data/debug_report.json
+randlanet/data_instances/
 randlanet/checkpoints/
+
+# ML models (binarios grandes)
+ml/models/random_forest.pkl
+ml/__pycache__/
+
+# Outputs
+output_instances/
+
+# Claude Code
+.claude/
+bim-ai-superintendent/.claude/
 
 # Temp
 nul
