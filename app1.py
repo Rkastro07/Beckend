@@ -23,6 +23,7 @@ import numpy as np
 import ifcopenshell
 import ifcopenshell.geom
 import open3d as o3d
+from ifcopenshell.util.placement import get_local_placement
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -43,9 +44,10 @@ if sys.stderr.encoding and sys.stderr.encoding.lower() != 'utf-8':
 # CONFIGURAÇÃO
 # =========================
 TIPOS_INTERESSE = (
-    "IfcWall", "IfcSlab", "IfcDoor", "IfcWindow",
+    "IfcWall", "IfcSlab",
     "IfcColumn", "IfcBeam", "IfcStair", "IfcRoof", "IfcSanitaryTerminal"
 )
+# "IfcDoor" e "IfcWindow" removidos — bboxes sobrepõem paredes e causam leaking
 
 # Margens de tolerância
 MARGEM_PADRAO = 0.02      # 2cm
@@ -85,6 +87,17 @@ OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
 app = Flask(__name__)
 CORS(app)
 app.config["MAX_CONTENT_LENGTH"] = 2048 * 1024 * 1024  # 2GB
+
+# JSON encoder que converte numpy types automaticamente
+import json as _json
+class _NumpyEncoder(_json.JSONEncoder):
+    def default(self, obj):
+        if hasattr(obj, 'item'):      # np.int32, np.float64, etc.
+            return obj.item()
+        if hasattr(obj, 'tolist'):     # np.ndarray
+            return obj.tolist()
+        return super().default(obj)
+app.json_encoder = _NumpyEncoder
 
 
 # =========================
@@ -164,6 +177,23 @@ def extrair_objetos_por_pavimento(ifc_path: str, pavimento_alvo: str) -> List[Di
 
             nome = getattr(product, "Name", None) or f"{product.is_a()}_{product.GlobalId[:8]}"
 
+            # Extrai placement local para OBB: transforma verts globais → espaço local
+            matrix_local = None
+            bbox_local_obb = None
+            try:
+                matrix_local = get_local_placement(product.ObjectPlacement)
+                R = matrix_local[:3, :3]
+                t = matrix_local[:3, 3]
+                R_inv = np.linalg.inv(R)
+                vl = (R_inv @ (verts - t).T).T
+                bbox_local_obb = {
+                    "xmin": float(vl[:, 0].min()), "xmax": float(vl[:, 0].max()),
+                    "ymin": float(vl[:, 1].min()), "ymax": float(vl[:, 1].max()),
+                    "zmin": float(vl[:, 2].min()), "zmax": float(vl[:, 2].max()),
+                }
+            except Exception:
+                pass  # fallback para AABB global no filtro
+
             objetos.append({
                 "guid": product.GlobalId,
                 "tipo": product.is_a(),
@@ -175,9 +205,10 @@ def extrair_objetos_por_pavimento(ifc_path: str, pavimento_alvo: str) -> List[Di
                     "zmin": zmin, "zmax": zmax,
                 },
                 "volume_ifc": (xmax - xmin) * (ymax - ymin) * (zmax - zmin),
+                "matrix_local": matrix_local,
+                "bbox_local_obb": bbox_local_obb,
             })
         except Exception:
-            # print(f"[WARN] Falha em create_shape: {e}")
             continue
 
     print(f"Encontrados {len(objetos)} objetos no pavimento {pavimento_alvo}")
@@ -416,136 +447,162 @@ def filtrar_pontos_aabb(
 
 
 # =========================
+# FILTRO DE PONTOS (OBB)
+# =========================
+def filtrar_pontos_obb(
+    pts: np.ndarray,
+    bbox_local_obb: Dict,
+    matrix_local: np.ndarray,
+    margem: float,
+    frac_bottom: float = 0.0,
+    frac_top: float = 0.0,
+) -> np.ndarray:
+    """
+    Filtra pontos usando OBB: transforma pontos para o espaço local do objeto
+    (via placement IFC) e faz teste AABB nesse espaço.
+    Elimina os volumes fantasma nos cantos de objetos diagonais/rotacionados.
+    Fallback automático para AABB global se matrix_local ou bbox_local_obb for None.
+    """
+    if matrix_local is None or bbox_local_obb is None:
+        # Sem placement local, não há como fazer OBB — usa AABB global
+        from_bbox = bbox_local_obb  # será None, filtrar_pontos_aabb trata isso
+        return filtrar_pontos_aabb(pts, from_bbox or {}, margem, frac_bottom, frac_top)
+
+    if pts.size == 0:
+        return np.empty((0, 3), dtype=float)
+
+    # Transforma pontos do espaço global para o espaço local do objeto
+    R = matrix_local[:3, :3]
+    t = matrix_local[:3, 3]
+    try:
+        R_inv = np.linalg.inv(R)
+    except np.linalg.LinAlgError:
+        return filtrar_pontos_aabb(pts, bbox_local_obb, margem, frac_bottom, frac_top)
+
+    pts_local = (R_inv @ (pts - t).T).T  # (N, 3) no espaço local
+
+    # Aplica frac_bottom / frac_top no eixo Z local
+    zmin = bbox_local_obb["zmin"]
+    zmax = bbox_local_obb["zmax"]
+    altura = zmax - zmin
+    if altura > 0 and (frac_bottom > 0.0 or frac_top > 0.0):
+        frac_bottom = max(0.0, min(0.9, frac_bottom))
+        frac_top    = max(0.0, min(0.9, frac_top))
+        zmin_c = zmin + frac_bottom * altura
+        zmax_c = zmax - frac_top    * altura
+        if zmin_c < zmax_c:
+            zmin, zmax = zmin_c, zmax_c
+
+    mask = (
+        (pts_local[:, 0] >= bbox_local_obb["xmin"] - margem) &
+        (pts_local[:, 0] <= bbox_local_obb["xmax"] + margem) &
+        (pts_local[:, 1] >= bbox_local_obb["ymin"] - margem) &
+        (pts_local[:, 1] <= bbox_local_obb["ymax"] + margem) &
+        (pts_local[:, 2] >= zmin - margem) &
+        (pts_local[:, 2] <= zmax + margem)
+    )
+    return pts[mask]
+
+
+# =========================
 # ALINHAMENTO HÍBRIDO 2.0 (CORRIGIDO)
 # =========================
 def alinhar_nuvem_com_ifc(
     pts: np.ndarray,
     objetos_ifc: List[Dict],
-    max_pts_amostra: int = 150_000
+    max_pts_amostra: int = 120_000
 ) -> Tuple[np.ndarray, Dict]:
-    """
-    Versão Híbrida Corrigida:
-    - Usa bounds da nuvem COMPLETA para calcular translação (precisão).
-    - Usa AMOSTRA apenas para verificar o score de encaixe (velocidade).
-    """
-    print(f"\n🔍 Alinhando nuvem de pontos (Híbrido v2)...")
-
+    """Alinhamento v2.1 robust (copiado do app.py)."""
+    print(f"\n🔍 Alinhando nuvem (v2.1 robust)...")
     if pts.size == 0 or not objetos_ifc:
-        print("  ⚠️ Nuvem vazia ou sem objetos IFC. Pulando alinhamento.")
-        return pts, {"R": np.eye(3), "t": np.zeros(3), "scale": 1.0}
-
-    # 1. Analisa dimensões do IFC
+        return pts, {'R': np.eye(3), 't': np.zeros(3), 'scale': 1.0}
+    # 1. BOUNDS IFC
     ifc_min, ifc_max, ifc_center, ifc_extent = _bounds_from_objs(objetos_ifc)
-    diagonal_ifc = np.linalg.norm(ifc_extent)
-    print(f"  📏 Diagonal do IFC: {diagonal_ifc:.2f}m")
-
-    # 2. Analisa dimensões da Nuvem COMPLETA (Crucial para precisão)
-    pts_min_full = pts.min(axis=0)
-    pts_max_full = pts.max(axis=0)
-    pts_center_full = (pts_min_full + pts_max_full) / 2.0
-    diagonal_pts_raw = np.linalg.norm(pts_max_full - pts_min_full)
-
-    # 3. Cria amostra para o loop de Scoring (Pesado)
-    if pts.shape[0] > max_pts_amostra:
-        idx = np.random.choice(pts.shape[0], max_pts_amostra, replace=False)
-        pts_amostra = pts[idx]
-        print(f"  ✂️ Usando amostra de {pts_amostra.shape[0]:,} pontos para scoring")
+    diag_ifc = np.linalg.norm(ifc_extent)
+    # 2. BOUNDS NUVEM
+    pts_min = pts.min(axis=0)
+    pts_max = pts.max(axis=0)
+    pts_center = (pts_min + pts_max) / 2.0
+    diag_pts = np.linalg.norm(pts_max - pts_min)
+    # 3. AMOSTRA ROBUSTA (sem viés)
+    if len(pts) > max_pts_amostra:
+        step = len(pts) // max_pts_amostra
+        pts_sample = pts[::step]
     else:
-        pts_amostra = pts
-        print(f"  ✂️ Usando todos os {pts_amostra.shape[0]:,} pontos")
-
-    melhor_resultado = {
-        "total_pontos": -1,
-        "R": np.eye(3),
-        "t": np.zeros(3),
-        "scale": 1.0,
-    }
-
-    # Amostra de objetos para scoring
+        pts_sample = pts
+    print(f"   ✂️ Amostra: {len(pts_sample):,} pontos")
+    # 4. OBJETOS PARA SCORE
     objetos_teste = objetos_ifc
-    if len(objetos_ifc) > 50:
-        objetos_teste = random.sample(objetos_ifc, 50)
-
-    # Permutações
+    if len(objetos_ifc) > 60:
+        objetos_teste = random.sample(objetos_ifc, 60)
+    # 5. BUSCA
     perms = list(permutations((0, 1, 2), 3))
     signs = list(product([-1, 1], repeat=3))
-    count_validos = 0
-
+    melhor = {
+        'score': -1,
+        'R': np.eye(3),
+        't': np.zeros(3),
+        'scale': 1.0
+    }
     for scl in SCALES_TO_TEST:
-        diagonal_scaled = diagonal_pts_raw * scl
-        ratio = diagonal_scaled / diagonal_ifc if diagonal_ifc > 0 else 0
-
-        # Ignora se ficar muito pequeno ou muito grande
-        if ratio < 0.05 or ratio > 5.0:
+        ratio = (diag_pts * scl) / (diag_ifc + 1e-6)
+        if ratio < 0.6 or ratio > 1.8:
             continue
-
-        print(f"  ⚡ Testando escala {scl} (razão: {ratio:.2f})...")
-        count_validos += 1
-
+        print(f"   ⚡ escala {scl} (ratio={ratio:.2f})")
         for perm in perms:
             for sign in signs:
-                # 4. Truque Matemático: Rotacionar o CENTRO DA NUVEM COMPLETA
-                center_rotated = pts_center_full[list(perm)] * np.array(sign) * scl
-
-                # Amostra transformada para teste
-                P_sample = pts_amostra[:, perm]
-                S_sample = (P_sample * np.array(sign)) * float(scl)
-                smin_sample = S_sample.min(axis=0)
-
-                # Estratégia 1: Centro REAL da Nuvem no Centro do IFC
-                t_centro = (ifc_center - center_rotated).astype(float)
-
-                # Estratégia 2: Base da Amostra no Chão do IFC (ajuste fino vertical)
+                P = pts_sample[:, perm]
+                S = (P * np.array(sign)) * scl
+                center_rot = pts_center[list(perm)] * np.array(sign) * scl
+                t_centro = ifc_center - center_rot
+                smin = S.min(axis=0)
                 t_base = t_centro.copy()
-                t_base[2] = ifc_min[2] - smin_sample[2]
-
-                for t_atual in (t_centro, t_base):
-                    # Teste rápido na amostra
-                    pts_test = S_sample + t_atual
-                    total_pontos_capturados = 0
-
+                t_base[2] = ifc_min[2] - smin[2]
+                for t in (t_centro, t_base):
+                    pts_test = S + t
+                    score_total = 0.0
                     for obj in objetos_teste:
-                        bbox = obj["bbox"]
-                        m = 0.2
-
-                        # Vetorização (rápido)
+                        bbox = obj['bbox']
+                        dx = bbox['xmax'] - bbox['xmin']
+                        dy = bbox['ymax'] - bbox['ymin']
+                        dz = bbox['zmax'] - bbox['zmin']
+                        volume = max(dx * dy * dz, 1e-6)
+                        m = 0.15
                         mask = (
-                            (pts_test[:, 0] >= bbox["xmin"] - m) & (pts_test[:, 0] <= bbox["xmax"] + m) &
-                            (pts_test[:, 1] >= bbox["ymin"] - m) & (pts_test[:, 1] <= bbox["ymax"] + m) &
-                            (pts_test[:, 2] >= bbox["zmin"] - m) & (pts_test[:, 2] <= bbox["zmax"] + m)
+                            (pts_test[:, 0] >= bbox['xmin'] - m) &
+                            (pts_test[:, 0] <= bbox['xmax'] + m) &
+                            (pts_test[:, 1] >= bbox['ymin'] - m) &
+                            (pts_test[:, 1] <= bbox['ymax'] + m) &
+                            (pts_test[:, 2] >= bbox['zmin'] - m) &
+                            (pts_test[:, 2] <= bbox['zmax'] + m)
                         )
-                        total_pontos_capturados += np.count_nonzero(mask)
-
-                    if total_pontos_capturados > melhor_resultado["total_pontos"]:
-                        R = _perm_sign_to_R(perm, sign, scl)
-                        melhor_resultado = {
-                            "total_pontos": total_pontos_capturados,
-                            "R": R,
-                            "t": t_atual,
-                            "scale": scl,
+                        pts_in = pts_test[mask]
+                        count = len(pts_in)
+                        if count < 5:
+                            continue
+                        densidade = count / volume
+                        std = np.std(pts_in, axis=0).mean()
+                        penal_spread = 1.0 / (1.0 + std)
+                        score_local = densidade * penal_spread
+                        score_total += score_local
+                    if score_total > melhor['score']:
+                        melhor = {
+                            'score': score_total,
+                            'R': _perm_sign_to_R(perm, sign, scl),
+                            't': t,
+                            'scale': scl
                         }
-
-    if count_validos == 0:
-        print("  ⚠️ Nenhuma escala compatível! Verifique as unidades.")
-        return pts, {"R": np.eye(3), "t": np.zeros(3), "scale": 1.0}
-
-    print(
-        f"  ✅ Melhor alinhamento: {melhor_resultado['total_pontos']:,} pontos "
-        f"(escala {melhor_resultado['scale']})"
-    )
-
-    # Aplica a melhor transformação em TODOS os pontos
-    R_best = melhor_resultado["R"]
-    t_best = melhor_resultado["t"]
-    pts_alinhado = (pts @ R_best.T) + t_best
-
-    transformacao = {
-        "R": R_best,
-        "t": t_best,
-        "scale": melhor_resultado["scale"],
+    # 6. VALIDAÇÃO FINAL
+    if melhor['score'] < 1e-3:
+        print("⚠️ Alinhamento falhou (score muito baixo)")
+        return pts, {'R': np.eye(3), 't': np.zeros(3), 'scale': 1.0}
+    print(f"   ✅ Melhor score: {melhor['score']:.4f} | escala={melhor['scale']}")
+    pts_alinhado = (pts @ melhor['R'].T) + melhor['t']
+    return pts_alinhado, {
+        'R': melhor['R'],
+        't': melhor['t'],
+        'scale': melhor['scale']
     }
-
-    return pts_alinhado, transformacao
 
 
 # =========================
@@ -654,6 +711,11 @@ def normalizar_coordenadas(
             "zmin": bbox["zmin"] - global_center[2],
             "zmax": bbox["zmax"] - global_center[2],
         }
+        # Atualiza translação do placement local para OBB acompanhar a normalização
+        if obj.get("matrix_local") is not None:
+            ml = obj["matrix_local"].copy()
+            ml[:3, 3] -= global_center
+            obj_norm["matrix_local"] = ml
         objetos_normalized.append(obj_norm)
 
     transform_info = {"translation": global_center.tolist()}
@@ -908,6 +970,12 @@ def analisar_pavimento_completo(
     print(f"{'Nome':<25} {'Tipo':<12} {'Pontos':>8} {'Cobert.':>8} {'Altura':>15} {'Status':<20}")
     print("=" * 120)
 
+    n_obb = sum(
+        1 for o in objetos_ifc
+        if o.get("matrix_local") is not None and o.get("bbox_local_obb") is not None
+    )
+    print(f"\n🔷 OBB ativo: {n_obb}/{len(objetos_ifc)} objetos (restante usa AABB fallback)")
+
     for obj in objetos_ifc:
         # Margem baseada no tipo
         margem = MARGEM_PORTA_JAN if obj["tipo"] in ("IfcDoor", "IfcWindow") else MARGEM_PADRAO
@@ -925,28 +993,28 @@ def analisar_pavimento_completo(
             elif obj.get("conecta_teto") and not obj.get("conecta_piso"):
                 frac_top = 0.10
 
-        # BBox local (com ajuste para conexões)
-        bbox_local = dict(obj["bbox"])
+        # OBB: usa bbox no espaço local do objeto (cópia para não modificar o original)
+        bbox_obb = dict(obj["bbox_local_obb"]) if obj.get("bbox_local_obb") else None
 
-        # Encolhe bbox para paredes de conexão
-        if obj["tipo"] == "IfcWall" and obj.get("eh_conexao"):
-            dx = bbox_local["xmax"] - bbox_local["xmin"]
-            dy = bbox_local["ymax"] - bbox_local["ymin"]
+        # Encolhe bbox para paredes de conexão (aplicado no espaço local — mais preciso)
+        if obj["tipo"] == "IfcWall" and obj.get("eh_conexao") and bbox_obb:
+            dx_l = bbox_obb["xmax"] - bbox_obb["xmin"]
+            dy_l = bbox_obb["ymax"] - bbox_obb["ymin"]
             factor = 0.10
-
-            if dx >= dy:
-                shrink = dx * factor
-                bbox_local["xmin"] += shrink
-                bbox_local["xmax"] -= shrink
+            if dx_l >= dy_l:
+                shrink = dx_l * factor
+                bbox_obb["xmin"] += shrink
+                bbox_obb["xmax"] -= shrink
             else:
-                shrink = dy * factor
-                bbox_local["ymin"] += shrink
-                bbox_local["ymax"] -= shrink
+                shrink = dy_l * factor
+                bbox_obb["ymin"] += shrink
+                bbox_obb["ymax"] -= shrink
 
-        # Filtra pontos
-        pts_obj = filtrar_pontos_aabb(
+        # Filtra pontos com OBB (fallback automático para AABB se sem placement)
+        pts_obj = filtrar_pontos_obb(
             pts,
-            bbox_local,
+            bbox_obb,
+            obj.get("matrix_local"),
             margem,
             frac_bottom=frac_bottom,
             frac_top=frac_top,
@@ -1162,6 +1230,7 @@ def analisar_pavimento():
         return jsonify({
             "pavimento": pav_alvo,
             "session_id": session_id,
+            "modo": "bbox",
             "estatisticas": estatisticas,
             "resultados": resultados,
         })
