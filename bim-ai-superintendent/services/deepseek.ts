@@ -1,6 +1,6 @@
 import { AnalysisResult } from "../types";
 
-const BACKEND_URL = "http://localhost:8080";
+const BACKEND_URL = "http://localhost:8081";
 
 export const generateExecutiveReport = async (
     analysis: AnalysisResult,

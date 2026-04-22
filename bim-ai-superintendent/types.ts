@@ -38,6 +38,18 @@ export interface BimItem {
   json_url?: string;
   ply_file?: string;
   bbox_normalized: BBox;
+  obb_corners?: number[][] | null; // 8 vértices OBB em coords Three.js (null → usa AABB)
+  // Cross-floor (pilar/shaft/estrutura vertical longa fatiada por andar)
+  cross_floor?: boolean;
+  altura_total?: number;                 // altura total do elemento (todos os andares)
+  z_total?: [number, number];            // [zmin, zmax] globais
+  andares_atravessa?: string[];          // nomes dos pavimentos que o elemento cruza
+  storey_original_ifc?: string;          // pavimento a que o IFC atribui o elemento
+  fatia_atual?: {
+    pavimento: string;
+    z_range:   [number, number];
+    altura:    number;
+  };
 }
 
 export interface AnalysisResult {

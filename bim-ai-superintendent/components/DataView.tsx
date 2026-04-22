@@ -59,7 +59,7 @@ const ObjectPoints = ({ jsonFile, color }: { jsonFile: string; color: string }) 
     if (!jsonFile) return;
 
     // Constrói URL correta: API retorna "session_id/arquivo.json"
-    const baseUrl = 'http://localhost:8080/outputs/';
+    const baseUrl = 'http://localhost:8081/outputs/';
     const finalUrl = jsonFile.startsWith('http') ? jsonFile : `${baseUrl}${jsonFile}`;
 
     console.log("Carregando pontos de:", finalUrl);
@@ -556,11 +556,61 @@ const MeasureTool: React.FC = () => {
 // --- COMPONENTE DE BOUNDING BOX ---
 
 // --- HITBOX CLICÁVEL (seleção de objetos no 3D) ---
+// Triângulos das 6 faces do OBB (2 triângulos por face = 12 triângulos)
+const OBB_FACES = new Uint16Array([
+  0,1,2,  0,2,3,    // bottom
+  4,6,5,  4,7,6,    // top
+  0,4,5,  0,5,1,    // side1
+  1,5,6,  1,6,2,    // side2
+  2,6,7,  2,7,3,    // side3
+  3,7,4,  3,4,0,    // side4
+]);
+
 const SelectableHitbox: React.FC<{
   item: any;
   isSelected: boolean;
   onSelect: (guid: string) => void;
 }> = ({ item, isSelected, onSelect }) => {
+  const corners = item.obb_corners;
+
+  // ----- Modo OBB (caixa orientada) -----
+  if (corners && Array.isArray(corners) && corners.length === 8) {
+    const { meshGeom, lineGeom } = React.useMemo(() => {
+      const positions = new Float32Array(8 * 3);
+      for (let i = 0; i < 8; i++) {
+        positions[i * 3]     = corners[i][0];
+        positions[i * 3 + 1] = corners[i][1];
+        positions[i * 3 + 2] = corners[i][2];
+      }
+      const mesh = new THREE.BufferGeometry();
+      mesh.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      mesh.setIndex(new THREE.BufferAttribute(OBB_FACES, 1));
+      mesh.computeVertexNormals();
+
+      const line = new THREE.BufferGeometry();
+      line.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      line.setIndex(new THREE.BufferAttribute(OBB_EDGES, 1));
+      return { meshGeom: mesh, lineGeom: line };
+    }, [corners]);
+
+    return (
+      <group>
+        <mesh
+          geometry={meshGeom}
+          onClick={(e) => { e.stopPropagation(); onSelect(item.guid); }}
+        >
+          <meshBasicMaterial visible={false} />
+        </mesh>
+        {isSelected && (
+          <lineSegments geometry={lineGeom}>
+            <lineBasicMaterial color="#00ffff" transparent opacity={0.9} />
+          </lineSegments>
+        )}
+      </group>
+    );
+  }
+
+  // ----- Fallback AABB -----
   const bbox = item.bbox_normalized || item.bbox;
   if (!bbox) return null;
 
@@ -577,12 +627,10 @@ const SelectableHitbox: React.FC<{
 
   return (
     <group position={center}>
-      {/* Hitbox invisível para capturar cliques */}
       <mesh onClick={(e) => { e.stopPropagation(); onSelect(item.guid); }}>
         <boxGeometry args={[width, height, depth]} />
         <meshBasicMaterial visible={false} />
       </mesh>
-      {/* Highlight quando selecionado */}
       {isSelected && (
         <mesh>
           <boxGeometry args={[width + 0.05, height + 0.05, depth + 0.05]} />
@@ -593,43 +641,66 @@ const SelectableHitbox: React.FC<{
   );
 };
 
-const BimBoundingBox: React.FC<{ item: any }> = ({ item }) => {
-  // Verifica se bbox existe (compatibilidade com ambos formatos)
-  const bbox = item.bbox_normalized || item.bbox;
+// Índices das 12 arestas que conectam os 8 cantos do OBB
+// (ordem: 0-3 face inferior CCW, 4-7 face superior CCW)
+const OBB_EDGES = new Uint16Array([
+  0, 1, 1, 2, 2, 3, 3, 0,    // face inferior
+  4, 5, 5, 6, 6, 7, 7, 4,    // face superior
+  0, 4, 1, 5, 2, 6, 3, 7,    // arestas verticais
+]);
 
+// Desenha OBB wireframe a partir de 8 cantos [x,y,z] em coords Three.js
+const ObbWireframe: React.FC<{ corners: number[][]; color: string; opacity?: number }> = ({
+  corners, color, opacity = 0.4,
+}) => {
+  const geometry = React.useMemo(() => {
+    const positions = new Float32Array(8 * 3);
+    for (let i = 0; i < 8; i++) {
+      positions[i * 3]     = corners[i][0];
+      positions[i * 3 + 1] = corners[i][1];
+      positions[i * 3 + 2] = corners[i][2];
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    g.setIndex(new THREE.BufferAttribute(OBB_EDGES, 1));
+    return g;
+  }, [corners]);
+
+  return (
+    <lineSegments geometry={geometry}>
+      <lineBasicMaterial color={color} transparent opacity={opacity} />
+    </lineSegments>
+  );
+};
+
+const BimBoundingBox: React.FC<{ item: any }> = ({ item }) => {
+  // Preferência: OBB (8 cantos orientados) → fallback AABB
+  const corners = item.obb_corners;
+  const color = item.status?.cor || '#cccccc';
+
+  if (corners && Array.isArray(corners) && corners.length === 8) {
+    return <ObbWireframe corners={corners} color={color} opacity={0.4} />;
+  }
+
+  // ----- Fallback AABB -----
+  const bbox = item.bbox_normalized || item.bbox;
   if (!bbox) {
     console.warn("Item sem bbox:", item.nome || item.guid);
     return null;
   }
-
   const { xmin, xmax, ymin, ymax, zmin, zmax } = bbox;
-
   const width = Math.abs(xmax - xmin);
   const height = Math.abs(ymax - ymin);
   const depth = Math.abs(zmax - zmin);
-
-  // Evita boxes degeneradas (tamanho zero)
-  if (width < 0.01 || height < 0.01 || depth < 0.01) {
-    return null;
-  }
-
+  if (width < 0.01 || height < 0.01 || depth < 0.01) return null;
   const center = new THREE.Vector3(
-    xmin + width / 2,
-    ymin + height / 2,
-    zmin + depth / 2
+    xmin + width / 2, ymin + height / 2, zmin + depth / 2
   );
-
   return (
     <group position={center}>
-      {/* Wireframe da bounding box */}
       <mesh>
         <boxGeometry args={[width, height, depth]} />
-        <meshBasicMaterial
-          color={item.status?.cor || '#cccccc'}
-          wireframe
-          transparent
-          opacity={0.4}
-        />
+        <meshBasicMaterial color={color} wireframe transparent opacity={0.4} />
       </mesh>
     </group>
   );
@@ -976,7 +1047,37 @@ export const DataView: React.FC<{
                     item.status.code === 'PARCIAL' ? 'bg-orange-50 hover:bg-slate-50' :
                     'hover:bg-slate-50'
                   }`}>
-                  <td className="px-4 py-2 font-medium text-slate-800">{item.nome}</td>
+                  <td className="px-4 py-2 font-medium text-slate-800">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span>{item.nome}</span>
+                      {item.cross_floor && (
+                        <span
+                          className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-100 text-amber-800 border border-amber-300"
+                          title={
+                            `Estrutura vertical atravessando andares\n` +
+                            `Altura total: ${item.altura_total?.toFixed(2)}m ` +
+                            `(Z ${item.z_total?.[0]?.toFixed(2)} → ${item.z_total?.[1]?.toFixed(2)})\n` +
+                            `Atravessa: ${(item.andares_atravessa || []).join(', ')}\n` +
+                            `Storey IFC: ${item.storey_original_ifc}\n` +
+                            (item.fatia_atual
+                              ? `Fatia aqui: ${item.fatia_atual.altura?.toFixed(2)}m ` +
+                                `(Z ${item.fatia_atual.z_range?.[0]?.toFixed(2)} → ${item.fatia_atual.z_range?.[1]?.toFixed(2)})`
+                              : '')
+                          }
+                        >
+                          ⚡ Cross-floor
+                        </span>
+                      )}
+                    </div>
+                    {item.cross_floor && (
+                      <div className="text-[11px] text-slate-500 mt-0.5">
+                        Total {item.altura_total?.toFixed(2)}m · atravessa{' '}
+                        {(item.andares_atravessa || []).length} andar
+                        {(item.andares_atravessa || []).length === 1 ? '' : 'es'}
+                        {item.fatia_atual && ` · fatia ${item.fatia_atual.altura?.toFixed(2)}m`}
+                      </div>
+                    )}
+                  </td>
                   <td className="px-4 py-2 text-slate-600">{item.tipo.replace('Ifc', '')}</td>
                   <td className="px-4 py-2 text-center">
                     <span className={`px-2 py-1 rounded text-xs font-medium ${
