@@ -21,6 +21,7 @@ export default function App() {
   
   // File State
   const [ifcFile, setIfcFile] = useState<File | null>(null);
+  const [ifcToken, setIfcToken] = useState<string | null>(null);
   const [plyFile, setPlyFile] = useState<File | null>(null);
   const [csvFile, setCsvFile] = useState<File | null>(null);
   const [csvContent, setCsvContent] = useState<string | null>(null);
@@ -28,10 +29,12 @@ export default function App() {
   // Handlers
   const handleIfcUpload = async (file: File) => {
     setIfcFile(file);
+    setIfcToken(null);  // invalida token anterior até a nova listagem resolver
     // Automatically trigger floor listing when IFC is uploaded
     try {
-      const floorList = await listFloors(file);
+      const { floors: floorList, ifcToken: token } = await listFloors(file);
       setFloors(floorList);
+      setIfcToken(token);  // permite que as próximas análises pulem o reupload
     } catch (e) {
       console.error(e);
       alert("Erro ao listar andares do IFC.");
@@ -58,19 +61,19 @@ export default function App() {
     setAnalysisResultAI(null);
     try {
       if (analysisMode === 'bbox') {
-        const result = await analyzeFloor(ifcFile, plyFile, selectedFloorId);
+        const result = await analyzeFloor(ifcFile, plyFile, selectedFloorId, ifcToken);
         setAnalysisResult(result);
       } else if (analysisMode === 'ai') {
-        const result = await analyzeFloorAI(ifcFile, plyFile, selectedFloorId);
+        const result = await analyzeFloorAI(ifcFile, plyFile, selectedFloorId, ifcToken);
         setAnalysisResultAI(result);
       } else if (analysisMode === 'instances') {
-        const result = await analyzeFloorInstances(ifcFile, plyFile, selectedFloorId);
+        const result = await analyzeFloorInstances(ifcFile, plyFile, selectedFloorId, ifcToken);
         setAnalysisResult(result);
       } else {
         // both — roda em paralelo
         const [bbox, ai] = await Promise.all([
-          analyzeFloor(ifcFile, plyFile, selectedFloorId),
-          analyzeFloorAI(ifcFile, plyFile, selectedFloorId)
+          analyzeFloor(ifcFile, plyFile, selectedFloorId, ifcToken),
+          analyzeFloorAI(ifcFile, plyFile, selectedFloorId, ifcToken)
         ]);
         setAnalysisResult(bbox);
         setAnalysisResultAI(ai);

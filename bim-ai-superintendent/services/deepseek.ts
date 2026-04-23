@@ -68,7 +68,7 @@ export const processVoiceQuery = async (
     analysis: AnalysisResult,
     csvContent: string | null
 ): Promise<string> => {
-    return "Assistente de voz requer Gemini API. Use a caixa de texto abaixo para conversar via DeepSeek.";
+    return "Assistente de voz indisponível no momento. Use a caixa de texto abaixo para conversar via DeepSeek.";
 };
 
 // CHAT COM DEEPSEEK - DIRETO SEM BACKEND

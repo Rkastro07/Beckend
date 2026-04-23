@@ -155,7 +155,9 @@ def _valid_upload(f, exts: Tuple[str, ...]) -> bool:
 # Camada (b): /api/listar_pavimentos devolve `ifc_token` (hash).
 #   Endpoints de análise aceitam token em vez de reupload do arquivo.
 import hashlib
+import threading
 _IFC_CACHE: Dict[str, Dict] = {}  # hash -> {"file": ifcopenshell.file, "path": str}
+_IFC_CACHE_LOCK = threading.Lock()  # Flask threaded por padrão; serializa populate do cache
 
 
 def _hash_ifc_path(path: str, sample_bytes: int = 1024 * 1024) -> str:
@@ -169,13 +171,21 @@ def _hash_ifc_path(path: str, sample_bytes: int = 1024 * 1024) -> str:
 
 
 def _cache_ifc(path: str) -> str:
-    """Abre o IFC (se ainda não estiver em cache) e retorna o token."""
+    """Abre o IFC (se ainda não estiver em cache) e retorna o token.
+
+    Double-checked locking: check sem lock (rápido) → lock → re-check → parse.
+    Evita que duas threads façam ifcopenshell.open() do mesmo arquivo em paralelo.
+    """
     token = _hash_ifc_path(path)
-    if token not in _IFC_CACHE:
-        print(f"📂 IFC cache miss ({token[:8]}…) — fazendo parse de {os.path.basename(path)}")
-        _IFC_CACHE[token] = {"file": ifcopenshell.open(path), "path": path}
-    else:
+    if token in _IFC_CACHE:
         print(f"⚡ IFC cache hit ({token[:8]}…) — reusando parse")
+        return token
+    with _IFC_CACHE_LOCK:
+        if token not in _IFC_CACHE:
+            print(f"📂 IFC cache miss ({token[:8]}…) — fazendo parse de {os.path.basename(path)}")
+            _IFC_CACHE[token] = {"file": ifcopenshell.open(path), "path": path}
+        else:
+            print(f"⚡ IFC cache hit ({token[:8]}…) — outro thread completou o parse")
     return token
 
 
@@ -1857,8 +1867,8 @@ def analisar_pavimento():
         ply_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ply_file.filename)}"
         ply_file.save(str(ply_path))
 
-        # Extrai objetos do pavimento
-        objetos = extrair_objetos_por_pavimento(str(ifc_path), pav_alvo)
+        # Extrai objetos do pavimento (inclui estrutura cruzando — consistente com /api/analisar_ai)
+        objetos = extrair_objetos_por_pavimento(str(ifc_path), pav_alvo, incluir_estrutura_cruzando=True)
         if not objetos:
             return jsonify(
                 {'error': f'Nenhum objeto encontrado no pavimento "{pav_alvo}"'}), 400
@@ -1964,7 +1974,7 @@ def analisar_instancias():
         ply_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ply_file.filename)}"
         ply_file.save(str(ply_path))
 
-        objetos = extrair_objetos_por_pavimento(str(ifc_path), pav_alvo)
+        objetos = extrair_objetos_por_pavimento(str(ifc_path), pav_alvo, incluir_estrutura_cruzando=True)
         if not objetos:
             return jsonify({'error': f'Nenhum objeto no pavimento "{pav_alvo}"'}), 400
 
@@ -2159,22 +2169,26 @@ def chat():
 _ML_MODEL  = None
 _ML_SCALER = None
 _ML_MODEL_PATH = Path(__file__).parent / "ml" / "models" / "random_forest.pkl"
+_ML_LOCK = threading.Lock()  # serializa o pickle.load na primeira requisição concorrente
 
 def _carregar_modelo_ml():
     global _ML_MODEL, _ML_SCALER
     if _ML_MODEL is not None:
         return True
-    try:
-        import pickle
-        with open(_ML_MODEL_PATH, 'rb') as f:
-            saved = pickle.load(f)
-        _ML_MODEL  = saved['model']
-        _ML_SCALER = saved['scaler']
-        print(f"ML: Random Forest carregado")
-        return True
-    except Exception as e:
-        print(f"ML: modelo nao disponivel — {e}")
-        return False
+    with _ML_LOCK:
+        if _ML_MODEL is not None:  # outro thread carregou enquanto esperávamos
+            return True
+        try:
+            import pickle
+            with open(_ML_MODEL_PATH, 'rb') as f:
+                saved = pickle.load(f)
+            _ML_MODEL  = saved['model']
+            _ML_SCALER = saved['scaler']
+            print(f"ML: Random Forest carregado")
+            return True
+        except Exception as e:
+            print(f"ML: modelo nao disponivel — {e}")
+            return False
 
 _ML_DISPONIVEL = _carregar_modelo_ml()
 

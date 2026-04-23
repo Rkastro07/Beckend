@@ -1,6 +1,6 @@
 {
   "name": " BIM AI Superintendent",
-  "description": "Next-gen construction management dashboard integrating BIM data analysis with Multimodal Gemini AI for voice-driven site supervision.",
+  "description": "Next-gen construction management dashboard integrating BIM data analysis for site supervision.",
   "requestFramePermissions": [
     "microphone"
   ]

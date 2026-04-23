@@ -1,7 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { AnalysisResult, ChatMessage } from '../types';
-import { processVoiceQuery } from '../services/gemini';
-import { processChatQuery } from '../services/deepseek';
+import { processVoiceQuery, processChatQuery } from '../services/deepseek';
 import { Mic, Square, Send, User, Bot, Loader2 } from 'lucide-react';
 
 interface VoiceAssistantProps {
@@ -238,7 +237,7 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ result, csvConte
             )}
           </button>
           <div className="absolute bottom-0 text-[10px] text-slate-400">
-            {isRecording ? 'Gravando... Toque para parar' : 'Ou use voz (Gemini)'}
+            {isRecording ? 'Gravando... Toque para parar' : 'Ou use voz'}
           </div>
         </div>
       </div>

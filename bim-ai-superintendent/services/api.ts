@@ -2,9 +2,14 @@ import { Floor, AnalysisResult, BimItem } from '../types';
 
 const API_BASE_URL = 'http://localhost:8081';
 
-export const listFloors = async (ifcFile: File): Promise<Floor[]> => {
+export interface ListFloorsResult {
+  floors: Floor[];
+  ifcToken: string | null;  // usado pelos endpoints de análise p/ pular reupload
+}
+
+export const listFloors = async (ifcFile: File): Promise<ListFloorsResult> => {
   const formData = new FormData();
-  formData.append('ifc_file', ifcFile); 
+  formData.append('ifc_file', ifcFile);
 
   try {
     const response = await fetch(`${API_BASE_URL}/api/listar_pavimentos`, {
@@ -17,18 +22,19 @@ export const listFloors = async (ifcFile: File): Promise<Floor[]> => {
     }
 
     const data = await response.json();
-    
+
     if (data.pavimentos && Array.isArray(data.pavimentos)) {
-        return data.pavimentos.map((p: string) => ({ id: p, name: p }));
+      const floors = data.pavimentos.map((p: string) => ({ id: p, name: p }));
+      return { floors, ifcToken: data.ifc_token ?? null };
     }
-    
-    if (Array.isArray(data)) return data;
-    
-    return [];
+
+    if (Array.isArray(data)) return { floors: data, ifcToken: null };
+
+    return { floors: [], ifcToken: null };
   } catch (error) {
     console.error("Failed to list floors:", error);
-    alert("Erro ao conectar com o servidor. Verifique se o Cloud Run está ativo.");
-    return []; 
+    alert("Erro ao conectar com o servidor. Verifique se o backend está ativo.");
+    return { floors: [], ifcToken: null };
   }
 };
 
@@ -38,18 +44,37 @@ const _doAnalysis = async (
   ifcFile: File,
   plyFile: File,
   floorId: string,
-  endpoint: string
+  endpoint: string,
+  ifcToken: string | null
 ): Promise<AnalysisResult> => {
   const formData = new FormData();
-  formData.append('ifc_file', ifcFile);
+  // Se temos token, o backend reusa o IFC cacheado e pulamos o reupload (pode economizar dezenas de MB)
+  if (ifcToken) {
+    formData.append('ifc_token', ifcToken);
+  } else {
+    formData.append('ifc_file', ifcFile);
+  }
   formData.append('ply_file', plyFile);
   formData.append('pavimento', floorId);
 
   try {
-    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+    let response = await fetch(`${API_BASE_URL}${endpoint}`, {
       method: 'POST',
       body: formData,
     });
+
+    // 410 = ifc_token desconhecido (ex: backend reiniciou). Retry com upload completo.
+    if (response.status === 410 && ifcToken) {
+      console.warn("ifc_token expirado, refazendo upload completo do IFC");
+      const retryForm = new FormData();
+      retryForm.append('ifc_file', ifcFile);
+      retryForm.append('ply_file', plyFile);
+      retryForm.append('pavimento', floorId);
+      response = await fetch(`${API_BASE_URL}${endpoint}`, {
+        method: 'POST',
+        body: retryForm,
+      });
+    }
 
     if (!response.ok) {
        const errText = await response.text();
@@ -139,13 +164,13 @@ const _doAnalysis = async (
 };
 
 export const analyzeFloor = (
-  ifcFile: File, plyFile: File, floorId: string
-): Promise<AnalysisResult> => _doAnalysis(ifcFile, plyFile, floorId, '/api/analisar_pavimento');
+  ifcFile: File, plyFile: File, floorId: string, ifcToken: string | null = null
+): Promise<AnalysisResult> => _doAnalysis(ifcFile, plyFile, floorId, '/api/analisar_pavimento', ifcToken);
 
 export const analyzeFloorAI = (
-  ifcFile: File, plyFile: File, floorId: string
-): Promise<AnalysisResult> => _doAnalysis(ifcFile, plyFile, floorId, '/api/analisar_ai');
+  ifcFile: File, plyFile: File, floorId: string, ifcToken: string | null = null
+): Promise<AnalysisResult> => _doAnalysis(ifcFile, plyFile, floorId, '/api/analisar_ai', ifcToken);
 
 export const analyzeFloorInstances = (
-  ifcFile: File, plyFile: File, floorId: string
-): Promise<AnalysisResult> => _doAnalysis(ifcFile, plyFile, floorId, '/api/analisar_instancias');
+  ifcFile: File, plyFile: File, floorId: string, ifcToken: string | null = null
+): Promise<AnalysisResult> => _doAnalysis(ifcFile, plyFile, floorId, '/api/analisar_instancias', ifcToken);
