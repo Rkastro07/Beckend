@@ -130,10 +130,21 @@ app.config['MAX_CONTENT_LENGTH'] = 2048 * 1024 * 1024  # 2GB
 
 @app.after_request
 def _no_cache(response):
-    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-    response.headers['Pragma'] = 'no-cache'
-    response.headers['Expires'] = '0'
+    # /outputs/* são imutáveis (nome tem session_id + guid) — deixa o browser cachear
+    if request.path.startswith('/outputs/'):
+        response.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+    else:
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
     return response
+
+
+def _valid_upload(f, exts: Tuple[str, ...]) -> bool:
+    """True se o filename termina numa das extensões permitidas (case-insensitive)."""
+    if f is None or not f.filename:
+        return False
+    return f.filename.lower().endswith(exts)
 
 # JSON encoder que converte numpy types automaticamente (evita int32/float64 errors)
 import json as _json
@@ -201,17 +212,9 @@ def calcular_obb_corners_threejs(obj: Dict) -> List[List[float]]:
 
     # Se é cross-floor fatiado, clipa Z global ao range da fatia
     slice_z = obj.get('slice_z')
-    _nome_dbg = str(obj.get('nome', ''))
-    _dbg_match = 'pil_Radondo' in _nome_dbg or 'pil_radondo' in _nome_dbg.lower()
-    if _dbg_match:
-        print(f"[OBB-DBG] {_nome_dbg} cross={obj.get('cross_floor')} "
-              f"slice_z={slice_z} "
-              f"cantos_z_pre=[{cantos_world[:,2].min():.2f},{cantos_world[:,2].max():.2f}]")
     if slice_z is not None:
         z_lo, z_hi = slice_z
         cantos_world[:, 2] = np.clip(cantos_world[:, 2], z_lo, z_hi)
-        if _dbg_match:
-            print(f"[OBB-DBG]   cantos_z_pos=[{cantos_world[:,2].min():.2f},{cantos_world[:,2].max():.2f}]")
 
     # Converte IFC (Z=up) → Three.js (Y=up)
     cantos_tj = cantos_world.copy()
@@ -280,9 +283,37 @@ def extrair_objetos_por_pavimento(
     n_por_geom   = 0
     # Cache da geometria de produtos NÃO matched por storey (reaproveitar na 2ª passada)
     cache_nao_storey = []  # lista de (product, tipo_base, pav_do_objeto, verts, shape)
-    # Z-range por storey normalizado (construído na 1ª passada, usado pra
-    # computar "andares_atravessa" dos elementos cross-floor na 2ª passada)
+    # Z-range por storey normalizado.
+    # FONTE PRIMÁRIA: IfcBuildingStorey.Elevation (valor oficial do projeto).
+    #   zmin = Elevation do storey; zmax = Elevation do próximo storey.
+    # FALLBACK: envelope dos objetos (só se Elevation ausente), atualizado no loop abaixo.
+    # Usar Elevation evita que objetos cross-floor marcados num storey puxem o
+    # range pra fora do limite físico real do pavimento.
     storeys_z: Dict[str, Tuple[float, float]] = {}
+    storeys_z_from_elev: Dict[str, Tuple[float, float]] = {}
+    try:
+        _sts = [s for s in f.by_type("IfcBuildingStorey")
+                if getattr(s, "Elevation", None) is not None]
+        _sts.sort(key=lambda s: float(s.Elevation))
+        for i, s in enumerate(_sts):
+            z_lo = float(s.Elevation)
+            if i + 1 < len(_sts):
+                z_hi = float(_sts[i + 1].Elevation)
+            else:
+                # Último storey: sem próximo, estima teto com altura média dos outros
+                if len(_sts) >= 2:
+                    alturas = [float(_sts[j+1].Elevation) - float(_sts[j].Elevation)
+                               for j in range(len(_sts)-1)]
+                    h_med = sum(alturas) / len(alturas)
+                else:
+                    h_med = 3.0
+                z_hi = z_lo + h_med
+            storeys_z_from_elev[_norm_pav(s.Name)] = (z_lo, z_hi)
+        if storeys_z_from_elev:
+            print(f"   📏 Z-range de {len(storeys_z_from_elev)} storeys via IfcBuildingStorey.Elevation")
+            storeys_z.update(storeys_z_from_elev)
+    except Exception as _e:
+        print(f"   ⚠️ Falha ao ler Elevation dos storeys: {_e}. Usando envelope fallback.")
 
     for product in f.by_type("IfcProduct"):
         tipo_base = None
@@ -311,12 +342,10 @@ def extrair_objetos_por_pavimento(
             if verts.size == 0:
                 continue
 
-            # Atualiza Z-range do storey normalizado (com dados reais dos elementos).
-            # Usa só elementos "horizontais normais" (altura pequena em relação a XY)
-            # pra o range não ser dominado por pilares altos; mas pra simplicidade
-            # pegamos todos — o cross-floor é exceção.
+            # Atualiza Z-range SÓ se Elevation não deu conta (storey sem Elevation no IFC).
+            # Se já veio de Elevation, NÃO mexe — senão objetos cross-floor puxam o range.
             pav_norm_obj = _norm_pav(pav_do_objeto)
-            if pav_norm_obj:
+            if pav_norm_obj and pav_norm_obj not in storeys_z_from_elev:
                 z_lo = float(verts[:, 2].min())
                 z_hi = float(verts[:, 2].max())
                 if pav_norm_obj in storeys_z:
@@ -403,8 +432,10 @@ def extrair_objetos_por_pavimento(
     if usa_geom and alvo_norm in storeys_z and cache_nao_storey:
         storey_z_min, storey_z_max = storeys_z[alvo_norm]
         altura_storey = storey_z_max - storey_z_min
+        _fonte_z = "Elevation" if alvo_norm in storeys_z_from_elev else "envelope (fallback)"
         print(f"   🔲 Z-range do storey '{alvo_norm}': "
-              f"[{storey_z_min:.2f}, {storey_z_max:.2f}] m  (altura {altura_storey:.2f}m)")
+              f"[{storey_z_min:.2f}, {storey_z_max:.2f}] m  (altura {altura_storey:.2f}m)  "
+              f"← fonte: {_fonte_z}")
         print(f"      Candidatos de outros storeys: {len(cache_nao_storey)} objetos")
 
         MIN_OVERLAP_M    = 0.05    # 5cm
@@ -1404,18 +1435,48 @@ def detectar_objetos_fantasma(
             if other_data['num_pontos'] <= data['num_pontos']:
                 continue
 
-            other_bbox = other_data['obj']['bbox']
+            other_obj = other_data['obj']
             m = MARGEM_PADRAO
 
-            # Verifica quais dos MEUS pontos estão dentro do bbox do outro
-            mask_in_other = (
-                (meus_pontos[:, 0] >= other_bbox['xmin'] - m) &
-                (meus_pontos[:, 0] <= other_bbox['xmax'] + m) &
-                (meus_pontos[:, 1] >= other_bbox['ymin'] - m) &
-                (meus_pontos[:, 1] <= other_bbox['ymax'] + m) &
-                (meus_pontos[:, 2] >= other_bbox['zmin'] - m) &
-                (meus_pontos[:, 2] <= other_bbox['zmax'] + m)
-            )
+            # OBB do vizinho (espaço local) — evita falsos positivos em paredes
+            # diagonais, onde a AABB world engloba o canto vazio.
+            other_ml      = other_obj.get('matrix_local')
+            other_bbox_l  = other_obj.get('bbox_local_obb')
+            if other_ml is not None and other_bbox_l is not None:
+                try:
+                    R_inv = np.linalg.inv(other_ml[:3, :3])
+                    t     = other_ml[:3, 3]
+                    pts_local = (R_inv @ (meus_pontos - t).T).T
+                    mask_in_other = (
+                        (pts_local[:, 0] >= other_bbox_l['xmin'] - m) &
+                        (pts_local[:, 0] <= other_bbox_l['xmax'] + m) &
+                        (pts_local[:, 1] >= other_bbox_l['ymin'] - m) &
+                        (pts_local[:, 1] <= other_bbox_l['ymax'] + m) &
+                        (pts_local[:, 2] >= other_bbox_l['zmin'] - m) &
+                        (pts_local[:, 2] <= other_bbox_l['zmax'] + m)
+                    )
+                except np.linalg.LinAlgError:
+                    other_bbox = other_obj['bbox']
+                    mask_in_other = (
+                        (meus_pontos[:, 0] >= other_bbox['xmin'] - m) &
+                        (meus_pontos[:, 0] <= other_bbox['xmax'] + m) &
+                        (meus_pontos[:, 1] >= other_bbox['ymin'] - m) &
+                        (meus_pontos[:, 1] <= other_bbox['ymax'] + m) &
+                        (meus_pontos[:, 2] >= other_bbox['zmin'] - m) &
+                        (meus_pontos[:, 2] <= other_bbox['zmax'] + m)
+                    )
+            else:
+                # Fallback AABB world quando objeto não tem placement
+                other_bbox = other_obj['bbox']
+                mask_in_other = (
+                    (meus_pontos[:, 0] >= other_bbox['xmin'] - m) &
+                    (meus_pontos[:, 0] <= other_bbox['xmax'] + m) &
+                    (meus_pontos[:, 1] >= other_bbox['ymin'] - m) &
+                    (meus_pontos[:, 1] <= other_bbox['ymax'] + m) &
+                    (meus_pontos[:, 2] >= other_bbox['zmin'] - m) &
+                    (meus_pontos[:, 2] <= other_bbox['zmax'] + m)
+                )
+
             pontos_compartilhados |= mask_in_other
 
             n_shared = int(np.count_nonzero(mask_in_other))
@@ -1457,7 +1518,7 @@ def analisar_pavimento_completo(
     objetos_ifc: List[Dict],
     ply_path: str,
     output_dir: Path
-) -> Tuple[List[Dict], Dict]:
+) -> Tuple[List[Dict], Dict, np.ndarray, List[Dict]]:
     """
     Análise completa com todas as proteções anti-leaking.
     """
@@ -1693,6 +1754,8 @@ def listar_pavimentos():
         f = request.files.get('ifc_file') or request.files.get('file')
         if not f:
             return jsonify({'error': 'Arquivo IFC não enviado'}), 400
+        if not _valid_upload(f, ('.ifc',)):
+            return jsonify({'error': 'Arquivo precisa ter extensão .ifc'}), 400
 
         filename = f"{uuid.uuid4()}_{secure_filename(f.filename)}"
         path = UPLOAD_FOLDER / filename
@@ -1723,6 +1786,10 @@ def analisar_pavimento():
             return jsonify({'error': 'Arquivo IFC não enviado'}), 400
         if not ply_file:
             return jsonify({'error': 'Arquivo PLY não enviado'}), 400
+        if not _valid_upload(ifc_file, ('.ifc',)):
+            return jsonify({'error': 'Arquivo IFC precisa ter extensão .ifc'}), 400
+        if not _valid_upload(ply_file, ('.ply',)):
+            return jsonify({'error': 'Arquivo PLY precisa ter extensão .ply'}), 400
         if not pav_alvo:
             return jsonify({'error': 'Pavimento não especificado'}), 400
 
@@ -1830,6 +1897,10 @@ def analisar_instancias():
             return jsonify({'error': 'Arquivo IFC não enviado'}), 400
         if not ply_file:
             return jsonify({'error': 'Arquivo PLY não enviado'}), 400
+        if not _valid_upload(ifc_file, ('.ifc',)):
+            return jsonify({'error': 'Arquivo IFC precisa ter extensão .ifc'}), 400
+        if not _valid_upload(ply_file, ('.ply',)):
+            return jsonify({'error': 'Arquivo PLY precisa ter extensão .ply'}), 400
         if not pav_alvo:
             return jsonify({'error': 'Pavimento não especificado'}), 400
 
@@ -2137,6 +2208,10 @@ def analisar_ai_ml():
             return jsonify({'error': 'IFC nao enviado'}), 400
         if not ply_file:
             return jsonify({'error': 'PLY nao enviado'}), 400
+        if not _valid_upload(ifc_file, ('.ifc',)):
+            return jsonify({'error': 'Arquivo IFC precisa ter extensão .ifc'}), 400
+        if not _valid_upload(ply_file, ('.ply',)):
+            return jsonify({'error': 'Arquivo PLY precisa ter extensão .ply'}), 400
         if not pav_alvo:
             return jsonify({'error': 'Pavimento nao especificado'}), 400
 

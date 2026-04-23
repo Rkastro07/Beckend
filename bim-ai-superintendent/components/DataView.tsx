@@ -757,12 +757,7 @@ export const DataView: React.FC<{
   const [selectedGuid, setSelectedGuid] = useState<string | null>(null);
   const tableRowRefs = useRef<Record<string, HTMLTableRowElement | null>>({});
 
-  // Quando seleciona no 3D, scrolla até a linha na tabela
-  useEffect(() => {
-    if (selectedGuid && tableRowRefs.current[selectedGuid]) {
-      tableRowRefs.current[selectedGuid]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
-  }, [selectedGuid]);
+  // Seleção no 3D só marca a linha (não rola a tabela automaticamente)
 
   // --- ESTADO DE VISIBILIDADE ---
   const [hiddenCategories, setHiddenCategories] = useState<Set<string>>(new Set());
