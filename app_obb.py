@@ -146,6 +146,62 @@ def _valid_upload(f, exts: Tuple[str, ...]) -> bool:
         return False
     return f.filename.lower().endswith(exts)
 
+
+# =========================
+# CACHE DE IFC (evita reparse + re-upload do mesmo arquivo)
+# =========================
+# Camada (a): parse do ifcopenshell é caro (~2–5s pra IFCs grandes).
+#   Cacheamos o ifcopenshell.file em memória por hash do conteúdo.
+# Camada (b): /api/listar_pavimentos devolve `ifc_token` (hash).
+#   Endpoints de análise aceitam token em vez de reupload do arquivo.
+import hashlib
+_IFC_CACHE: Dict[str, Dict] = {}  # hash -> {"file": ifcopenshell.file, "path": str}
+
+
+def _hash_ifc_path(path: str, sample_bytes: int = 1024 * 1024) -> str:
+    """Hash do 1º MB do arquivo (rápido, suficiente pra distinguir IFCs)."""
+    h = hashlib.md5()
+    with open(path, 'rb') as fh:
+        h.update(fh.read(sample_bytes))
+    # Inclui tamanho pra diferenciar truncados de completos do mesmo prefixo
+    h.update(str(os.path.getsize(path)).encode())
+    return h.hexdigest()
+
+
+def _cache_ifc(path: str) -> str:
+    """Abre o IFC (se ainda não estiver em cache) e retorna o token."""
+    token = _hash_ifc_path(path)
+    if token not in _IFC_CACHE:
+        print(f"📂 IFC cache miss ({token[:8]}…) — fazendo parse de {os.path.basename(path)}")
+        _IFC_CACHE[token] = {"file": ifcopenshell.open(path), "path": path}
+    else:
+        print(f"⚡ IFC cache hit ({token[:8]}…) — reusando parse")
+    return token
+
+
+def _resolve_ifc_from_request(req, session_id: str) -> Tuple[Optional[str], Optional[str], Optional[Tuple[str, int]]]:
+    """
+    Resolve o IFC da requisição: via upload (`ifc_file`) ou via token (`ifc_token`).
+    Retorna (ifc_path, token, err). `err` é (msg, status) ou None.
+    """
+    token = req.form.get('ifc_token')
+    if token:
+        entry = _IFC_CACHE.get(token)
+        if entry is None:
+            return None, None, ("ifc_token desconhecido — reenvie o arquivo IFC", 410)
+        return entry['path'], token, None
+
+    ifc_file = req.files.get('ifc_file')
+    if not ifc_file:
+        return None, None, ("IFC não enviado (use ifc_file ou ifc_token)", 400)
+    if not _valid_upload(ifc_file, ('.ifc',)):
+        return None, None, ("Arquivo IFC precisa ter extensão .ifc", 400)
+
+    ifc_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ifc_file.filename)}"
+    ifc_file.save(str(ifc_path))
+    token = _cache_ifc(str(ifc_path))
+    return str(ifc_path), token, None
+
 # JSON encoder que converte numpy types automaticamente (evita int32/float64 errors)
 import json as _json
 class _NumpyEncoder(_json.JSONEncoder):
@@ -227,7 +283,8 @@ def calcular_obb_corners_threejs(obj: Dict) -> List[List[float]]:
 # =========================
 def extrair_pavimentos(ifc_path: str) -> List[str]:
     """Extrai lista de pavimentos do arquivo IFC."""
-    f = ifcopenshell.open(ifc_path)
+    token = _cache_ifc(ifc_path)
+    f = _IFC_CACHE[token]['file']
     pavs = set()
     for s in f.by_type("IfcBuildingStorey"):
         if s.Name:
@@ -253,7 +310,8 @@ def extrair_objetos_por_pavimento(
     Isso captura pilares, shafts, escadas e vigas que o projetista atribuiu a
     outro storey no IFC mas que fisicamente passam pelo pavimento analisado.
     """
-    f = ifcopenshell.open(ifc_path)
+    token = _cache_ifc(ifc_path)
+    f = _IFC_CACHE[token]['file']
     settings = ifcopenshell.geom.settings()
     settings.set(settings.USE_WORLD_COORDS, True)
 
@@ -1761,11 +1819,13 @@ def listar_pavimentos():
         path = UPLOAD_FOLDER / filename
         f.save(str(path))
 
+        token = _cache_ifc(str(path))
         pavs = extrair_pavimentos(str(path))
 
         return jsonify({
             'pavimentos': pavs,
-            'total': len(pavs)
+            'total': len(pavs),
+            'ifc_token': token,  # front pode reusar no /api/analisar_ai pra pular reupload
         })
 
     except Exception as e:
@@ -1777,28 +1837,24 @@ def listar_pavimentos():
 def analisar_pavimento():
     """Analisa um pavimento com todas as proteções anti-leaking."""
     try:
-        ifc_file = request.files.get('ifc_file')
         ply_file = request.files.get('ply_file')
         pav_alvo = request.form.get('pavimento')
         use_ai = request.form.get('use_ai', 'false').lower() == 'true'
 
-        if not ifc_file:
-            return jsonify({'error': 'Arquivo IFC não enviado'}), 400
         if not ply_file:
             return jsonify({'error': 'Arquivo PLY não enviado'}), 400
-        if not _valid_upload(ifc_file, ('.ifc',)):
-            return jsonify({'error': 'Arquivo IFC precisa ter extensão .ifc'}), 400
         if not _valid_upload(ply_file, ('.ply',)):
             return jsonify({'error': 'Arquivo PLY precisa ter extensão .ply'}), 400
         if not pav_alvo:
             return jsonify({'error': 'Pavimento não especificado'}), 400
 
-        # Salva arquivos
         session_id = str(uuid.uuid4())
-        ifc_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ifc_file.filename)}"
-        ply_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ply_file.filename)}"
+        ifc_path_str, ifc_token, err = _resolve_ifc_from_request(request, session_id)
+        if err:
+            return jsonify({'error': err[0]}), err[1]
+        ifc_path = Path(ifc_path_str)
 
-        ifc_file.save(str(ifc_path))
+        ply_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ply_file.filename)}"
         ply_file.save(str(ply_path))
 
         # Extrai objetos do pavimento
@@ -1889,25 +1945,23 @@ def analisar_instancias():
         if not _INSTANCE_INFERENCE:
             return jsonify({'error': 'RandLA-Net Instance não disponível (checkpoint ausente)'}), 503
 
-        ifc_file = request.files.get('ifc_file')
         ply_file = request.files.get('ply_file')
         pav_alvo = request.form.get('pavimento')
 
-        if not ifc_file:
-            return jsonify({'error': 'Arquivo IFC não enviado'}), 400
         if not ply_file:
             return jsonify({'error': 'Arquivo PLY não enviado'}), 400
-        if not _valid_upload(ifc_file, ('.ifc',)):
-            return jsonify({'error': 'Arquivo IFC precisa ter extensão .ifc'}), 400
         if not _valid_upload(ply_file, ('.ply',)):
             return jsonify({'error': 'Arquivo PLY precisa ter extensão .ply'}), 400
         if not pav_alvo:
             return jsonify({'error': 'Pavimento não especificado'}), 400
 
         session_id = str(uuid.uuid4())
-        ifc_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ifc_file.filename)}"
+        ifc_path_str, _, err = _resolve_ifc_from_request(request, session_id)
+        if err:
+            return jsonify({'error': err[0]}), err[1]
+        ifc_path = Path(ifc_path_str)
+
         ply_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ply_file.filename)}"
-        ifc_file.save(str(ifc_path))
         ply_file.save(str(ply_path))
 
         objetos = extrair_objetos_por_pavimento(str(ifc_path), pav_alvo)
@@ -2200,25 +2254,23 @@ def analisar_ai_ml():
         if not _ML_DISPONIVEL:
             return jsonify({'error': 'Modelo ML nao disponivel. Rode ml/train.py primeiro.'}), 503
 
-        ifc_file = request.files.get('ifc_file')
         ply_file = request.files.get('ply_file')
         pav_alvo = request.form.get('pavimento')
 
-        if not ifc_file:
-            return jsonify({'error': 'IFC nao enviado'}), 400
         if not ply_file:
             return jsonify({'error': 'PLY nao enviado'}), 400
-        if not _valid_upload(ifc_file, ('.ifc',)):
-            return jsonify({'error': 'Arquivo IFC precisa ter extensão .ifc'}), 400
         if not _valid_upload(ply_file, ('.ply',)):
             return jsonify({'error': 'Arquivo PLY precisa ter extensão .ply'}), 400
         if not pav_alvo:
             return jsonify({'error': 'Pavimento nao especificado'}), 400
 
         session_id = str(uuid.uuid4())
-        ifc_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ifc_file.filename)}"
+        ifc_path_str, _, err = _resolve_ifc_from_request(request, session_id)
+        if err:
+            return jsonify({'error': err[0]}), err[1]
+        ifc_path = Path(ifc_path_str)
+
         ply_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ply_file.filename)}"
-        ifc_file.save(str(ifc_path))
         ply_file.save(str(ply_path))
 
         # Extrai objetos do IFC:
