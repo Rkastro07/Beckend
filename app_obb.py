@@ -183,7 +183,16 @@ def _cache_ifc(path: str) -> str:
     with _IFC_CACHE_LOCK:
         if token not in _IFC_CACHE:
             print(f"📂 IFC cache miss ({token[:8]}…) — fazendo parse de {os.path.basename(path)}")
-            _IFC_CACHE[token] = {"file": ifcopenshell.open(path), "path": path}
+            try:
+                ifc = ifcopenshell.open(path)
+            except Exception as e:
+                # ifcopenshell solta exceções diversas (RuntimeError, IOError, schema errors…);
+                # normaliza pra ValueError com mensagem útil pro usuário final.
+                raise ValueError(
+                    f'Não foi possível abrir o IFC "{os.path.basename(path)}": {e}. '
+                    f'Verifique se o arquivo é IFC2x3/IFC4 válido e não está corrompido.'
+                ) from e
+            _IFC_CACHE[token] = {"file": ifc, "path": path}
         else:
             print(f"⚡ IFC cache hit ({token[:8]}…) — outro thread completou o parse")
     return token
@@ -209,8 +218,38 @@ def _resolve_ifc_from_request(req, session_id: str) -> Tuple[Optional[str], Opti
 
     ifc_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ifc_file.filename)}"
     ifc_file.save(str(ifc_path))
-    token = _cache_ifc(str(ifc_path))
+    try:
+        token = _cache_ifc(str(ifc_path))
+    except ValueError as e:
+        return None, None, (str(e), 400)
     return str(ifc_path), token, None
+
+
+def _ler_ply_validado(path: str) -> Tuple[np.ndarray, Optional[Tuple[str, int]]]:
+    """Lê um PLY e valida que não ficou vazio.
+
+    o3d.io.read_point_cloud não lança exceção em arquivos corrompidos — só devolve
+    um PointCloud com 0 pontos, o que antes causava análises inteiras retornarem
+    tudo "AUSENTE" em silêncio. Aqui deduplicamos e falhamos rápido com mensagem útil.
+    """
+    try:
+        pcd = o3d.io.read_point_cloud(path)
+    except Exception as e:
+        return np.empty((0, 3)), (f'Falha ao ler PLY: {e}', 400)
+    pts = np.asarray(pcd.points, dtype=float)
+    if pts.size == 0:
+        return pts, (
+            f'PLY "{os.path.basename(path)}" está vazio ou ilegível. '
+            f'Verifique se o arquivo não está corrompido.',
+            400,
+        )
+    pts = np.unique(pts, axis=0)
+    if pts.size == 0:
+        return pts, (
+            f'PLY "{os.path.basename(path)}" só tem pontos duplicados (0 únicos).',
+            400,
+        )
+    return pts, None
 
 # JSON encoder que converte numpy types automaticamente (evita int32/float64 errors)
 import json as _json
@@ -882,7 +921,9 @@ def candidatos_obj(
     dy = bbox['ymax'] - bbox['ymin']
     dz = bbox['zmax'] - bbox['zmin']
     raio = 0.5 * float(np.sqrt(dx * dx + dy * dy + dz * dz)) + float(margem)
-    idx = tree.query_ball_point([cx, cy, cz], raio)
+    # return_sorted=False: não precisamos de ordem (pts[idx] ignora isso)
+    # workers=-1: paraleliza usando todos os cores disponíveis
+    idx = tree.query_ball_point([cx, cy, cz], raio, return_sorted=False, workers=-1)
     if not idx:
         return np.empty((0, 3), dtype=pts.dtype)
     return pts[idx]
@@ -1594,14 +1635,11 @@ def analisar_pavimento_completo(
     print("ANÁLISE DE PROGRESSO (VERSÃO HÍBRIDA 2.0)")
     print("=" * 70)
 
-    # 1. Carrega nuvem
+    # 1. Carrega nuvem (valida vazio/corrompido — open3d não lança por conta própria)
     print("\n📦 Carregando nuvem de pontos...")
-    pcd = o3d.io.read_point_cloud(ply_path)
-    pts = np.asarray(pcd.points, dtype=float)
-    print(f"   ✓ {len(pts):,} pontos brutos")
-
-    # 1b. Deduplicação (remove pontos repetidos)
-    pts = np.unique(pts, axis=0)
+    pts, err_ply = _ler_ply_validado(ply_path)
+    if err_ply:
+        raise ValueError(err_ply[0])
     print(f"   ✓ {len(pts):,} pontos únicos")
 
     # 2. Detecta conexões
@@ -1877,12 +1915,15 @@ def analisar_pavimento():
         output_session = OUTPUT_FOLDER / session_id
         output_session.mkdir(parents=True, exist_ok=True)
 
-        # Análise completa (bbox-based)
-        resultados, estatisticas, pts_alinhados, objetos_processados = analisar_pavimento_completo(
-            objetos,
-            str(ply_path),
-            output_session
-        )
+        # Análise completa (bbox-based) — ValueError indica PLY inválido (400), não 500
+        try:
+            resultados, estatisticas, pts_alinhados, objetos_processados = analisar_pavimento_completo(
+                objetos,
+                str(ply_path),
+                output_session
+            )
+        except ValueError as e_ply:
+            return jsonify({'error': str(e_ply)}), 400
 
         # ── MODO AI (opcional) ─────────────────────────────────
         modo_usado = "bbox"
@@ -1985,9 +2026,9 @@ def analisar_instancias():
         print("ANALISE INSTANCIAS (RandLA-Net Instance + DBSCAN)")
         print("=" * 70)
 
-        pcd = o3d.io.read_point_cloud(str(ply_path))
-        pts = np.asarray(pcd.points, dtype=float)
-        pts = np.unique(pts, axis=0)
+        pts, err_ply = _ler_ply_validado(str(ply_path))
+        if err_ply:
+            return jsonify({'error': err_ply[0]}), err_ply[1]
         print(f"   Pontos: {len(pts):,}")
 
         objetos, _ = detectar_paredes_conexao(objetos)
@@ -2210,7 +2251,7 @@ _ML_STATUS = {
 }
 
 
-def _extrair_features_ml(pts_cena: np.ndarray, obj: Dict) -> np.ndarray:
+def _extrair_features_ml(pts_cena: np.ndarray, obj: Dict) -> Tuple[np.ndarray, np.ndarray]:
     bbox = obj['bbox']
     area = float(obj.get('area_ifc') or obj.get('area') or 1.0)
     vol  = float(obj.get('volume_ifc') or obj.get('volume') or 1.0)
@@ -2254,11 +2295,12 @@ def _extrair_features_ml(pts_cena: np.ndarray, obj: Dict) -> np.ndarray:
 
     density_area = n / max(area, 1e-6)
 
-    return np.array([
+    feats = np.array([
         completeness_r, is_empty, height_fill,
         z_bottom_norm, z_top_norm, centroid_z_norm, xy_spread_norm, density_area,
         float(tipo), float(eixo), bh,
     ], dtype=np.float32)
+    return feats, pts_obj
 
 
 @app.route('/api/analisar_ai', methods=['POST'])
@@ -2297,9 +2339,9 @@ def analisar_ai_ml():
         if not objetos:
             return jsonify({'error': f'Nenhum objeto no pavimento "{pav_alvo}"'}), 400
 
-        pcd = o3d.io.read_point_cloud(str(ply_path))
-        pts = np.asarray(pcd.points, dtype=float)
-        pts = np.unique(pts, axis=0)
+        pts, err_ply = _ler_ply_validado(str(ply_path))
+        if err_ply:
+            return jsonify({'error': err_ply[0]}), err_ply[1]
         objetos, _ = detectar_paredes_conexao(objetos)
         objetos     = marcar_conexoes_piso_teto(objetos)
 
@@ -2355,9 +2397,12 @@ def analisar_ai_ml():
 
         _t0 = _time.time()
         feats_list = []
+        pts_obj_cache: List[np.ndarray] = []  # cacheia pts filtrados p/ reusar no loop de JSON
         for obj in objetos:
             pts_cand = candidatos_obj(pts, tree, obj['bbox'], margem=0.10)
-            feats_list.append(_extrair_features_ml(pts_cand, obj))
+            feats, pts_obj = _extrair_features_ml(pts_cand, obj)
+            feats_list.append(feats)
+            pts_obj_cache.append(pts_obj)
         feats = np.stack(feats_list)
         print(f"⚡ Features extraídas em {(_time.time()-_t0):.2f}s "
               f"para {len(objetos)} objetos")
@@ -2370,22 +2415,21 @@ def analisar_ai_ml():
         output_dir = OUTPUT_FOLDER / session_id
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Evidência do cache reuse: quantos objetos vão escrever JSON de pontos
+        _n_cache_hit = sum(1 for p in pts_obj_cache if len(p) > 0)
+        print(f"♻️  Cache pts_obj reusado: {_n_cache_hit}/{len(pts_obj_cache)} objetos "
+              f"(sem refiltrar via KDTree/OBB)")
+
+        _t0_json = _time.time()
         resultados = []
-        m = 0.05
         for i, (obj, pred, proba) in enumerate(zip(objetos, preds, probas)):
             status = _ML_STATUS[int(pred)]
             bbox_threejs = converter_ifc_para_threejs(obj['bbox'])
             bbox = obj['bbox']
 
-            # Pré-filtra candidatos via KDTree, depois aplica OBB exato no subset
-            pts_cand = candidatos_obj(pts, tree, bbox, margem=0.10)
-            pts_obj = filtrar_pontos_obb(
-                pts_cand,
-                obj.get('bbox_local_obb') or bbox,
-                obj.get('matrix_local'),
-                m,
-                slice_z=obj.get('slice_z'),
-            )
+            # Reusa pts já filtrados na extração de features (evita candidatos_obj
+            # + filtrar_pontos_obb duplicados — mesmos bbox/margem/slice_z)
+            pts_obj = pts_obj_cache[i]
 
             json_filename = None
             if len(pts_obj) > 0:
@@ -2440,6 +2484,12 @@ def analisar_ai_ml():
                     }
 
             resultados.append(item_out)
+
+        print(f"📝 Loop de JSON+output em {(_time.time()-_t0_json):.2f}s "
+              f"({len(resultados)} objetos)")
+
+        # libera a cache de pontos por objeto (pode somar centenas de MB num IFC grande)
+        del pts_obj_cache
 
         stats = Counter(r['status']['code'] for r in resultados)
         total = len(resultados)
