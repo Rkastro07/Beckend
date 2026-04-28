@@ -225,31 +225,44 @@ def _resolve_ifc_from_request(req, session_id: str) -> Tuple[Optional[str], Opti
     return str(ifc_path), token, None
 
 
-def _ler_ply_validado(path: str) -> Tuple[np.ndarray, Optional[Tuple[str, int]]]:
-    """Lê um PLY e valida que não ficou vazio.
+def _ler_ply_validado(path: str) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[Tuple[str, int]]]:
+    """Lê um PLY e valida que não ficou vazio. Devolve cores quando o scanner trouxe RGB.
 
     o3d.io.read_point_cloud não lança exceção em arquivos corrompidos — só devolve
     um PointCloud com 0 pontos, o que antes causava análises inteiras retornarem
     tudo "AUSENTE" em silêncio. Aqui deduplicamos e falhamos rápido com mensagem útil.
+
+    Retorno: (pts[N,3] float, colors[N,3] float em [0,1] ou None se PLY sem RGB, err)
+    Dedup preserva a ordem original via return_index — necessário pra cores ficarem
+    alinhadas com os pontos.
     """
     try:
         pcd = o3d.io.read_point_cloud(path)
     except Exception as e:
-        return np.empty((0, 3)), (f'Falha ao ler PLY: {e}', 400)
+        return np.empty((0, 3)), None, (f'Falha ao ler PLY: {e}', 400)
     pts = np.asarray(pcd.points, dtype=float)
     if pts.size == 0:
-        return pts, (
+        return pts, None, (
             f'PLY "{os.path.basename(path)}" está vazio ou ilegível. '
             f'Verifique se o arquivo não está corrompido.',
             400,
         )
-    pts = np.unique(pts, axis=0)
+    has_colors = len(pcd.colors) > 0
+    colors = np.asarray(pcd.colors, dtype=float) if has_colors else None
+
+    # Dedup mantendo a ordem (sort dos índices únicos) para colors permanecer alinhada
+    _, idx_unique = np.unique(pts, axis=0, return_index=True)
+    idx_unique.sort()
+    pts = pts[idx_unique]
+    if colors is not None:
+        colors = colors[idx_unique]
+
     if pts.size == 0:
-        return pts, (
+        return pts, None, (
             f'PLY "{os.path.basename(path)}" só tem pontos duplicados (0 únicos).',
             400,
         )
-    return pts, None
+    return pts, colors, None
 
 # JSON encoder que converte numpy types automaticamente (evita int32/float64 errors)
 import json as _json
@@ -903,17 +916,20 @@ def candidatos_obj(
     tree: Optional[cKDTree],
     bbox: Dict,
     margem: float = 0.05,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """Retorna apenas os pontos da cena que podem estar dentro do objeto.
 
     Usa uma esfera envolvente da bbox (expandida pela `margem`) como pré-filtro
     barato via cKDTree.query_ball_point. O filtro OBB/AABB exato é feito depois
     no subset minúsculo retornado aqui.
 
-    Se `tree` for None (fallback), devolve `pts` inteiro.
+    Retorna `(pts_subset, idx)`. `idx` é o array de índices originais (no `pts` da
+    cena) que pode ser reusado para fatiar arrays paralelos como `colors`. Quando
+    `tree` é None (fallback) ou `pts` está vazio, `idx` vem como None — nesse caso
+    o chamador deve assumir que `pts_subset` é o array inteiro.
     """
     if tree is None or pts.size == 0:
-        return pts
+        return pts, None
     cx = 0.5 * (bbox['xmin'] + bbox['xmax'])
     cy = 0.5 * (bbox['ymin'] + bbox['ymax'])
     cz = 0.5 * (bbox['zmin'] + bbox['zmax'])
@@ -925,8 +941,9 @@ def candidatos_obj(
     # workers=-1: paraleliza usando todos os cores disponíveis
     idx = tree.query_ball_point([cx, cy, cz], raio, return_sorted=False, workers=-1)
     if not idx:
-        return np.empty((0, 3), dtype=pts.dtype)
-    return pts[idx]
+        return np.empty((0, 3), dtype=pts.dtype), np.empty((0,), dtype=np.int64)
+    idx_arr = np.asarray(idx, dtype=np.int64)
+    return pts[idx_arr], idx_arr
 
 
 # =========================
@@ -940,6 +957,7 @@ def filtrar_pontos_obb(
     frac_bottom: float = 0.0,
     frac_top: float = 0.0,
     slice_z: Optional[Tuple[float, float]] = None,
+    extras: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Filtra pontos usando OBB: transforma pontos para o espaço local do objeto
@@ -949,18 +967,41 @@ def filtrar_pontos_obb(
 
     Se `slice_z` (zmin_global, zmax_global) for fornecido, aplica também um clip
     GLOBAL em Z antes do OBB — usado para cross-floor (pilar fatiado por andar).
+
+    Se `extras` for um array N×K (mesma ordem de `pts`), recebe os mesmos masks aplicados
+    e a função retorna a tupla (pts_filtrados, extras_filtrados) — usado para propagar
+    cores RGB do scanner em paralelo aos pontos sem refazer a filtragem.
     """
     # Clip global Z primeiro (cross-floor slicing)
     if slice_z is not None and pts.size > 0:
         z_lo, z_hi = slice_z
         mask_g = (pts[:, 2] >= z_lo - margem) & (pts[:, 2] <= z_hi + margem)
         pts = pts[mask_g]
+        if extras is not None:
+            extras = extras[mask_g]
 
     if matrix_local is None or bbox_local_obb is None:
-        return filtrar_pontos_aabb(pts, bbox_local_obb or {}, margem, frac_bottom, frac_top)
+        out_pts = filtrar_pontos_aabb(pts, bbox_local_obb or {}, margem, frac_bottom, frac_top)
+        if extras is None:
+            return out_pts
+        # Para propagar extras no fallback AABB precisaríamos do mask interno; como o
+        # caso é raro (sem placement) e barato, refazemos o filtro AABB local aqui:
+        if pts.size == 0:
+            return out_pts, np.empty((0, extras.shape[1]) if extras.ndim == 2 else (0,))
+        b = bbox_local_obb or {}
+        if not b:
+            return out_pts, extras  # sem bbox: AABB devolve tudo
+        m = margem
+        mask_a = (
+            (pts[:, 0] >= b.get('xmin', -np.inf) - m) & (pts[:, 0] <= b.get('xmax', np.inf) + m) &
+            (pts[:, 1] >= b.get('ymin', -np.inf) - m) & (pts[:, 1] <= b.get('ymax', np.inf) + m) &
+            (pts[:, 2] >= b.get('zmin', -np.inf) - m) & (pts[:, 2] <= b.get('zmax', np.inf) + m)
+        )
+        return out_pts, extras[mask_a]
 
     if pts.size == 0:
-        return np.empty((0, 3), dtype=float)
+        empty = np.empty((0, 3), dtype=float)
+        return (empty, np.empty((0, extras.shape[1]) if (extras is not None and extras.ndim == 2) else (0,))) if extras is not None else empty
 
     # Transforma pontos do espaço global para o espaço local do objeto
     R = matrix_local[:3, :3]
@@ -968,7 +1009,8 @@ def filtrar_pontos_obb(
     try:
         R_inv = np.linalg.inv(R)
     except np.linalg.LinAlgError:
-        return filtrar_pontos_aabb(pts, bbox_local_obb, margem, frac_bottom, frac_top)
+        out_pts = filtrar_pontos_aabb(pts, bbox_local_obb, margem, frac_bottom, frac_top)
+        return (out_pts, extras) if extras is not None else out_pts
 
     pts_local = (R_inv @ (pts - t).T).T  # (N, 3) no espaço local
 
@@ -992,7 +1034,9 @@ def filtrar_pontos_obb(
         (pts_local[:, 2] >= zmin - margem) &
         (pts_local[:, 2] <= zmax + margem)
     )
-    return pts[mask]
+    if extras is None:
+        return pts[mask]
+    return pts[mask], extras[mask]
 
 
 # =========================
@@ -1636,8 +1680,9 @@ def analisar_pavimento_completo(
     print("=" * 70)
 
     # 1. Carrega nuvem (valida vazio/corrompido — open3d não lança por conta própria)
+    # BBox helper: ignora colors (modo BBox não usa RGB do scanner)
     print("\n📦 Carregando nuvem de pontos...")
-    pts, err_ply = _ler_ply_validado(ply_path)
+    pts, _, err_ply = _ler_ply_validado(ply_path)
     if err_ply:
         raise ValueError(err_ply[0])
     print(f"   ✓ {len(pts):,} pontos únicos")
@@ -2026,7 +2071,8 @@ def analisar_instancias():
         print("ANALISE INSTANCIAS (RandLA-Net Instance + DBSCAN)")
         print("=" * 70)
 
-        pts, err_ply = _ler_ply_validado(str(ply_path))
+        # Modo Instancias: ignora colors (RandLA-Net atual nao consome RGB)
+        pts, _, err_ply = _ler_ply_validado(str(ply_path))
         if err_ply:
             return jsonify({'error': err_ply[0]}), err_ply[1]
         print(f"   Pontos: {len(pts):,}")
@@ -2251,7 +2297,16 @@ _ML_STATUS = {
 }
 
 
-def _extrair_features_ml(pts_cena: np.ndarray, obj: Dict) -> Tuple[np.ndarray, np.ndarray]:
+def _extrair_features_ml(
+    pts_cena: np.ndarray,
+    obj: Dict,
+    colors_cena: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Extrai 11 features ML + devolve pts/colors filtrados pelo OBB do objeto.
+
+    Quando `colors_cena` é fornecido (PLY com RGB), retorna `colors_obj` com a mesma
+    máscara aplicada — permite reusar no loop de geração dos JSONs sem refiltrar.
+    """
     bbox = obj['bbox']
     area = float(obj.get('area_ifc') or obj.get('area') or 1.0)
     vol  = float(obj.get('volume_ifc') or obj.get('volume') or 1.0)
@@ -2264,17 +2319,30 @@ def _extrair_features_ml(pts_cena: np.ndarray, obj: Dict) -> Tuple[np.ndarray, n
     expected_pts = max(area * 130, 1)
 
     m = 0.05
+    colors_obj: Optional[np.ndarray] = None
     if pts_cena is not None and len(pts_cena) > 0:
         # OBB com fallback automático para AABB se o objeto não tiver placement
-        pts_obj = filtrar_pontos_obb(
-            pts_cena,
-            obj.get('bbox_local_obb') or bbox,
-            obj.get('matrix_local'),
-            m,
-            slice_z=obj.get('slice_z'),
-        )
+        if colors_cena is not None:
+            pts_obj, colors_obj = filtrar_pontos_obb(
+                pts_cena,
+                obj.get('bbox_local_obb') or bbox,
+                obj.get('matrix_local'),
+                m,
+                slice_z=obj.get('slice_z'),
+                extras=colors_cena,
+            )
+        else:
+            pts_obj = filtrar_pontos_obb(
+                pts_cena,
+                obj.get('bbox_local_obb') or bbox,
+                obj.get('matrix_local'),
+                m,
+                slice_z=obj.get('slice_z'),
+            )
     else:
         pts_obj = np.zeros((0, 3))
+        if colors_cena is not None:
+            colors_obj = np.zeros((0, 3))
 
     n = len(pts_obj)
     if n > 0:
@@ -2300,7 +2368,7 @@ def _extrair_features_ml(pts_cena: np.ndarray, obj: Dict) -> Tuple[np.ndarray, n
         z_bottom_norm, z_top_norm, centroid_z_norm, xy_spread_norm, density_area,
         float(tipo), float(eixo), bh,
     ], dtype=np.float32)
-    return feats, pts_obj
+    return feats, pts_obj, colors_obj
 
 
 @app.route('/api/analisar_ai', methods=['POST'])
@@ -2339,9 +2407,11 @@ def analisar_ai_ml():
         if not objetos:
             return jsonify({'error': f'Nenhum objeto no pavimento "{pav_alvo}"'}), 400
 
-        pts, err_ply = _ler_ply_validado(str(ply_path))
+        pts, ply_colors, err_ply = _ler_ply_validado(str(ply_path))
         if err_ply:
             return jsonify({'error': err_ply[0]}), err_ply[1]
+        if ply_colors is not None:
+            print(f"🎨 PLY traz cores RGB do scanner — {len(ply_colors):,} pontos coloridos")
         objetos, _ = detectar_paredes_conexao(objetos)
         objetos     = marcar_conexoes_piso_teto(objetos)
 
@@ -2397,12 +2467,23 @@ def analisar_ai_ml():
 
         _t0 = _time.time()
         feats_list = []
-        pts_obj_cache: List[np.ndarray] = []  # cacheia pts filtrados p/ reusar no loop de JSON
+        pts_obj_cache: List[np.ndarray] = []                # pts filtrados p/ reusar no loop de JSON
+        colors_obj_cache: List[Optional[np.ndarray]] = []   # cores RGB paralelas (None se PLY sem RGB)
         for obj in objetos:
-            pts_cand = candidatos_obj(pts, tree, obj['bbox'], margem=0.10)
-            feats, pts_obj = _extrair_features_ml(pts_cand, obj)
+            pts_cand, idx_cand = candidatos_obj(pts, tree, obj['bbox'], margem=0.10)
+            # Sem custo extra de KDTree: `idx_cand` é o resultado de query_ball_point
+            # já feito; só fatiamos o array global de cores com os mesmos índices.
+            if ply_colors is not None and idx_cand is not None and idx_cand.size > 0:
+                colors_cand = ply_colors[idx_cand]
+            elif ply_colors is not None and idx_cand is None:
+                # tree=None (PLY pequeno demais p/ KDTree) — passa o array inteiro
+                colors_cand = ply_colors
+            else:
+                colors_cand = None
+            feats, pts_obj, colors_obj = _extrair_features_ml(pts_cand, obj, colors_cena=colors_cand)
             feats_list.append(feats)
             pts_obj_cache.append(pts_obj)
+            colors_obj_cache.append(colors_obj)
         feats = np.stack(feats_list)
         print(f"⚡ Features extraídas em {(_time.time()-_t0):.2f}s "
               f"para {len(objetos)} objetos")
@@ -2430,9 +2511,11 @@ def analisar_ai_ml():
             # Reusa pts já filtrados na extração de features (evita candidatos_obj
             # + filtrar_pontos_obb duplicados — mesmos bbox/margem/slice_z)
             pts_obj = pts_obj_cache[i]
+            colors_obj = colors_obj_cache[i]  # None se PLY sem RGB
 
             json_filename = None
             if len(pts_obj) > 0:
+                # Cor por status (fallback para quando o front escolhe modo "status")
                 cor = {
                     'COMPLETO': [0.2, 0.8, 0.2],
                     'PARCIAL':  [1.0, 0.6, 0.0],
@@ -2443,9 +2526,13 @@ def analisar_ai_ml():
                 pts_threejs = converter_pontos_ifc_para_threejs(pts_obj)
                 json_data = {
                     'positions': pts_threejs.flatten().tolist(),
-                    'color': cor,
-                    'count': len(pts_obj)
+                    'color':     cor,            # cor única (fallback)
+                    'count':     len(pts_obj),
                 }
+                # Cores RGB do scanner — uint8 (0-255) reduz JSON em ~3-4× vs floats
+                if colors_obj is not None and len(colors_obj) == len(pts_obj):
+                    rgb_uint8 = np.clip(colors_obj * 255.0, 0, 255).astype(np.uint8)
+                    json_data['colors'] = rgb_uint8.flatten().tolist()
                 with open(output_dir / json_filename, 'w') as f:
                     json.dump(json_data, f)
                 json_filename = f"{session_id}/{json_filename}"
@@ -2488,8 +2575,9 @@ def analisar_ai_ml():
         print(f"📝 Loop de JSON+output em {(_time.time()-_t0_json):.2f}s "
               f"({len(resultados)} objetos)")
 
-        # libera a cache de pontos por objeto (pode somar centenas de MB num IFC grande)
+        # libera caches por objeto (pode somar centenas de MB num IFC grande)
         del pts_obj_cache
+        del colors_obj_cache
 
         stats = Counter(r['status']['code'] for r in resultados)
         total = len(resultados)

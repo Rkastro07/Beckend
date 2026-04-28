@@ -51,9 +51,34 @@ declare module 'react' {
   }
 }
 
+// --- TEXTURA DE PONTO CIRCULAR ---
+// Sprite gerado uma vez no módulo (evita recriar a cada instância de ObjectPoints).
+// Gradiente radial dá borda suave: centro opaco até 70% do raio, vai pra alpha=0 na borda.
+// Combinado com alphaTest no material, recortamos os "cantos" do quad e ficamos com um disco.
+const POINT_SPRITE = (() => {
+  const size = 64;
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const ctx = c.getContext('2d')!;
+  const grad = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  grad.addColorStop(0.0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.7, 'rgba(255,255,255,1)');
+  grad.addColorStop(1.0, 'rgba(255,255,255,0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, size, size);
+  const tex = new THREE.CanvasTexture(c);
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.needsUpdate = true;
+  return tex;
+})();
+
 // --- COMPONENTE DOS PONTOS ---
+// Quando o backend devolve `colors` no JSON (PLY com RGB do scanner), o material
+// usa `vertexColors` e a `color` passada vira só fallback de tinta única (modo status).
 const ObjectPoints = ({ jsonFile, color }: { jsonFile: string; color: string }) => {
   const [points, setPoints] = React.useState<Float32Array | null>(null);
+  const [colors, setColors] = React.useState<Float32Array | null>(null);
 
   useEffect(() => {
     if (!jsonFile) return;
@@ -62,8 +87,6 @@ const ObjectPoints = ({ jsonFile, color }: { jsonFile: string; color: string }) 
     const baseUrl = 'http://localhost:8081/outputs/';
     const finalUrl = jsonFile.startsWith('http') ? jsonFile : `${baseUrl}${jsonFile}`;
 
-    console.log("Carregando pontos de:", finalUrl);
-
     fetch(finalUrl)
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
@@ -71,8 +94,17 @@ const ObjectPoints = ({ jsonFile, color }: { jsonFile: string; color: string }) 
       })
       .then((data) => {
         if (data.positions && Array.isArray(data.positions)) {
-          console.log(`✓ ${data.positions.length / 3} pontos carregados`);
           setPoints(new Float32Array(data.positions));
+        }
+        // Backend manda colors como uint8 0-255 (compactação ~3-4× vs float).
+        // Three.js pede color attribute em [0,1] float, então normalizamos.
+        if (Array.isArray(data.colors) && data.colors.length === data.positions.length) {
+          const u8 = data.colors as number[];
+          const f32 = new Float32Array(u8.length);
+          for (let i = 0; i < u8.length; i++) f32[i] = u8[i] / 255;
+          setColors(f32);
+        } else {
+          setColors(null);
         }
       })
       .catch((err) => console.error("Erro ao carregar pontos:", err));
@@ -83,9 +115,33 @@ const ObjectPoints = ({ jsonFile, color }: { jsonFile: string; color: string }) 
   return (
     <points>
       <bufferGeometry>
-        <bufferAttribute attach="attributes-position" count={points.length / 3} array={points} itemSize={3} />
+        <bufferAttribute
+          attach="attributes-position"
+          count={points.length / 3}
+          array={points}
+          itemSize={3}
+        />
+        {colors && (
+          <bufferAttribute
+            attach="attributes-color"
+            count={colors.length / 3}
+            array={colors}
+            itemSize={3}
+          />
+        )}
       </bufferGeometry>
-      <pointsMaterial size={0.05} color={new THREE.Color(color)} sizeAttenuation={true} />
+      <pointsMaterial
+        size={0.03}                        // 0.05 → 0.03: menos "blob", mais sensação de scan
+        sizeAttenuation
+        map={POINT_SPRITE}                 // sprite radial vira disco
+        alphaTest={0.5}                    // recorta os cantos do quad (sem blending)
+        transparent={false}                // alphaTest sozinho basta — evita problemas de depth sort
+        depthWrite                         // ponto opaco com depth correto
+        // Quando temos cor por vértice (RGB do scanner) ignoramos `color` e usamos vertexColors.
+        // Sem colors → usa a `color` única (fallback por status).
+        vertexColors={!!colors}
+        color={colors ? undefined : new THREE.Color(color)}
+      />
     </points>
   );
 };
@@ -861,8 +917,12 @@ export const DataView: React.FC<{
       <div className="flex gap-6 min-h-[500px]"> {/* Altura mínima, permite scroll */}
 
         {/* --- ÁREA 3D --- */}
-        <div className="flex-[3] bg-black rounded-xl overflow-hidden relative border-4 border-blue-500">
-          <Canvas camera={{ position: [5, 5, 5], fov: 50 }}>
+        <div className="flex-[3] bg-slate-900 rounded-xl overflow-hidden relative border border-slate-700">
+          <Canvas
+            camera={{ position: [5, 5, 5], fov: 50 }}
+            gl={{ antialias: true, alpha: false, powerPreference: 'high-performance' }}
+            dpr={[1, 2]}
+          >
             {/* LUZES */}
             <ambientLight intensity={0.8} />
             <pointLight position={[10, 10, 10]} />
@@ -873,13 +933,6 @@ export const DataView: React.FC<{
 
             {/* FERRAMENTA DE MEDIÇÃO (inclui OrbitControls) */}
             <MeasureTool />
-
-            {/* --- CUBO DE TESTE VERMELHO (DEBUG) --- */}
-            {/* Se você ver este cubo, o 3D funciona! */}
-            <mesh position={[0, 1, 0]}>
-              <boxGeometry args={[1, 1, 1]} />
-              <meshStandardMaterial color="red" wireframe />
-            </mesh>
 
             {/* OBJETOS BIM: BOUNDING BOXES + PONTOS (filtrado por visibilidade) */}
             {resultados.filter(item => isItemVisible(item)).map((item, i) => (
@@ -904,10 +957,6 @@ export const DataView: React.FC<{
               </group>
             ))}
           </Canvas>
-
-          <div className="absolute top-2 left-2 bg-black/70 text-white text-xs p-2 pointer-events-none">
-            Se você vê um cubo vermelho e eixos coloridos, o 3D funciona.
-          </div>
         </div>
 
         {/* --- GRÁFICOS (DIREITA) --- */}
