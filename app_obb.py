@@ -77,7 +77,14 @@ from collections import Counter
 TIPOS_INTERESSE = (
     "IfcWall", "IfcSlab",
     "IfcColumn", "IfcBeam", "IfcStair", "IfcRoof", "IfcSanitaryTerminal",
-    "IfcDoor", "IfcWindow"
+    "IfcDoor", "IfcWindow",
+    # Camada 1: elementos estruturais/composicionais que o RF não foi treinado
+    # explicitamente, mas geometricamente são equivalentes aos tipos conhecidos.
+    # Mapeados via _ML_TIPO_MAP / _ML_EIXO_TIPO pra reutilizar o aprendizado.
+    "IfcCovering",  # forros, revestimentos       → trata como IfcSlab
+    "IfcPlate",     # placas/chapas estruturais   → trata como IfcSlab
+    "IfcMember",    # membros estruturais         → trata como IfcBeam
+    "IfcRailing",   # guarda-corpos, parapeitos   → trata como IfcWall
 )
 # IfcDoor e IfcWindow reativados — OBB elimina o leaking que justificou a remoção
 
@@ -279,24 +286,40 @@ app.json_encoder = _NumpyEncoder
 # =========================
 # CONVERSÃO DE EIXOS (IFC -> Three.js)
 # =========================
+# IFC usa Z-up right-handed: (X, Y, Z) onde Z é vertical.
+# Three.js usa Y-up right-handed: (X, Y, Z) onde Y é vertical.
+# A conversão correta preservando handedness é rotação de -90° em torno de X:
+#     (x, y, z)_IFC  →  (x, z, -y)_Three.js
+#
+# O `-y` é crítico. Sem a negação, a transformação vira LEFT-HANDED e objetos
+# com rotação (matrix_local) aparecem ESPELHADOS no viewer. Objetos axis-aligned
+# não percebem o bug (bbox é simétrica), por isso o problema estava escondido —
+# sintéticos antigos eram quase todos axis-aligned.
 def converter_ifc_para_threejs(bbox_ifc: Dict) -> Dict:
-    """Converte BBox do IFC (X,Y,Z) para Three.js (X,Y,Z) onde Y=altura."""
+    """Converte BBox AABB do IFC (Z-up) para Three.js (Y-up).
+
+    Rotação de -90° em X + rotação 180° em Y (faz a câmera default do viewer
+    olhar pra "frente" do prédio em vez da "traseira"):
+        (x, y, z)_IFC → (-x, z, -y)_TJ
+    """
     return {
-        'xmin': bbox_ifc['xmin'],
-        'xmax': bbox_ifc['xmax'],
-        'ymin': bbox_ifc['zmin'],  # Y_threejs = Z_ifc (altura)
+        'xmin': -bbox_ifc['xmax'],   # X_TJ = -X_IFC → max_IFC vira min_TJ
+        'xmax': -bbox_ifc['xmin'],
+        'ymin': bbox_ifc['zmin'],    # Y_TJ = Z_IFC
         'ymax': bbox_ifc['zmax'],
-        'zmin': bbox_ifc['ymin'],  # Z_threejs = Y_ifc (profundidade)
-        'zmax': bbox_ifc['ymax']
+        'zmin': -bbox_ifc['ymax'],   # Z_TJ = -Y_IFC → max_IFC vira min_TJ
+        'zmax': -bbox_ifc['ymin'],
     }
 
 
 def converter_pontos_ifc_para_threejs(pts: np.ndarray) -> np.ndarray:
-    """Converte pontos do IFC para Three.js."""
+    """Converte nuvem de pontos do IFC (Z-up) para Three.js (Y-up) preservando handedness."""
     if len(pts) == 0:
         return pts
-    pts_converted = pts.copy()
-    pts_converted[:, [1, 2]] = pts_converted[:, [2, 1]]
+    pts_converted = np.empty_like(pts)
+    pts_converted[:, 0] = -pts[:, 0]   # X_TJ = -X_IFC
+    pts_converted[:, 1] =  pts[:, 2]   # Y_TJ =  Z_IFC
+    pts_converted[:, 2] = -pts[:, 1]   # Z_TJ = -Y_IFC
     return pts_converted
 
 
@@ -334,9 +357,12 @@ def calcular_obb_corners_threejs(obj: Dict) -> List[List[float]]:
         z_lo, z_hi = slice_z
         cantos_world[:, 2] = np.clip(cantos_world[:, 2], z_lo, z_hi)
 
-    # Converte IFC (Z=up) → Three.js (Y=up)
-    cantos_tj = cantos_world.copy()
-    cantos_tj[:, [1, 2]] = cantos_tj[:, [2, 1]]
+    # Converte IFC (Z-up) → Three.js (Y-up) com flip X pra câmera ver de frente:
+    # (x, y, z)_IFC → (-x, z, -y)_TJ
+    cantos_tj = np.empty_like(cantos_world)
+    cantos_tj[:, 0] = -cantos_world[:, 0]
+    cantos_tj[:, 1] =  cantos_world[:, 2]
+    cantos_tj[:, 2] = -cantos_world[:, 1]
     return cantos_tj.tolist()
 
 
@@ -1040,7 +1066,337 @@ def filtrar_pontos_obb(
 
 
 # =========================
-# ALINHAMENTO HÍBRIDO 2.0 (CORRIGIDO)
+# ALINHAMENTO V3 — FGR + ICP (pipeline novo, robusto)
+# =========================
+# O algoritmo `alinhar_nuvem_com_ifc` original (mais abaixo) é "centroide +
+# brute-force de rotação Z + scoring por pontos em bboxes". Funciona em sintético
+# (mesma convenção de eixo e centro próximos), mas falha com scan real:
+#   - não normaliza convenção de eixos (Y-up vs Z-up)
+#   - rotação só em Z, não consegue endireitar nuvem deitada
+#   - scoring confunde com simetrias do prédio (180° ambíguo)
+#
+# Este pipeline novo combina 3 estágios bem testados:
+#   1. Normalização do eixo vertical (histograma de normais → up vira Z)
+#   2. Registro grosso via FGR (Open3D, baseado em features FPFH)
+#   3. Refinamento ICP point-to-point
+#
+# Tudo via Open3D nativo. Sem AI, sem GPU, sem brute-force de orientações.
+
+def _ifc_full_mesh_cloud(
+    ifc_path: str,
+    max_pts: int = 100_000,
+    density_per_m2: float = 80.0,
+) -> np.ndarray:
+    """Amostra pontos uniformemente nas FACES das malhas IFC.
+
+    IMPORTANTE: pra ALINHAMENTO usamos TODA a geometria disponível no IFC,
+    não só TIPOS_INTERESSE. Coverings (forros), railings, furniture etc.
+    dão FORMA distintiva ao prédio — sem eles FPFH não tem feature pra casar.
+    Análise ML continua usando só TIPOS_INTERESSE; isso é só pra ALIGNMENT REF.
+
+    Aqui usamos `mesh.sample_points_uniformly()` do Open3D que amostra
+    densamente nas superfícies, com densidade proporcional à área.
+    """
+    token = _cache_ifc(ifc_path)
+    f = _IFC_CACHE[token]['file']
+    settings = ifcopenshell.geom.settings()
+    settings.set(settings.USE_WORLD_COORDS, True)
+
+    # Tipos que ajudam no alinhamento mas não estão em TIPOS_INTERESSE
+    # (cobre quase tudo que tem geometria 3D útil pra forma do prédio)
+    TIPOS_ALINHAMENTO_EXTRAS = (
+        "IfcCovering",          # forros, revestimentos (chave pro teto)
+        "IfcRailing",           # guarda-corpos
+        "IfcRamp",              # rampas
+        "IfcCurtainWall",       # paredes-cortina (vidro)
+        "IfcMember",            # peças estruturais menores
+        "IfcPlate",             # placas
+        "IfcFurnishingElement", # móveis fixos
+        "IfcBuildingElementProxy", # genérico (equipamentos no Vinhedo, etc.)
+        "IfcFlowTerminal",      # bocas de ar/luz/água
+        "IfcFlowSegment",       # tubulação
+        "IfcDistributionElement", # elétrica
+        "IfcSpace",             # espaços (volumes vazios mas dão forma)
+    )
+    TIPOS_USAR = TIPOS_INTERESSE + TIPOS_ALINHAMENTO_EXTRAS
+
+    all_pts = []
+    n_meshes_ok = 0
+    n_meshes_fallback = 0
+    n_skipped_type = 0
+
+    for product in f.by_type("IfcProduct"):
+        if not any(product.is_a(t) for t in TIPOS_USAR):
+            n_skipped_type += 1
+            continue
+        try:
+            shape = ifcopenshell.geom.create_shape(settings, product)
+            verts_arr = np.array(shape.geometry.verts).reshape(-1, 3)
+            faces_arr = np.array(shape.geometry.faces).reshape(-1, 3) if hasattr(shape.geometry, 'faces') else None
+
+            if verts_arr.size == 0:
+                continue
+
+            if faces_arr is not None and len(faces_arr) > 0:
+                # Constrói malha e amostra densamente as faces
+                try:
+                    mesh = o3d.geometry.TriangleMesh()
+                    mesh.vertices = o3d.utility.Vector3dVector(verts_arr)
+                    mesh.triangles = o3d.utility.Vector3iVector(faces_arr)
+                    area = float(mesh.get_surface_area())
+                    n_sample = max(20, int(area * density_per_m2))
+                    pcd_s = mesh.sample_points_uniformly(number_of_points=n_sample)
+                    all_pts.append(np.asarray(pcd_s.points))
+                    n_meshes_ok += 1
+                    continue
+                except Exception:
+                    pass
+
+            # Fallback: vértices brutos
+            all_pts.append(verts_arr)
+            n_meshes_fallback += 1
+        except Exception:
+            continue
+
+    if not all_pts:
+        return np.empty((0, 3))
+
+    pts = np.vstack(all_pts)
+    pts = np.unique(pts, axis=0)
+    if len(pts) > max_pts:
+        rng = np.random.default_rng(seed=42)
+        idx = rng.choice(len(pts), max_pts, replace=False)
+        pts = pts[idx]
+    print(f"      [mesh cloud] {n_meshes_ok} meshes amostradas + {n_meshes_fallback} fallback verts "
+          f"(ignorados {n_skipped_type} de tipos não-geométricos) → {len(pts):,} pts")
+    return pts
+
+
+def _sample_obb_surface(obj: Dict, target_pts: int = 300) -> np.ndarray:
+    """Amostra pontos uniformemente nas 6 faces da bbox de um objeto IFC.
+
+    Usado pra construir uma 'nuvem de referência' do IFC pro FGR. Não precisa
+    de mesh exata — bbox é suficiente pra registro grosso.
+    """
+    bbox = obj['bbox']
+    x0, x1 = float(bbox['xmin']), float(bbox['xmax'])
+    y0, y1 = float(bbox['ymin']), float(bbox['ymax'])
+    z0, z1 = float(bbox['zmin']), float(bbox['zmax'])
+    dx, dy, dz = max(x1 - x0, 1e-6), max(y1 - y0, 1e-6), max(z1 - z0, 1e-6)
+
+    A_xy, A_xz, A_yz = dx * dy, dx * dz, dy * dz
+    A_sum = A_xy + A_xz + A_yz
+    if A_sum <= 0:
+        return np.empty((0, 3))
+
+    # Aloca pts por face proporcional à área
+    n_xy = max(2, int(target_pts * A_xy / A_sum / 2))
+    n_xz = max(2, int(target_pts * A_xz / A_sum / 2))
+    n_yz = max(2, int(target_pts * A_yz / A_sum / 2))
+
+    rng = np.random.default_rng(seed=42)
+    parts = []
+
+    # Bottom + top
+    for z_val in (z0, z1):
+        u = rng.uniform(x0, x1, n_xy)
+        v = rng.uniform(y0, y1, n_xy)
+        parts.append(np.column_stack([u, v, np.full(n_xy, z_val)]))
+    # Front + back
+    for y_val in (y0, y1):
+        u = rng.uniform(x0, x1, n_xz)
+        w = rng.uniform(z0, z1, n_xz)
+        parts.append(np.column_stack([u, np.full(n_xz, y_val), w]))
+    # Left + right
+    for x_val in (x0, x1):
+        v = rng.uniform(y0, y1, n_yz)
+        w = rng.uniform(z0, z1, n_yz)
+        parts.append(np.column_stack([np.full(n_yz, x_val), v, w]))
+
+    return np.vstack(parts)
+
+
+def _normalizar_eixo_vertical(pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray, str]:
+    """Detecta qual eixo é o 'up' da nuvem (X, Y ou Z) e rotaciona pra Z-up.
+
+    Método: estima normais em downsample e identifica o eixo cardinal onde
+    as normais mais se concentram (porque lajes+tetos sempre apontam pra
+    vertical, independente do número de andares).
+
+    Retorna (pts_rotacionados, R_aplicada, log).
+    """
+    if len(pts) < 200:
+        return pts, np.eye(3), "skip_few_pts"
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
+
+    # Downsample agressivo só pra estimar normais rápido
+    pcd_down = pcd.voxel_down_sample(voxel_size=0.10)
+    if len(pcd_down.points) < 100:
+        return pts, np.eye(3), "skip_sparse"
+    pcd_down.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.30, max_nn=20)
+    )
+    normals = np.asarray(pcd_down.normals)
+
+    # Score = soma de (normal · eixo)² → eixo com mais normais "perpendiculares"
+    # é o eixo vertical (porque lajes+tetos têm normal nesse eixo).
+    scores = (normals ** 2).sum(axis=0)
+    up_idx = int(np.argmax(scores))
+    axis_name = ['X', 'Y', 'Z'][up_idx]
+    scores_pct = (scores / scores.sum() * 100).round(1).tolist()
+
+    # Rotação pra trazer up_idx → +Z (preservando handedness/orientação)
+    # Atenção: as matrizes anteriores estavam INVERTIDAS, flippavam ao invés de rotacionar.
+    R = np.eye(3)
+    if up_idx == 0:    # X → +Z (rotação -90° em torno de Y)
+        R = np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]], dtype=float)
+    elif up_idx == 1:  # Y → +Z (rotação +90° em torno de X)
+        R = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=float)
+
+    if up_idx == 2:
+        return pts, R, f"já Z-up (distrib={scores_pct}%)"
+
+    pts_rot = (R @ pts.T).T
+    return pts_rot, R, f"{axis_name}-up → rotacionou para Z-up (distrib={scores_pct}%)"
+
+
+def _alinhar_fgr_icp(
+    pts_scan: np.ndarray,
+    pts_ifc: np.ndarray,
+    voxel_size: float = 0.10,
+) -> Tuple[np.ndarray, float, float]:
+    """Registro grosso (FGR) + refinamento (ICP) via Open3D.
+
+    Returns: (transformation 4x4, fitness 0-1, rmse).
+    """
+    if len(pts_scan) == 0 or len(pts_ifc) == 0:
+        return np.eye(4), 0.0, float('inf')
+
+    pcd_s = o3d.geometry.PointCloud()
+    pcd_s.points = o3d.utility.Vector3dVector(pts_scan)
+    pcd_s_d = pcd_s.voxel_down_sample(voxel_size)
+
+    pcd_i = o3d.geometry.PointCloud()
+    pcd_i.points = o3d.utility.Vector3dVector(pts_ifc)
+    pcd_i_d = pcd_i.voxel_down_sample(voxel_size)
+
+    # Estima normais (FPFH e ICP point-to-plane precisam)
+    radius_n = voxel_size * 2.0
+    pcd_s_d.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius_n, max_nn=30))
+    pcd_i_d.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius_n, max_nn=30))
+
+    # FPFH features
+    radius_f = voxel_size * 5.0
+    fpfh_s = o3d.pipelines.registration.compute_fpfh_feature(
+        pcd_s_d, o3d.geometry.KDTreeSearchParamHybrid(radius=radius_f, max_nn=100)
+    )
+    fpfh_i = o3d.pipelines.registration.compute_fpfh_feature(
+        pcd_i_d, o3d.geometry.KDTreeSearchParamHybrid(radius=radius_f, max_nn=100)
+    )
+
+    # FGR — Fast Global Registration (não precisa de chute inicial)
+    result_fgr = o3d.pipelines.registration.registration_fgr_based_on_feature_matching(
+        pcd_s_d, pcd_i_d, fpfh_s, fpfh_i,
+        o3d.pipelines.registration.FastGlobalRegistrationOption(
+            maximum_correspondence_distance=voxel_size * 0.5
+        )
+    )
+
+    # ICP refinement (point-to-plane converge mais rápido com normais)
+    result_icp = o3d.pipelines.registration.registration_icp(
+        pcd_s, pcd_i_d,
+        max_correspondence_distance=voxel_size * 0.4,
+        init=result_fgr.transformation,
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane()
+    )
+
+    return np.asarray(result_icp.transformation), float(result_icp.fitness), float(result_icp.inlier_rmse)
+
+
+def alinhar_via_fgr_icp(
+    pts_scan: np.ndarray,
+    objetos_ifc: List[Dict],
+    voxel_size: Optional[float] = None,
+    ifc_path: Optional[str] = None,
+) -> Tuple[np.ndarray, Dict]:
+    """Pipeline novo de alinhamento (3 estágios) — substitui o brute-force antigo.
+
+    Estágios:
+      1. Normaliza eixo vertical (X/Y-up → Z-up)
+      2. FGR multi-escala (Open3D) — rotação grossa baseada em features FPFH
+      3. ICP point-to-plane — refinamento fino
+
+    Voxel é adaptativo ao tamanho do prédio (1/50 da menor dimensão IFC) e
+    multi-escala (coarse → fine) — features grandes resolvem rotação 180°,
+    features pequenas refinam translação.
+
+    Returns: (pts_alinhados, debug_info)
+    """
+    debug: Dict = {}
+
+    # Estágio 1: normalizar eixo
+    pts_n, R_axis, axis_log = _normalizar_eixo_vertical(pts_scan)
+    print(f"   📐 Normalização eixo: {axis_log}")
+    debug['axis_normalization'] = axis_log
+
+    if not objetos_ifc:
+        debug['error'] = 'no_ifc_objects'
+        return pts_n, debug
+
+    # Estágio 2: monta nuvem de referência do IFC
+    pts_ifc = np.empty((0, 3))
+    if ifc_path:
+        pts_ifc = _ifc_full_mesh_cloud(ifc_path, max_pts=80_000)
+        if pts_ifc.size > 0:
+            print(f"   📦 IFC reference cloud: {len(pts_ifc):,} pts (mesh vertices reais)")
+    if pts_ifc.size == 0:
+        pts_ifc = np.vstack([_sample_obb_surface(o, target_pts=300) for o in objetos_ifc])
+        print(f"   📦 IFC reference cloud: {len(pts_ifc):,} pts (fallback: bbox surfaces)")
+    if pts_ifc.size == 0:
+        debug['error'] = 'empty_ifc_cloud'
+        return pts_n, debug
+
+    # Voxel adaptativo: 1/50 da diagonal do IFC
+    ifc_dims = pts_ifc.max(axis=0) - pts_ifc.min(axis=0)
+    diag = float(np.linalg.norm(ifc_dims))
+    if voxel_size is None:
+        voxel_size = max(0.05, diag / 80.0)  # ex: prédio 25m → voxel 0.3m
+    print(f"   📏 IFC diag={diag:.1f}m | voxel base={voxel_size:.3f}m")
+
+    # Multi-escala: coarse pra resolver rotação 180°, fine pra refinar
+    voxels = [voxel_size * 3, voxel_size, voxel_size * 0.4]
+    best_T = np.eye(4)
+    best_fit = 0.0
+    best_rmse = float('inf')
+
+    for v in voxels:
+        T, fitness, rmse = _alinhar_fgr_icp(pts_n, pts_ifc, voxel_size=v)
+        print(f"      [voxel {v:.3f}m] fitness={fitness:.3f} rmse={rmse:.3f}m")
+        # Aceita melhoria SIGNIFICATIVA (não só marginal)
+        if fitness > best_fit + 0.02:
+            best_T = T
+            best_fit = fitness
+            best_rmse = rmse
+
+    print(f"   ✅ FGR+ICP (melhor): fitness={best_fit:.3f} | rmse={best_rmse:.3f}m")
+    debug.update({
+        'fitness': best_fit,
+        'rmse_m': best_rmse,
+        'transformation': best_T.tolist(),
+        'voxel_base': voxel_size,
+    })
+
+    # Aplica transformação na nuvem completa
+    pts_homog = np.hstack([pts_n, np.ones((len(pts_n), 1))])
+    pts_final = (best_T @ pts_homog.T).T[:, :3]
+
+    return pts_final, debug
+
+
+# =========================
+# ALINHAMENTO HÍBRIDO 2.0 (LEGADO — mantido como fallback)
 # =========================
 def alinhar_nuvem_com_ifc(
     pts: np.ndarray,
@@ -2282,6 +2638,11 @@ _ML_DISPONIVEL = _carregar_modelo_ml()
 _ML_TIPO_MAP = {
     "IfcWall": 0, "IfcSlab": 1, "IfcColumn": 2, "IfcBeam": 3,
     "IfcStair": 4, "IfcRoof": 5, "IfcDoor": 6, "IfcWindow": 7,
+    # Novos tipos mapeados ao equivalente geométrico que o RF já conhece:
+    "IfcCovering": 1,  # como IfcSlab (forros = placa horizontal)
+    "IfcPlate":    1,  # como IfcSlab (placa)
+    "IfcMember":   3,  # como IfcBeam (membro linear)
+    "IfcRailing":  0,  # como IfcWall (extrusão vertical)
 }
 _ML_EIXO_MAP  = {"z_up": 0, "horiz_longest": 1, "length_axis": 2}
 _ML_EIXO_TIPO = {
@@ -2289,6 +2650,11 @@ _ML_EIXO_TIPO = {
     "IfcDoor": "z_up", "IfcWindow": "z_up",
     "IfcSlab": "horiz_longest", "IfcRoof": "horiz_longest",
     "IfcBeam": "length_axis",
+    # Novos tipos, eixo da feature geométrica equivalente:
+    "IfcCovering": "horiz_longest",  # forro deita no plano horizontal
+    "IfcPlate":    "horiz_longest",
+    "IfcMember":   "length_axis",     # membro estrutural longo
+    "IfcRailing":  "z_up",            # guarda-corpo vertical
 }
 _ML_STATUS = {
     0: {'code': 'COMPLETO', 'texto': 'Executado',              'cor': '#22c55e'},
@@ -2423,9 +2789,19 @@ def analisar_ai_ml():
             objetos_para_alinhar = objetos  # fallback
         print(f"   🎯 Alinhamento usará {len(objetos_para_alinhar)} objetos do storey "
               f"(ignora {len(objetos) - len(objetos_para_alinhar)} cross-floor)")
-        pts, _      = alinhar_nuvem_com_ifc(pts, objetos_para_alinhar)
-        # Flip removido — desalinhava nuvens que ja estao orientadas corretamente
-        # pts, _, _   = corrigir_orientacao_por_pico_vertical(pts, objetos)
+        # V3 (alinhar_via_fgr_icp) temporariamente DESABILITADO — está com bug
+        # em dado real e o fallback legado lida bem com nuvens já pré-alinhadas
+        # (como as exportadas do CloudCompare após alinhamento manual).
+        # Reativar quando V3 estiver corrigido.
+        # pts_v3, dbg_v3 = alinhar_via_fgr_icp(pts, objetos_para_alinhar, ifc_path=str(ifc_path))
+        # if dbg_v3.get('fitness', 0.0) >= 0.10:
+        #     pts = pts_v3
+        #     print(f"   🎯 Usando alinhamento V3 (FGR+ICP) — fitness={dbg_v3['fitness']:.3f}")
+        # else:
+        #     print(f"   ⚠️  V3 com fitness baixa ({dbg_v3.get('fitness', 0):.3f}) — caindo pro algoritmo legado")
+        #     pts, _ = alinhar_nuvem_com_ifc(pts, objetos_para_alinhar)
+        pts, _ = alinhar_nuvem_com_ifc(pts, objetos_para_alinhar)
+        print(f"   ℹ️  V3 desabilitado nesse teste — usando só legado")
         pts, _, objetos = normalizar_coordenadas(pts, objetos)
 
         import sys as _s
@@ -2515,6 +2891,20 @@ def analisar_ai_ml():
 
             json_filename = None
             if len(pts_obj) > 0:
+                # SUBSAMPLE pra viewer: scanners profissionais geram milhões de pts/objeto,
+                # Three.js trava acima de uns 100k pts. Análise ML já rodou com todos os
+                # pontos (features acima), então subsample aqui afeta SÓ a visualização.
+                MAX_PTS_VIEWER = 50_000
+                if len(pts_obj) > MAX_PTS_VIEWER:
+                    rng = np.random.default_rng(seed=42)  # reproduzível
+                    idx_sub = rng.choice(len(pts_obj), MAX_PTS_VIEWER, replace=False)
+                    pts_obj_view = pts_obj[idx_sub]
+                    colors_obj_view = colors_obj[idx_sub] if colors_obj is not None else None
+                    print(f"   🔻 {obj.get('nome', '?')[:35]}: subsample {len(pts_obj):,} → {MAX_PTS_VIEWER:,} pra viewer")
+                else:
+                    pts_obj_view = pts_obj
+                    colors_obj_view = colors_obj
+
                 # Cor por status (fallback para quando o front escolhe modo "status")
                 cor = {
                     'COMPLETO': [0.2, 0.8, 0.2],
@@ -2523,16 +2913,16 @@ def analisar_ai_ml():
                 }.get(status['code'], [0.5, 0.5, 0.5])
                 nome_safe = secure_filename(obj.get('nome', 'obj'))[:30]
                 json_filename = f"{nome_safe}_{obj.get('guid', '')[:8]}.json"
-                pts_threejs = converter_pontos_ifc_para_threejs(pts_obj)
+                pts_threejs = converter_pontos_ifc_para_threejs(pts_obj_view)
                 json_data = {
                     'positions': pts_threejs.flatten().tolist(),
-                    'color':     cor,            # cor única (fallback)
-                    'count':     len(pts_obj),
+                    'color':     cor,            # cor única por status (verde/laranja/vermelho)
+                    'count':     len(pts_obj_view),
+                    'count_total': len(pts_obj),  # quantos foram analisados de fato (pre-subsample)
                 }
-                # Cores RGB do scanner — uint8 (0-255) reduz JSON em ~3-4× vs floats
-                if colors_obj is not None and len(colors_obj) == len(pts_obj):
-                    rgb_uint8 = np.clip(colors_obj * 255.0, 0, 255).astype(np.uint8)
-                    json_data['colors'] = rgb_uint8.flatten().tolist()
+                # RGB do scanner desabilitado por enquanto — reduz peso do JSON em ~30%
+                # e simplifica visualização (cor uniforme por status é mais legível
+                # que mistura de status + tinta real). Reativar quando viewer escalar.
                 with open(output_dir / json_filename, 'w') as f:
                     json.dump(json_data, f)
                 json_filename = f"{session_id}/{json_filename}"
@@ -2594,17 +2984,119 @@ def analisar_ai_ml():
 
         print(f"ML: C={stats.get('COMPLETO',0)} P={stats.get('PARCIAL',0)} A={stats.get('AUSENTE',0)}", flush=True)
 
+        # === Nuvem global pra visualização (debug + diagnóstico de alinhamento) ===
+        # Sem isso, o viewer só mostra pontos dentro de OBBs — pontos "órfãos"
+        # (fora de qualquer objeto IFC) ficam invisíveis. Escrever esta nuvem
+        # subsampleada permite ver a FORMA completa do scan e diagnosticar
+        # alinhamento visualmente.
+        MAX_PTS_GLOBAL = 200_000
+        if len(pts) > MAX_PTS_GLOBAL:
+            rng_g = np.random.default_rng(seed=42)
+            idx_g = rng_g.choice(len(pts), MAX_PTS_GLOBAL, replace=False)
+            pts_global = pts[idx_g]
+        else:
+            pts_global = pts
+        pts_global_threejs = converter_pontos_ifc_para_threejs(pts_global)
+        global_json = {
+            'positions': pts_global_threejs.flatten().tolist(),
+            'count':     len(pts_global),
+            'count_total': len(pts),
+            'color':     [0.45, 0.5, 0.55],  # cinza-azulado neutro
+        }
+        with open(output_dir / "_global.json", 'w') as f:
+            json.dump(global_json, f)
+        print(f"🌐 Nuvem global salva: {len(pts_global):,}/{len(pts):,} pts → _global.json")
+
         return jsonify({
             'pavimento':    pav_alvo,
             'session_id':   session_id,
             'modo':         'ai',
             'estatisticas': estatisticas,
             'resultados':   resultados,
+            'global_cloud': f"{session_id}/_global.json",
         })
 
     except Exception as e:
         print(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
+
+
+# ================================================================
+# /api/analisar_ai_v2 — pipeline Sonata + OBB do IFC (sem DBSCAN)
+# ================================================================
+# REESCRITO 2026-05-18: pipeline antigo (Sonata+DBSCAN+Hungarian+RF) substituido
+# por Sonata classifica nuvem inteira -> filtra pontos por OBB do IFC ->
+# verdict por classe dominante dentro da OBB.
+# Codigo antigo permanece em pipeline_v2/orchestrator.py mas nao e chamado.
+@app.route('/api/analisar_ai_v2', methods=['POST'])
+def analisar_ai_v2():
+    """Pipeline Sonata + OBB do IFC.
+
+    Etapas:
+      1. Le IFC -> extrai OBB de cada elemento (TIPOS_INTERESSE)
+      2. Le PLY -> alinha com IFC (resolve Y-up vs Z-up)
+      3. Sonata classifica nuvem alinhada (ScanNet 20 classes por ponto)
+      4. Pra cada OBB IFC: cropa pts dentro, conta classes, decide verdict:
+           - poucos pts        -> AUSENTE
+           - classe dominante coerente -> COMPLETO
+           - classe diverge    -> PARCIAL
+
+    Sem DBSCAN, sem Hungarian, sem RF. Tudo via subprocess no venv_sonata.
+    """
+    try:
+        from pipeline_v2 import bbox_runner, bbox_to_v2_schema
+
+        ply_file = request.files.get('ply_file')
+        pav_alvo = request.form.get('pavimento') or '__TODOS__'
+        # Flag opcional pra ativar alinhamento semantico por classe Sonata
+        sem_align = (request.form.get('semantic_align') or '').lower() in ('1', 'true', 'yes', 'on')
+
+        if not ply_file:
+            return jsonify({'error': 'PLY nao enviado'}), 400
+        if not _valid_upload(ply_file, ('.ply',)):
+            return jsonify({'error': 'Arquivo PLY precisa ter extensao .ply'}), 400
+
+        session_id = str(uuid.uuid4())
+        ifc_path_str, _, err = _resolve_ifc_from_request(request, session_id)
+        if err:
+            return jsonify({'error': err[0]}), err[1]
+
+        ply_path = UPLOAD_FOLDER / f"{session_id}_{secure_filename(ply_file.filename)}"
+        ply_file.save(str(ply_path))
+
+        print(f"v2: PLY={ply_path.name} IFC={Path(ifc_path_str).name} pav={pav_alvo}")
+
+        output_dir = OUTPUT_FOLDER / session_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Roda bbox_features.py em subprocess (sonata venv)
+        result_raw = bbox_runner.run_bbox_features(
+            ply_path=str(ply_path),
+            ifc_path=ifc_path_str,
+            pavimento=pav_alvo,
+            output_dir=str(output_dir),
+            timeout=600.0,
+            verbose=True,
+            semantic_align=sem_align,
+        )
+
+        # Adapta pro schema do front v2
+        adapted = bbox_to_v2_schema.adaptar(result_raw)
+
+        return jsonify({
+            'pavimento':    pav_alvo,
+            'session_id':   session_id,
+            'modo':         'sonata_bbox_v1',
+            'estatisticas': adapted['estatisticas'],
+            'resultados':   adapted['resultados'],
+            'adicoes':      adapted['adicoes'],
+            'global_cloud': adapted['meta'].get('global_cloud'),
+            'meta':         adapted['meta'],
+        })
+
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({'error': f'pipeline sonata_bbox falhou: {e}'}), 500
 
 
 # =========================

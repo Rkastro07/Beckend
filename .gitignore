@@ -25,3 +25,21 @@ bim-ai-superintendent/.claude/
 # Temp
 nul
 server_test_output.txt
+
+# Logs
+*.log
+~$*
+
+# PLY uploads / outputs grandes no root
+*.ply
+checkpoints/
+
+# Sonata experiments — venv + clone + checkpoints (todos grandes)
+experiments/sonata/venv_sonata/
+experiments/sonata/checkpoints/
+experiments/sonata/repo/
+
+# Frontend v2 build artifacts
+bim-ai-superintendent-v2/node_modules/
+bim-ai-superintendent-v2/dist/
+bim-ai-superintendent-v2/.vite/
