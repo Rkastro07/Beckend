@@ -9,12 +9,14 @@ usando features extraidas da nuvem de pontos + metadados IFC.
 Split por edificio (nao por sample) para evitar vazamento de dados.
 
 Uso:
-  python ml/train.py
+  python ml/train.py                       # v1 (11 features geometricas)
+  python ml/train.py --features v2         # v2 (11 v1 + 6 Sonata-aware)
   python ml/train.py --epochs 100 --lr 0.001
 """
 
 import argparse
 import json
+import math
 import pickle
 import random
 import sys
@@ -69,7 +71,25 @@ TIPO_MAP = {
 EIXO_MAP = {"z_up": 0, "horiz_longest": 1, "length_axis": 2}
 
 BBOX_MARGIN = 0.05   # metros — margem ao filtrar pts dentro da bbox
+SONATA_MARGIN = 0.3  # margem maior pras features v2 (alinhada com runtime)
 SEED        = 42
+
+# Lookup IFC type → classes Sonata esperadas (espelho de pipeline_v2.class_mapping)
+IFC_TO_SONATA_CLASSES = {
+    "IfcWall":     ["wall"],
+    "IfcRailing":  ["wall"],
+    "IfcSlab":     ["floor"],      # ceiling vira 'floor' tambem (no ScanNet 20)
+    "IfcCovering": ["floor"],
+    "IfcDoor":     ["door"],
+    "IfcWindow":   ["window"],
+}
+# ScanNet 20 class names (indice = class_id que o Sonata produz)
+SCANNET_CLASS_NAMES = (
+    "wall", "floor", "cabinet", "bed", "chair", "sofa", "table", "door",
+    "window", "bookshelf", "picture", "counter", "desk", "curtain",
+    "refrigerator", "shower_curtain", "toilet", "sink", "bathtub",
+    "otherfurniture",
+)
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -183,10 +203,95 @@ def extrair_features_objeto(pts_cena, obj_label, obj_ifc):
     return feat
 
 
-def carregar_dataset():
+def extrair_features_sonata(pts_voxel, pred, conf, obj_ifc, margin=SONATA_MARGIN):
+    """6 features Sonata-aware (v2) por objeto IFC.
+
+    Inline aqui (em vez de importar pipeline_v2.features_v2) pra manter
+    train.py auto-contido. Logica equivalente.
+
+    Args:
+        pts_voxel: (N,3) nuvem global pos-voxelize do Sonata
+        pred:      (N,)  class_id ScanNet por ponto
+        conf:      (N,)  confianca [0,1] por ponto
+        obj_ifc:   dict com 'bbox', 'tipo'
+
+    Returns:
+        np.ndarray (6,) float32 — ordem:
+            class_purity, class_confidence, bbox_size_ratio,
+            centroid_offset_x, centroid_offset_y, centroid_offset_z
+    """
+    bbox = obj_ifc["bbox"]
+    tipo = obj_ifc.get("tipo", "")
+
+    # 1. Filtra pts no bbox + margem
+    if pts_voxel is None or len(pts_voxel) == 0:
+        return np.zeros(6, dtype=np.float32)
+
+    mask = (
+        (pts_voxel[:, 0] >= bbox["xmin"] - margin) &
+        (pts_voxel[:, 0] <= bbox["xmax"] + margin) &
+        (pts_voxel[:, 1] >= bbox["ymin"] - margin) &
+        (pts_voxel[:, 1] <= bbox["ymax"] + margin) &
+        (pts_voxel[:, 2] >= bbox["zmin"] - margin) &
+        (pts_voxel[:, 2] <= bbox["zmax"] + margin)
+    )
+    pts_in   = pts_voxel[mask]
+    pred_in  = pred[mask]
+    conf_in  = conf[mask]
+    n_total  = len(pts_in)
+
+    # 2. class_purity, class_confidence
+    expected = IFC_TO_SONATA_CLASSES.get(tipo, [])
+    expected_ids = [SCANNET_CLASS_NAMES.index(c) for c in expected if c in SCANNET_CLASS_NAMES]
+    if n_total == 0 or not expected_ids:
+        class_purity = 0.0
+        class_conf_mean = 0.0
+    else:
+        mask_correct = np.isin(pred_in, expected_ids)
+        n_correct = int(mask_correct.sum())
+        class_purity = n_correct / n_total
+        class_conf_mean = float(conf_in[mask_correct].mean()) if n_correct > 0 else 0.0
+
+    # 3. bbox_size_ratio (volume dos pts filtrados vs volume bbox IFC), log clipped
+    bw = max(bbox["xmax"] - bbox["xmin"], 1e-6)
+    bd = max(bbox["ymax"] - bbox["ymin"], 1e-6)
+    bh = max(bbox["zmax"] - bbox["zmin"], 1e-6)
+    v_ifc = max(float(obj_ifc.get("volume_bbox") or (bw * bd * bh)), 1e-6)
+    if n_total > 2:
+        pmin = pts_in.min(axis=0)
+        pmax = pts_in.max(axis=0)
+        v_scan = max(float((pmax - pmin).prod()), 1e-6)
+        bbox_size_ratio = max(-2.0, min(2.0, math.log(v_scan / v_ifc)))
+    else:
+        bbox_size_ratio = -2.0  # praticamente nada → ratio minimo
+
+    # 4. Centroid offsets normalizados pela bbox IFC
+    ifc_cx = (bbox["xmin"] + bbox["xmax"]) * 0.5
+    ifc_cy = (bbox["ymin"] + bbox["ymax"]) * 0.5
+    ifc_cz = (bbox["zmin"] + bbox["zmax"]) * 0.5
+    if n_total > 0:
+        scan_c = pts_in.mean(axis=0)
+        offset_x = float((scan_c[0] - ifc_cx) / bw)
+        offset_y = float((scan_c[1] - ifc_cy) / bd)
+        offset_z = float((scan_c[2] - ifc_cz) / bh)
+    else:
+        offset_x = offset_y = offset_z = 0.0
+
+    return np.array([
+        class_purity, class_conf_mean, bbox_size_ratio,
+        offset_x, offset_y, offset_z,
+    ], dtype=np.float32)
+
+
+def carregar_dataset(features_version="v1"):
     """
     Varre todos os samples do dataset sintetico e extrai features por objeto.
-    Retorna X (N, 18), y (N,), grupos (N,) com nome do IFC para split.
+    Retorna X (N, n_features), y (N,), grupos (N,) com nome do IFC para split.
+
+    features_version='v1' → 11 features (default).
+    features_version='v2' → 17 features. Requer 'cena.sonata.pkl' por sample
+        (gerado por pipeline_v2.sonata_runner). Samples sem o pickle sao
+        pulados com warning.
     """
     samples = sorted(SINTETICO_DIR.iterdir())
     if not samples:
@@ -194,8 +299,9 @@ def carregar_dataset():
 
     X_list, y_list, grupos = [], [], []
     stats = {"COMPLETO": 0, "PARCIAL": 0, "AUSENTE": 0}
+    n_skipped_no_sonata = 0
 
-    print(f"Carregando {len(samples)} samples...")
+    print(f"Carregando {len(samples)} samples (features={features_version})...")
     t0 = time.time()
 
     for i, sample_dir in enumerate(samples):
@@ -204,6 +310,24 @@ def carregar_dataset():
         ply = sample_dir / "cena.ply"
         if not (lf.exists() and rf.exists() and ply.exists()):
             continue
+
+        # v2: precisa do pickle Sonata ao lado do PLY
+        sonata_pts = sonata_pred = sonata_conf = None
+        if features_version == "v2":
+            sonata_pkl = sample_dir / "cena.sonata.pkl"
+            if not sonata_pkl.exists():
+                n_skipped_no_sonata += 1
+                continue
+            try:
+                with open(sonata_pkl, 'rb') as f:
+                    s = pickle.load(f)
+                sonata_pts  = np.asarray(s['pts_voxel'], dtype=np.float32)
+                sonata_pred = np.asarray(s['pred'],      dtype=np.int32)
+                sonata_conf = np.asarray(s['confidence'], dtype=np.float32)
+            except Exception as e:
+                print(f"  AVISO: falha lendo {sonata_pkl.name}: {e} — pulando")
+                n_skipped_no_sonata += 1
+                continue
 
         labels  = json.load(open(lf, encoding='utf-8'))
         ifc_ref = json.load(open(rf, encoding='utf-8'))
@@ -221,7 +345,14 @@ def carregar_dataset():
             if obj_ifc is None:
                 continue
 
-            feat  = extrair_features_objeto(pts, obj_label, obj_ifc)
+            feat_v1 = extrair_features_objeto(pts, obj_label, obj_ifc)
+            if features_version == "v2":
+                feat_v2_new = extrair_features_sonata(
+                    sonata_pts, sonata_pred, sonata_conf, obj_ifc,
+                )
+                feat = np.concatenate([feat_v1, feat_v2_new]).astype(np.float32)
+            else:
+                feat = feat_v1
             label = LABEL_MAP[obj_label['status']]
 
             X_list.append(feat)
@@ -231,6 +362,10 @@ def carregar_dataset():
 
         if (i + 1) % 50 == 0:
             print(f"  {i+1}/{len(samples)} samples processados...")
+
+    if features_version == "v2" and n_skipped_no_sonata > 0:
+        print(f"\n  AVISO: {n_skipped_no_sonata} samples sem cena.sonata.pkl foram pulados.")
+        print(f"  Rode pipeline_v2.sonata_runner sobre o dataset antes de treinar v2.")
 
     X = np.stack(X_list, axis=0)
     y = np.array(y_list, dtype=np.int64)
@@ -445,24 +580,32 @@ def avaliar(modelo_rf, modelo_mlp, scaler, X_te, y_te):
         print(f"  {LABEL_NAMES[i]:<12}  {row[0]:>7}  {row[1]:>7}  {row[2]:>7}")
 
 
-def salvar_modelos(modelo_rf, modelo_mlp, scaler, X_tr):
+def salvar_modelos(modelo_rf, modelo_mlp, scaler, X_tr, features_version="v1"):
     n_feat = X_tr.shape[1]
 
-    # Random Forest
-    rf_path = OUTPUT_DIR / "random_forest.pkl"
+    # Random Forest — schema compativel com pipeline_v2.rf_router
+    rf_filename = "random_forest.pkl" if features_version == "v1" else "random_forest_v2.pkl"
+    rf_path = OUTPUT_DIR / rf_filename
     with open(rf_path, 'wb') as f:
-        pickle.dump({'model': modelo_rf, 'scaler': scaler}, f)
-    print(f"\nRandom Forest salvo: {rf_path}")
+        pickle.dump({
+            'model':            modelo_rf,
+            'scaler':           scaler,
+            'feature_version':  features_version,
+            'n_features':       n_feat,
+        }, f)
+    print(f"\nRandom Forest salvo: {rf_path}  (version={features_version}, n_features={n_feat})")
 
     # MLP PyTorch
-    mlp_path = OUTPUT_DIR / "mlp_bim.pt"
+    mlp_filename = "mlp_bim.pt" if features_version == "v1" else "mlp_bim_v2.pt"
+    mlp_path = OUTPUT_DIR / mlp_filename
     torch.save({
-        'model_state': modelo_mlp.state_dict(),
-        'n_features':  n_feat,
-        'label_map':   LABEL_MAP,
-        'label_names': LABEL_NAMES,
-        'scaler_mean': scaler.mean_.tolist(),
-        'scaler_std':  scaler.scale_.tolist(),
+        'model_state':     modelo_mlp.state_dict(),
+        'n_features':      n_feat,
+        'feature_version': features_version,
+        'label_map':       LABEL_MAP,
+        'label_names':     LABEL_NAMES,
+        'scaler_mean':     scaler.mean_.tolist(),
+        'scaler_std':      scaler.scale_.tolist(),
     }, mlp_path)
     print(f"MLP PyTorch salvo : {mlp_path}")
 
@@ -475,6 +618,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=80)
     parser.add_argument('--lr',     type=float, default=5e-4)
+    parser.add_argument('--features', choices=['v1', 'v2'], default='v1',
+                        help="v1 = 11 features geometricas (default); "
+                             "v2 = 11 v1 + 6 Sonata-aware (precisa cena.sonata.pkl).")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -484,7 +630,7 @@ def main():
     print("=" * 60)
 
     # 1. Carrega features
-    X, y, grupos = carregar_dataset()
+    X, y, grupos = carregar_dataset(features_version=args.features)
 
     # 2. Split por edificio
     X_tr, y_tr, X_val, y_val, X_te, y_te = split_por_edificio(X, y, grupos)
@@ -515,13 +661,20 @@ def main():
     print(f"  Val accuracy: {val_acc_rf:.2f}%")
 
     # Feature importance
-    feat_names = [
-        'n_pts','completeness_r','is_empty','height_fill',
+    feat_names_v1 = [
+        'completeness_r','is_empty','height_fill',
         'z_bottom_norm','z_top_norm','centroid_z_norm',
-        'xy_spread_norm','density_obs',
-        'tipo','eixo','bbox_w','bbox_d','bbox_h',
-        'area','volume','aspect_hw','aspect_hd'
+        'xy_spread_norm','density_area',
+        'tipo','eixo','bh',
     ]
+    feat_names_v2_new = [
+        'class_purity','class_confidence','bbox_size_ratio',
+        'centroid_offset_x','centroid_offset_y','centroid_offset_z',
+    ]
+    feat_names = feat_names_v1 + (feat_names_v2_new if args.features == 'v2' else [])
+    # Garantia de tamanho — RF pode ter recebido mais/menos colunas
+    if len(feat_names) != X_tr.shape[1]:
+        feat_names = [f'f{i}' for i in range(X_tr.shape[1])]
     imp = rf.feature_importances_
     top = sorted(zip(feat_names, imp), key=lambda x: -x[1])
     print("\n  Top features:")
@@ -536,7 +689,7 @@ def main():
     avaliar(rf, mlp, scaler, X_te, y_te)
 
     # 7. Salva
-    salvar_modelos(rf, mlp, scaler, X_tr)
+    salvar_modelos(rf, mlp, scaler, X_tr, features_version=args.features)
 
     print("\nPronto!")
 
