@@ -33,8 +33,10 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from scipy.optimize import linear_sum_assignment
 
-# Mask3D
-MASK3D_DIR = Path("/home/rafael/Mask3D")
+# Mask3D — configura via variavel de ambiente ou usa default Colab
+# WSL:   export MASK3D_DIR=/home/rafael/Mask3D
+# Colab: nao precisa exportar (default ja eh /content/Mask3D)
+MASK3D_DIR = Path(os.environ.get("MASK3D_DIR", "/content/Mask3D"))
 sys.path.insert(0, str(MASK3D_DIR))
 
 import MinkowskiEngine as ME
@@ -67,7 +69,7 @@ class BIMInstanceDataset(Dataset):
     """
 
     def __init__(self, npz_paths, voxel_size=0.05, seg_size=0.15,
-                 max_voxels=20000, augment=True):
+                 max_voxels=80000, augment=True):
         self.paths = list(npz_paths)
         self.voxel_size = voxel_size
         self.seg_size = seg_size
@@ -530,13 +532,13 @@ def treinar(args):
 
     print(f"Train: {len(train_files)} | Val: {len(val_files)}")
 
-    ds_train = BIMInstanceDataset(train_files, augment=True)
-    ds_val   = BIMInstanceDataset(val_files,   augment=False)
+    ds_train = BIMInstanceDataset(train_files, augment=True,  max_voxels=args.max_voxels)
+    ds_val   = BIMInstanceDataset(val_files,   augment=False, max_voxels=args.max_voxels)
 
     dl_train = DataLoader(ds_train, batch_size=1, shuffle=True,
-                          num_workers=0, collate_fn=collate_single)
+                          num_workers=2, collate_fn=collate_single)
     dl_val   = DataLoader(ds_val, batch_size=1, shuffle=False,
-                          num_workers=0, collate_fn=collate_single)
+                          num_workers=2, collate_fn=collate_single)
 
     # Modelo
     print("\n" + "=" * 60)
@@ -726,6 +728,8 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--freeze_backbone", action="store_true",
                         help="Congela backbone (so treina decoder)")
+    parser.add_argument("--max_voxels", type=int, default=80000,
+                        help="Max voxels por cena (default 80000 pro A100, 20000 pra GPUs menores)")
     args = parser.parse_args()
 
     treinar(args)
