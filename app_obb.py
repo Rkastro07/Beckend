@@ -137,8 +137,9 @@ app.config['MAX_CONTENT_LENGTH'] = 2048 * 1024 * 1024  # 2GB
 
 @app.after_request
 def _no_cache(response):
-    # /outputs/* são imutáveis (nome tem session_id + guid) — deixa o browser cachear
-    if request.path.startswith('/outputs/'):
+    # /outputs/* são imutáveis (nome tem session_id + guid) — deixa o browser cachear.
+    # SO em 200: um 404 marcado immutable fica preso no cache do browser pra sempre.
+    if request.path.startswith('/outputs/') and response.status_code == 200:
         response.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
     else:
         response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
@@ -2579,10 +2580,10 @@ def chat():
                     {'role': 'user', 'content': prompt}
                 ],
                 'temperature': 0.7,
-                'max_tokens': 300,
+                'max_tokens': 1500,
                 'stream': False
             },
-            timeout=20
+            timeout=30
         )
 
         if not response.ok:
@@ -3102,6 +3103,22 @@ def analisar_ai_v2():
 # =========================
 # MAIN
 # =========================
+# Ferramentas (conversores + geradores) — registradas em nivel de modulo pra
+# funcionar tanto via __main__ quanto via WSGI/gunicorn.
+try:
+    from tools_endpoints import register_tools
+    register_tools(app, UPLOAD_FOLDER, OUTPUT_FOLDER, _valid_upload)
+    print("🧰 Ferramentas registradas: /api/tools/{obj-to-ply,usdz-to-ply,asc-to-ply,gerar-nuvem}")
+except Exception as _e:
+    print(f"⚠️  Falha ao registrar ferramentas: {_e}")
+
+try:
+    from scan_endpoints import register_scan
+    register_scan(app, UPLOAD_FOLDER, OUTPUT_FOLDER)
+except Exception as _e:
+    print(f"⚠️  Falha ao registrar scan→BIM: {_e}")
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8081))
     debug = os.environ.get('DEBUG', 'false').lower() == 'true'

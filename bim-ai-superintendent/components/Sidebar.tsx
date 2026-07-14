@@ -1,5 +1,5 @@
 import React from 'react';
-import { Upload, FileText, Layers, Key, PlayCircle, Box, Brain, GitCompare, Shapes } from 'lucide-react';
+import { Upload, FileText, Layers, Key, PlayCircle, Brain, Sparkles } from 'lucide-react';
 import { Floor } from '../types';
 import { AnalysisMode } from '../services/api';
 
@@ -124,33 +124,29 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
         {/* Analysis Mode */}
         <div className="space-y-2">
-          <label className="text-sm font-medium text-slate-300">Modo de Análise</label>
+          <label className="text-sm font-medium text-slate-300">Pipeline de Análise</label>
           <div className="flex rounded-lg overflow-hidden border border-slate-600">
             {([
-              { mode: 'bbox' as AnalysisMode, label: 'BBox', icon: Box },
-              { mode: 'ai' as AnalysisMode, label: 'ML', icon: Brain },
-              { mode: 'both' as AnalysisMode, label: 'Ambos', icon: GitCompare },
-              { mode: 'instances' as AnalysisMode, label: 'Inst.', icon: Shapes },
+              { mode: 'ml_v1' as AnalysisMode, label: 'ML v1', icon: Brain },
+              { mode: 'sonata_v2' as AnalysisMode, label: 'Sonata v2', icon: Sparkles },
             ]).map(({ mode, label, icon: Icon }) => (
               <button
                 key={mode}
                 onClick={() => onModeChange(mode)}
-                className={`flex-1 py-2 px-2 text-xs font-semibold flex items-center justify-center gap-1 transition-colors
+                className={`flex-1 py-2.5 px-3 text-sm font-semibold flex items-center justify-center gap-1.5 transition-colors
                   ${analysisMode === mode
                     ? 'bg-blue-600 text-white'
                     : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
                   }`}
               >
-                <Icon className="w-3.5 h-3.5" />
+                <Icon className="w-4 h-4" />
                 {label}
               </button>
             ))}
           </div>
           <p className="text-[10px] text-slate-500">
-            {analysisMode === 'bbox' && 'Geometria (bounding box + anti-leaking)'}
-            {analysisMode === 'ai' && 'Random Forest treinado no dataset sintetico'}
-            {analysisMode === 'both' && 'Compara BBox vs AI lado a lado'}
-            {analysisMode === 'instances' && 'RandLA-Net Instance — separa objetos individuais'}
+            {analysisMode === 'ml_v1' && 'Random Forest treinado no dataset sintético'}
+            {analysisMode === 'sonata_v2' && 'Sonata (segmentação semântica) + OBB do IFC'}
           </p>
         </div>
 

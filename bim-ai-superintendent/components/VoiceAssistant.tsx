@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
+import ReactMarkdown from 'react-markdown';
 import { AnalysisResult, ChatMessage } from '../types';
 import { processVoiceQuery, processChatQuery } from '../services/deepseek';
 import { Mic, Square, Send, User, Bot, Loader2 } from 'lucide-react';
@@ -163,16 +164,31 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ result, csvConte
             className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
           >
             <div
-              className={`flex max-w-[80%] ${msg.role === 'user'
-                ? 'bg-blue-600 text-white rounded-2xl rounded-tr-sm'
-                : 'bg-white border border-slate-200 text-slate-800 rounded-2xl rounded-tl-sm shadow-sm'
-                } p-4`}
+              className={`flex ${msg.role === 'user'
+                ? 'max-w-[75%] bg-blue-600 text-white rounded-2xl rounded-tr-sm p-4'
+                : 'max-w-[90%] bg-white border border-slate-200 text-slate-800 rounded-2xl rounded-tl-sm shadow-sm p-5'
+                }`}
             >
               <div className="mr-3 mt-1 shrink-0">
                 {msg.role === 'user' ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4 text-blue-500" />}
               </div>
-              <div>
-                <p className="text-sm leading-relaxed">{msg.text}</p>
+              <div className="min-w-0 flex-1">
+                {msg.role === 'model' ? (
+                  <div className="prose prose-sm prose-slate max-w-none
+                    prose-table:text-xs prose-table:border-collapse
+                    prose-th:bg-slate-100 prose-th:px-3 prose-th:py-1.5 prose-th:text-left prose-th:border prose-th:border-slate-300 prose-th:font-semibold
+                    prose-td:px-3 prose-td:py-1.5 prose-td:border prose-td:border-slate-200
+                    prose-tr:even:bg-slate-50
+                    prose-h1:text-lg prose-h2:text-base prose-h3:text-sm prose-h3:font-semibold
+                    prose-p:text-sm prose-p:leading-relaxed
+                    prose-li:text-sm
+                    prose-strong:text-slate-900
+                    overflow-x-auto">
+                    <ReactMarkdown>{msg.text}</ReactMarkdown>
+                  </div>
+                ) : (
+                  <p className="text-sm leading-relaxed">{msg.text}</p>
+                )}
                 <span className={`text-[10px] mt-2 block ${msg.role === 'user' ? 'text-blue-200' : 'text-slate-400'}`}>
                   {msg.timestamp.toLocaleTimeString()}
                 </span>

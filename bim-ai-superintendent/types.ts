@@ -2,7 +2,10 @@
 export enum AppTab {
   VISTORIA = 'vistoria',
   RELATORIO = 'relatorio',
-  VOICE = 'voice'
+  VOICE = 'voice',
+  FERRAMENTAS = 'ferramentas',
+  PLANTA = 'planta',
+  SCAN = 'scan'
 }
 
 export interface Floor {
@@ -23,14 +26,29 @@ export interface BimItem {
   guid: string;
   nome: string;
   tipo: string;
+  pavimento?: string;
   pontos: number;
   cobertura_vertical: number;
+  cobertura?: number;
+  volume_ifc?: number;
+  densidade?: number;
+  eh_conexao?: boolean;
   status: {
-    code: 'COMPLETO' | 'PARCIAL' | 'INICIADO' | 'AUSENTE';
+    code: 'COMPLETO' | 'PARCIAL' | 'INICIADO' | 'AUSENTE' | 'ADICAO';
     emoji: string;
     texto: string;
     cor: string;
   };
+  // Pipeline v2: informação de matching scan↔IFC
+  rf_version?: 'v1' | 'v2' | null;
+  match_info?: {
+    cost: number;
+    scan_class: string;
+    scan_centroid: [number, number, number];
+    scan_n_pts: number;
+    scan_conf: number;
+    matched_by: string;
+  } | null;
   dimensoes: {
     progresso: { z: number };
   };
@@ -63,8 +81,20 @@ export interface AnalysisResult {
     parciais: number;
     iniciados: number;
     ausentes: number;
+    adicoes?: number;        // v2: construído fora do plano
     progresso_geral: number;
   };
+  // Pipeline v2: instâncias scan sem par IFC (ADICAO)
+  adicoes?: Array<{
+    scan_class: string;
+    centroid: [number, number, number];
+    n_pts: number;
+    mean_conf: number;
+    volume: number;
+    bbox?: BBox;
+    status: { code: 'ADICAO'; texto: string; cor: string };
+  }>;
+  meta?: Record<string, any>;
   // Mantém compatibilidade com código antigo
   summary?: {
     total_elements: number;

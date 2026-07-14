@@ -51,6 +51,44 @@ declare module 'react' {
   }
 }
 
+// --- NUVEM GLOBAL (fundo cinza, mostra forma completa do scan) ---
+// Permite ver pontos que não caíram dentro de nenhum OBB ("órfãos"),
+// essencial pra diagnosticar visualmente se o alinhamento ficou certo.
+const GlobalPointsCloud = ({ jsonFile }: { jsonFile: string | undefined }) => {
+  const [points, setPoints] = React.useState<Float32Array | null>(null);
+
+  useEffect(() => {
+    if (!jsonFile) { setPoints(null); return; }
+    const baseUrl = 'http://localhost:8081/outputs/';
+    const finalUrl = jsonFile.startsWith('http') ? jsonFile : `${baseUrl}${jsonFile}`;
+    fetch(finalUrl)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then(d => {
+        if (d.positions && Array.isArray(d.positions)) {
+          setPoints(new Float32Array(d.positions));
+        }
+      })
+      .catch(err => console.error("Erro ao carregar nuvem global:", err));
+  }, [jsonFile]);
+
+  if (!points) return null;
+  return (
+    <points>
+      <bufferGeometry>
+        <bufferAttribute attach="attributes-position" count={points.length / 3} array={points} itemSize={3} />
+      </bufferGeometry>
+      <pointsMaterial
+        size={0.015}                    // bem pequeno, fica de "fundo"
+        sizeAttenuation
+        color={new THREE.Color(0.45, 0.5, 0.55)}  // cinza-azulado
+        transparent
+        opacity={0.55}                  // semitransparente pra não dominar
+        depthWrite={false}              // OBBs/pts coloridos sempre por cima
+      />
+    </points>
+  );
+};
+
 // --- TEXTURA DE PONTO CIRCULAR ---
 // Sprite gerado uma vez no módulo (evita recriar a cada instância de ObjectPoints).
 // Gradiente radial dá borda suave: centro opaco até 70% do raio, vai pra alpha=0 na borda.
@@ -766,23 +804,10 @@ const BimBoundingBox: React.FC<{ item: any }> = ({ item }) => {
 export const DataView: React.FC<{
   result: AnalysisResult | null;
   resultAI?: AnalysisResult | null;
-  analysisMode?: 'bbox' | 'ai' | 'both' | 'instances';
-}> = ({ result, resultAI, analysisMode = 'bbox' }) => {
+  analysisMode?: string;
+}> = ({ result, resultAI, analysisMode = 'ml_v1' }) => {
 
-  // Determina qual resultado exibir
-  const activeResult = analysisMode === 'ai' ? resultAI : result;
-
-  console.log("DADOS CHEGANDO NO DATAVIEW:", activeResult, "modo:", analysisMode);
-
-  if (!activeResult && analysisMode !== 'both') {
-    return <div className="p-10 text-slate-500">Aguardando dados...</div>;
-  }
-  if (analysisMode === 'both' && !result && !resultAI) {
-    return <div className="p-10 text-slate-500">Aguardando dados...</div>;
-  }
-
-  // No modo "both", mostra comparação
-  const displayResult = activeResult || result || resultAI;
+  const displayResult = result || resultAI;
   if (!displayResult) {
     return <div className="p-10 text-slate-500">Aguardando dados...</div>;
   }
@@ -798,16 +823,9 @@ export const DataView: React.FC<{
     progresso_geral: displayResult.summary?.progress_percentage || 0
   };
 
-  // Dados AI para comparação no modo "both"
-  const resultadosAI = resultAI?.resultados || resultAI?.items || [];
-  const estatisticasAI = resultAI?.estatisticas || null;
-
   if (resultados.length === 0) {
     return <div className="p-10 text-slate-500">Nenhum objeto encontrado.</div>;
   }
-
-  console.log("Primeiro objeto:", resultados[0]);
-  console.log("Total de objetos:", resultados.length);
 
   // --- ESTADO DE SELEÇÃO ---
   const [selectedGuid, setSelectedGuid] = useState<string | null>(null);
@@ -934,6 +952,9 @@ export const DataView: React.FC<{
             {/* FERRAMENTA DE MEDIÇÃO (inclui OrbitControls) */}
             <MeasureTool />
 
+            {/* NUVEM GLOBAL (fundo cinza, mostra forma completa do scan) */}
+            <GlobalPointsCloud jsonFile={(displayResult as any)?.global_cloud} />
+
             {/* OBJETOS BIM: BOUNDING BOXES + PONTOS (filtrado por visibilidade) */}
             {resultados.filter(item => isItemVisible(item)).map((item, i) => (
               <group key={item.guid || i}>
@@ -944,8 +965,7 @@ export const DataView: React.FC<{
                   onSelect={(guid) => setSelectedGuid(prev => prev === guid ? null : guid)}
                 />
 
-                {/* Bounding box — oculta apenas no modo Instâncias */}
-                {analysisMode !== 'instances' && <BimBoundingBox item={item} />}
+                <BimBoundingBox item={item} />
 
                 {/* Nuvem de pontos da execução (se existir) */}
                 {item.json_file && (
@@ -963,38 +983,14 @@ export const DataView: React.FC<{
         <div className="flex-[2] flex flex-col gap-4 overflow-y-auto">
           {/* Cards */}
           <div className="grid grid-cols-2 gap-4">
-            {analysisMode === 'instances' ? (
-              <>
-                <div className="bg-white p-4 rounded shadow border border-cyan-300">
-                  <div className="text-xs text-cyan-600">Estruturas Detectadas</div>
-                  <div className="text-2xl font-bold text-cyan-700">{estatisticas.total}</div>
-                </div>
-                <div className="bg-white p-4 rounded shadow border border-cyan-200">
-                  <div className="text-xs text-cyan-500">Tipos Encontrados</div>
-                  <div className="text-2xl font-bold text-cyan-600">{Object.keys(statusByType).length}</div>
-                </div>
-              </>
-            ) : (
-              <>
-                <div className="bg-white p-4 rounded shadow border border-slate-200">
-                  <div className="text-xs text-slate-500">
-                    {analysisMode === 'both' ? 'Progresso BBox' : 'Progresso'}
-                  </div>
-                  <div className="text-2xl font-bold">{estatisticas.progresso_geral.toFixed(0)}%</div>
-                </div>
-                {analysisMode === 'both' && estatisticasAI ? (
-                  <div className="bg-white p-4 rounded shadow border border-purple-300">
-                    <div className="text-xs text-purple-500">Progresso AI</div>
-                    <div className="text-2xl font-bold text-purple-700">{estatisticasAI.progresso_geral.toFixed(0)}%</div>
-                  </div>
-                ) : (
-                  <div className="bg-white p-4 rounded shadow border border-slate-200">
-                    <div className="text-xs text-slate-500">Elementos</div>
-                    <div className="text-2xl font-bold">{estatisticas.completos + estatisticas.parciais}/{estatisticas.total}</div>
-                  </div>
-                )}
-              </>
-            )}
+              <div className="bg-white p-4 rounded shadow border border-slate-200">
+                <div className="text-xs text-slate-500">Progresso</div>
+                <div className="text-2xl font-bold">{estatisticas.progresso_geral.toFixed(0)}%</div>
+              </div>
+              <div className="bg-white p-4 rounded shadow border border-slate-200">
+                <div className="text-xs text-slate-500">Elementos</div>
+                <div className="text-2xl font-bold">{estatisticas.completos + estatisticas.parciais}/{estatisticas.total}</div>
+              </div>
           </div>
 
           {/* Gráfico */}
@@ -1005,15 +1001,9 @@ export const DataView: React.FC<{
                 <XAxis dataKey="name" />
                 <YAxis />
                 <Tooltip />
-                {analysisMode === 'instances' ? (
-                  <Bar dataKey="Detectado" fill="#06b6d4" />
-                ) : (
-                  <>
-                    <Bar dataKey="Total" fill="#cbd5e1" />
-                    <Bar dataKey="Completo" fill="#4caf50" />
-                    <Bar dataKey="Parcial" fill="#ff9800" />
-                  </>
-                )}
+                <Bar dataKey="Total" fill="#cbd5e1" />
+                <Bar dataKey="Completo" fill="#4caf50" />
+                <Bar dataKey="Parcial" fill="#ff9800" />
               </BarChart>
             </ResponsiveContainer>
           </div>
@@ -1025,15 +1015,6 @@ export const DataView: React.FC<{
         <div className="px-4 py-3 bg-slate-50 border-b border-slate-200 flex justify-between items-center">
           <h3 className="font-semibold text-slate-700">📋 Lista de Objetos ({resultados.length} itens)</h3>
           <div className="flex gap-2 text-xs">
-            {analysisMode === 'instances' ? (
-              <span
-                onClick={() => toggleCategory('DETECTADO')}
-                className={`px-2 py-1 bg-cyan-100 text-cyan-700 rounded cursor-pointer hover:ring-2 flex items-center gap-1 ${hiddenCategories.has('DETECTADO') ? 'opacity-50' : ''}`}
-              >
-                Detectado ({estatisticas.total}) {hiddenCategories.has('DETECTADO') ? '👁️‍🗨️' : '👁️'}
-              </span>
-            ) : (
-              <>
                 <span
                   onClick={() => toggleCategory('COMPLETO')}
                   className={`px-2 py-1 bg-green-100 text-green-700 rounded cursor-pointer hover:ring-2 flex items-center gap-1 ${hiddenCategories.has('COMPLETO') ? 'opacity-50' : ''}`}
@@ -1058,8 +1039,13 @@ export const DataView: React.FC<{
                 >
                   ❌ Ausente {hiddenCategories.has('AUSENTE') ? '👁️‍🗨️' : '👁️'}
                 </span>
-              </>
-            )}
+                <span
+                  onClick={() => toggleCategory('ADICAO')}
+                  className={`px-2 py-1 bg-sky-100 text-sky-700 rounded cursor-pointer hover:ring-2 flex items-center gap-1 ${hiddenCategories.has('ADICAO') ? 'opacity-50' : ''}`}
+                  title="Construído fora do plano (detectado no scan, ausente no IFC)"
+                >
+                  ➕ Adição {hiddenCategories.has('ADICAO') ? '👁️‍🗨️' : '👁️'}
+                </span>
           </div>
         </div>
         <div className="overflow-x-auto">
@@ -1069,14 +1055,9 @@ export const DataView: React.FC<{
                 <th className="text-left px-4 py-2 font-medium text-slate-600">Nome</th>
                 <th className="text-left px-4 py-2 font-medium text-slate-600">Tipo</th>
                 <th className="text-center px-4 py-2 font-medium text-slate-600">Status</th>
-                {analysisMode === 'both' && <th className="text-center px-4 py-2 font-medium text-purple-600">Status AI</th>}
                 <th className="text-center px-2 py-2 font-medium text-slate-600" title="Visibilidade">👁️</th>
-                <th className="text-center px-4 py-2 font-medium text-slate-600">
-                  {analysisMode === 'instances' ? 'Pontos' : 'Cobertura'}
-                </th>
-                <th className="text-center px-4 py-2 font-medium text-slate-600">
-                  {analysisMode === 'instances' ? 'Dimensoes (m)' : 'Altura (Exec/Plan)'}
-                </th>
+                <th className="text-center px-4 py-2 font-medium text-slate-600">Cobertura</th>
+                <th className="text-center px-4 py-2 font-medium text-slate-600">Altura (Exec/Plan)</th>
               </tr>
             </thead>
             <tbody>
@@ -1089,6 +1070,7 @@ export const DataView: React.FC<{
                     selectedGuid === item.guid ? 'bg-cyan-100 ring-2 ring-cyan-400' :
                     item.status.code === 'AUSENTE' ? 'bg-red-50 hover:bg-slate-50' :
                     item.status.code === 'PARCIAL' ? 'bg-orange-50 hover:bg-slate-50' :
+                    item.status.code === 'ADICAO'  ? 'bg-sky-50 hover:bg-slate-50' :
                     'hover:bg-slate-50'
                   }`}>
                   <td className="px-4 py-2 font-medium text-slate-800">
@@ -1129,29 +1111,12 @@ export const DataView: React.FC<{
                       item.status.code === 'COMPLETO' ? 'bg-green-100 text-green-700' :
                       item.status.code === 'PARCIAL' ? 'bg-orange-100 text-orange-700' :
                       item.status.code === 'INICIADO' ? 'bg-blue-100 text-blue-700' :
+                      item.status.code === 'ADICAO'   ? 'bg-sky-100 text-sky-700' :
                       'bg-red-100 text-red-700'
                       }`}>
                       {item.status.emoji} {item.status.texto}
                     </span>
                   </td>
-                  {analysisMode === 'both' && (() => {
-                    const aiItem = resultadosAI.find((ai: any) => ai.guid === item.guid);
-                    const aiStatus = aiItem?.status;
-                    return (
-                      <td className="px-4 py-2 text-center">
-                        {aiStatus ? (
-                          <span className={`px-2 py-1 rounded text-xs font-medium ${
-                            aiStatus.code === 'COMPLETO' ? 'bg-purple-100 text-purple-700' :
-                            aiStatus.code === 'PARCIAL' ? 'bg-purple-50 text-purple-600' :
-                            aiStatus.code === 'INICIADO' ? 'bg-purple-50 text-purple-500' :
-                            'bg-red-50 text-red-600'
-                          }`}>
-                            {aiStatus.emoji} {aiStatus.texto}
-                          </span>
-                        ) : <span className="text-slate-400">-</span>}
-                      </td>
-                    );
-                  })()}
                   <td
                     className="px-2 py-2 text-center cursor-pointer hover:bg-slate-100 text-lg"
                     onClick={() => toggleItemVisibility(item.guid, item.status.code)}
@@ -1160,19 +1125,11 @@ export const DataView: React.FC<{
                     {isItemVisible(item) ? '👁️' : '👁️‍🗨️'}
                   </td>
                   <td className="px-4 py-2 text-center text-slate-600">
-                    {analysisMode === 'instances'
-                      ? (item.pontos?.toLocaleString() || '-')
-                      : (item.cobertura_vertical !== undefined ? `${(item.cobertura_vertical * 100).toFixed(0)}%` :
-                          item.cobertura !== undefined ? `${item.cobertura}%` : '-')
-                    }
+                    {item.cobertura_vertical !== undefined ? `${(item.cobertura_vertical * 100).toFixed(0)}%` :
+                      item.cobertura !== undefined ? `${item.cobertura}%` : '-'}
                   </td>
                   <td className="px-4 py-2 text-center text-slate-600">
-                    {analysisMode === 'instances'
-                      ? (item.bbox_normalized
-                          ? `${(item.bbox_normalized.xmax - item.bbox_normalized.xmin).toFixed(2)} x ${(item.bbox_normalized.ymax - item.bbox_normalized.ymin).toFixed(2)} x ${(item.bbox_normalized.zmax - item.bbox_normalized.zmin).toFixed(2)}`
-                          : '-')
-                      : (item.dimensoes ? `${item.dimensoes.executado?.z?.toFixed(1) || 0}m / ${item.dimensoes.planejado?.z?.toFixed(1) || 0}m` : '-')
-                    }
+                    {item.dimensoes ? `${item.dimensoes.executado?.z?.toFixed(1) || 0}m / ${item.dimensoes.planejado?.z?.toFixed(1) || 0}m` : '-'}
                   </td>
                 </tr>
               ))}

@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import ReactMarkdown from 'react-markdown';
 import { AnalysisResult } from '../types';
 import { generateExecutiveReport } from '../services/deepseek';
 import { FileText, RefreshCw, Download } from 'lucide-react';
@@ -77,8 +78,20 @@ export const ReportView: React.FC<ReportViewProps> = ({ result, csvContent }) =>
         )}
 
         {report && !loading && (
-          <div className="flex-1 overflow-auto p-8 prose prose-slate max-w-none whitespace-pre-wrap">
-            {report}
+          <div className="flex-1 overflow-auto p-8 prose prose-slate max-w-none
+            prose-table:w-full prose-table:text-sm prose-table:border-collapse
+            prose-th:bg-slate-100 prose-th:px-4 prose-th:py-2 prose-th:text-left prose-th:border prose-th:border-slate-300 prose-th:font-semibold prose-th:text-slate-700
+            prose-td:px-4 prose-td:py-2 prose-td:border prose-td:border-slate-200 prose-td:text-slate-600
+            prose-tr:even:bg-slate-50
+            prose-h1:text-2xl prose-h1:font-bold prose-h1:text-slate-900 prose-h1:border-b prose-h1:border-slate-200 prose-h1:pb-2
+            prose-h2:text-xl prose-h2:font-bold prose-h2:text-slate-800 prose-h2:mt-8
+            prose-h3:text-lg prose-h3:font-semibold prose-h3:text-slate-700
+            prose-p:text-slate-600 prose-p:leading-relaxed
+            prose-li:text-slate-600
+            prose-strong:text-slate-900
+            prose-blockquote:border-l-blue-500 prose-blockquote:bg-blue-50 prose-blockquote:py-1
+            overflow-x-auto">
+            <ReactMarkdown>{report}</ReactMarkdown>
           </div>
         )}
       </div>

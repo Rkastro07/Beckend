@@ -38,7 +38,7 @@ export const listFloors = async (ifcFile: File): Promise<ListFloorsResult> => {
   }
 };
 
-export type AnalysisMode = 'bbox' | 'ai' | 'both' | 'instances';
+export type AnalysisMode = 'ml_v1' | 'sonata_v2';
 
 const _doAnalysis = async (
   ifcFile: File,
@@ -148,6 +148,7 @@ const _doAnalysis = async (
         items: items, // Legacy support
         resultados: items, // New support
         estatisticas: estatisticas,
+        global_cloud: json.global_cloud,  // nuvem completa pro viewer (debug visual)
         summary: {
             total_elements: total,
             executed_elements: executed,
@@ -163,14 +164,12 @@ const _doAnalysis = async (
   }
 };
 
-export const analyzeFloor = (
-  ifcFile: File, plyFile: File, floorId: string, ifcToken: string | null = null
-): Promise<AnalysisResult> => _doAnalysis(ifcFile, plyFile, floorId, '/api/analisar_pavimento', ifcToken);
-
-export const analyzeFloorAI = (
+/** ML v1 — Random Forest treinado no dataset sintético */
+export const analyzeFloorMLv1 = (
   ifcFile: File, plyFile: File, floorId: string, ifcToken: string | null = null
 ): Promise<AnalysisResult> => _doAnalysis(ifcFile, plyFile, floorId, '/api/analisar_ai', ifcToken);
 
-export const analyzeFloorInstances = (
+/** v2 — Sonata segmentação semântica + filtragem por OBB do IFC */
+export const analyzeFloorSonataV2 = (
   ifcFile: File, plyFile: File, floorId: string, ifcToken: string | null = null
-): Promise<AnalysisResult> => _doAnalysis(ifcFile, plyFile, floorId, '/api/analisar_instancias', ifcToken);
+): Promise<AnalysisResult> => _doAnalysis(ifcFile, plyFile, floorId, '/api/analisar_ai_v2', ifcToken);
