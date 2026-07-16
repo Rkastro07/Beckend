@@ -82,6 +82,100 @@ def _normalizar_eixos_preview(raw):
         result.append([*values, label])
     return result
 
+
+def _normalizar_aberturas_preview(raw, n_eixos):
+    """Valida as esquadrias vindas do editor. None = fluxo direto (sem editor).
+    Lista (mesmo vazia) = o cliente passou pelo editor e ela é a verdade."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ValueError('aberturas devem ser uma lista')
+    if len(raw) > 2000:
+        raise ValueError('excede 2000 aberturas')
+    result = []
+    for index, row in enumerate(raw):
+        if not isinstance(row, dict):
+            raise ValueError(f'abertura {index + 1} invalida')
+        try:
+            eixo_idx = int(row['eixo_idx'])
+            s_centro = float(row['s_centro'])
+            largura = float(row['largura'])
+        except (KeyError, ValueError, TypeError):
+            raise ValueError(f'abertura {index + 1}: campos invalidos')
+        if not (0 <= eixo_idx < n_eixos):
+            # eixo referenciado nao existe nesta receita: ignora silenciosamente
+            continue
+        if not (np.isfinite(s_centro) and np.isfinite(largura)) or largura < 0.1:
+            continue
+        tipo = 'window' if str(row.get('tipo')) == 'window' else 'door'
+        result.append({'eixo_idx': eixo_idx, 'tipo': tipo,
+                       's_centro': round(s_centro, 4), 'largura': round(largura, 4)})
+    return result
+
+
+def _auditar_paredes_ifc(ifc_path, eixos):
+    """Prova do contrato tela->IFC: compara cada eixo aprovado no preview com a
+    parede correspondente no IFC FINAL (pos-bake). Devolve string pro relatorio
+    de etapas do front. Le a malha direto do IfcPolygonalFaceSet (create_shape
+    e instavel com faceset nesta versao do ifcopenshell); se a parede nao foi
+    assada, cai pro Axis."""
+    import ifcopenshell
+    import ifcopenshell.util.placement as _P
+
+    m = ifcopenshell.open(str(ifc_path))
+    malhas = []
+    for w in m.by_type('IfcWall') + m.by_type('IfcWallStandardCase'):
+        if (w.Description or '') != 'preview-locked':
+            continue
+        M = _P.get_local_placement(w.ObjectPlacement)
+        vs = []
+        for r in (w.Representation.Representations if w.Representation else []):
+            for it in r.Items:
+                if it.is_a('IfcPolygonalFaceSet'):
+                    pts = np.asarray(it.Coordinates.CoordList, dtype=float)
+                    vs.append((M @ np.c_[pts, np.ones(len(pts))].T).T[:, :2])
+            if not vs and r.RepresentationIdentifier == 'Axis':
+                for it in r.Items:
+                    if it.is_a('IfcPolyline'):
+                        pts = np.asarray([p.Coordinates[:2] for p in it.Points], dtype=float)
+                        vs.append((M @ np.c_[pts, np.zeros(len(pts)), np.ones(len(pts))].T).T[:, :2])
+        if vs:
+            malhas.append(np.vstack(vs))
+
+    # eixo pode ter sido descartado de proposito (<5cm): audita so os validos
+    validos = [e for e in eixos
+               if np.hypot(e[2] - e[0], e[3] - e[1]) >= 0.05]
+    if len(malhas) != len(validos):
+        return (f'DIVERGIU: {len(validos)} paredes aprovadas na tela, '
+                f'{len(malhas)} no IFC')
+
+    # erro combinado (centro + comprimento + espessura) por par eixo<->malha
+    E = np.full((len(validos), len(malhas)), np.inf)
+    for i, e in enumerate(validos):
+        a, b, esp = np.array(e[0:2], float), np.array(e[2:4], float), float(e[4])
+        L = np.linalg.norm(b - a)
+        u = (b - a) / L
+        n = np.array([-u[1], u[0]])
+        cx = (a + b) / 2
+        for j, v in enumerate(malhas):
+            t = (v - cx) @ u
+            s = (v - cx) @ n
+            E[i, j] = (abs((t.max() + t.min()) / 2) + abs((s.max() + s.min()) / 2)
+                       + abs((t.max() - t.min()) - L) + abs((s.max() - s.min()) - esp))
+    # pareamento guloso global (sem scipy): pega sempre o menor erro restante
+    pior = 0.0
+    livres_i, livres_j = set(range(len(validos))), set(range(len(malhas)))
+    while livres_i:
+        i, j = min(((i, j) for i in livres_i for j in livres_j),
+                   key=lambda ij: E[ij[0], ij[1]])
+        pior = max(pior, float(E[i, j]))
+        livres_i.discard(i)
+        livres_j.discard(j)
+    if pior > 0.02:
+        return f'DIVERGIU: pior erro {pior:.3f} m (tolerancia 0.02)'
+    return f'ok — {len(validos)}/{len(validos)} paredes exatas (erro máx {pior:.3f} m)'
+
+
 # O preview usa o MESMO detector do gerador (identify_walls) — motor unico.
 # As funcoes de plot do cloud2bim sao neutralizadas (no servidor so custam tempo).
 import os as _os
@@ -339,12 +433,32 @@ def register_scan(app, upload_folder, output_folder):
         Image.fromarray(np.flipud(img), mode='L').save(buf, format='PNG')
         png_b64 = base64.b64encode(buf.getvalue()).decode()
 
+        # ---- contorno do TETO/footprint (pra "ver a leitura" no editor) ----
+        # maior contorno externo da densidade da banda, fechado e simplificado.
+        contorno_teto = []
+        try:
+            occ_bin = (grade >= 1).astype(np.uint8) * 255
+            occ_bin = cv2.morphologyEx(occ_bin, cv2.MORPH_CLOSE,
+                                       np.ones((7, 7), np.uint8))
+            cnts, _ = cv2.findContours(occ_bin, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+            if cnts:
+                maior = max(cnts, key=cv2.contourArea)
+                eps = max(0.15 / cell, 2.0)   # ~15cm de tolerancia no contorno
+                poly = cv2.approxPolyDP(maior, eps, True).reshape(-1, 2)
+                contorno_teto = [[round(s['xmin'] + float(px) * cell, 3),
+                                  round(s['ymin'] + float(py) * cell, 3)]
+                                 for px, py in poly]
+        except Exception:
+            contorno_teto = []
+
         return jsonify({
             'segmentos': segs, 'n_segmentos': len(segs),
             'eixos': eixos, 'n_paredes': len(eixos),
             'png': png_b64,
             'bounds': [s['xmin'], s['ymin'],
                        s['xmin'] + NX * cell, s['ymin'] + NY * cell],
+            'contorno_teto': contorno_teto,
         })
 
     # ------------------------------------------------------------------
@@ -408,6 +522,14 @@ def register_scan(app, upload_folder, output_folder):
         n_bandas = max(0, len(s['grupos_para'](thr)) - 1)
         if eixos_preview is not None and banda_idx >= n_bandas:
             return jsonify({'error': 'pavimento do preview nao existe nesta receita'}), 400
+        # aberturas do editor (opcional): None = fluxo direto (redetecta),
+        # lista (mesmo vazia) = editor mandou, vira a verdade das esquadrias
+        try:
+            aberturas_preview = _normalizar_aberturas_preview(
+                d.get('aberturas'), len(eixos_preview) if eixos_preview else 0)
+        except ValueError as ve:
+            return jsonify({'error': str(ve)}), 400
+        config_preview = d.get('config') if isinstance(d.get('config'), dict) else None
         src = Path(s['path'])
 
         def _job():
@@ -428,15 +550,20 @@ def register_scan(app, upload_folder, output_folder):
                 pipeline_env = {**os.environ, **env_extra}
                 if eixos_preview is not None:
                     override_path = outdir / 'wall_overrides.json'
+                    storey_override = {'eixos': eixos_preview}
+                    if aberturas_preview is not None:
+                        storey_override['aberturas'] = aberturas_preview
+                        if config_preview:
+                            storey_override['config'] = config_preview
                     override_path.write_text(json.dumps({
-                        'storeys': {
-                            str(banda_idx): {'eixos': eixos_preview}
-                        }
+                        'storeys': {str(banda_idx): storey_override}
                     }, ensure_ascii=False), encoding='utf-8')
                     pipeline_env['WALL_OVERRIDE_FILE'] = str(override_path)
                     detalhes['paredes_preview'] = 'ok'
+                    _ab_msg = ('' if aberturas_preview is None
+                               else f', {len(aberturas_preview)} esquadrias do editor')
                     print(f'[scan {jid}] pavimento {banda_idx + 1}: '
-                          f'{len(eixos_preview)} eixos travados pelo preview')
+                          f'{len(eixos_preview)} eixos travados pelo preview{_ab_msg}')
                 ok, log = passo('pipeline (lajes/paredes/aberturas)',
                                 [sys.executable, str(C2B_DIR / 'rodar.py'), str(src),
                                  '--thr', str(thr), '--min-wall-len', str(min_len),
@@ -504,6 +631,16 @@ def register_scan(app, upload_folder, output_folder):
                                  str(pronto), '--tipos', 'IfcWall,IfcSlab'],
                                 1800)
                 detalhes['bake'] = 'ok' if ok else f'falhou: {log[-150:]}'
+
+                # prova do contrato: o IFC final contem EXATAMENTE as paredes
+                # aprovadas na tela (auditoria nunca derruba o job)
+                if eixos_preview is not None:
+                    _JOBS[jid]['etapa'] = 'auditando paredes (tela = IFC?)'
+                    try:
+                        detalhes['paredes'] = _auditar_paredes_ifc(
+                            pronto, eixos_preview)
+                    except Exception as audit_err:
+                        detalhes['paredes'] = f'auditoria falhou: {audit_err}'
 
                 nome = f"{jid}_{src.stem}_scan2bim.ifc"
                 shutil.copy(pronto, output_folder / nome)

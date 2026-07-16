@@ -559,13 +559,13 @@ class IFCmodel:
         )
         return product_definition_shape
 
-    def create_wall(self, wall_placement, product_definition_shape):
+    def create_wall(self, wall_placement, product_definition_shape, description="Wall Description"):
         ifc_wall = self.ifc_file.create_entity(
             "IfcWall",
             GlobalId=self.generate_guid(),
             OwnerHistory=self.owner_history,
             Name="Wall Name",
-            Description="Wall Description",
+            Description=description,
             ObjectType="Wall",
             ObjectPlacement=wall_placement,
             Representation=product_definition_shape,

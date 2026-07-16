@@ -137,6 +137,12 @@ for i, storey_pointcloud in enumerate(point_cloud_storeys):
     top_z_placement = slabs[i + 1]['slab_bottom_z_coord']
 
     wall_override = wall_overrides.get(i)
+    # aberturas aprovadas no editor: {eixo_idx: [ {tipo, s_centro, largura}, ... ]}
+    override_openings_by_axis = {}
+    # True só quando o cliente passou pelo editor (lista presente, mesmo vazia):
+    # aí as esquadrias manuais são a verdade e a detecção automática é desligada.
+    override_openings_manual = (
+        wall_override is not None and wall_override.get('aberturas') is not None)
     if wall_override is not None:
         override_axes = wall_override.get('eixos', [])
         start_points = [(row[0], row[1]) for row in override_axes]
@@ -148,8 +154,27 @@ for i, storey_pointcloud in enumerate(point_cloud_storeys):
         translated_filtered_rotated_wall_groups = prepare_wall_points_from_axes(
             storey_pointcloud, wall_axes, wall_thicknesses,
             z_placement, top_z_placement)
-        print('Storey %d: using %d wall axes approved in preview' %
-              (i + 1, len(override_axes)))
+        # config de alturas (mesmos defaults do plantatobim)
+        _cfg = wall_override.get('config') or {}
+        _porta_h = float(_cfg.get('porta_altura', 2.1))
+        _jan_h = float(_cfg.get('janela_altura', 1.2))
+        _jan_peit = float(_cfg.get('janela_peitoril', 1.0))
+        for _ab in wall_override.get('aberturas', []) or []:
+            try:
+                _idx = int(_ab['eixo_idx'])
+                _s = float(_ab['s_centro'])
+                _w = float(_ab['largura'])
+                _tp = 'window' if str(_ab.get('tipo')) == 'window' else 'door'
+                if _tp == 'window':
+                    _zmin, _zmax = _jan_peit, _jan_peit + _jan_h
+                else:
+                    _zmin, _zmax = 0.0, _porta_h
+                override_openings_by_axis.setdefault(_idx, []).append(
+                    ((_s - _w / 2, _s + _w / 2), (_zmin, _zmax), _tp))
+            except (KeyError, ValueError, TypeError):
+                continue
+        print('Storey %d: using %d wall axes approved in preview (%d aberturas manuais)' %
+              (i + 1, len(override_axes), sum(len(v) for v in override_openings_by_axis.values())))
     else:
         (start_points, end_points, wall_thicknesses, wall_materials,
          translated_filtered_rotated_wall_groups, wall_labels) = (
@@ -175,15 +200,27 @@ for i, storey_pointcloud in enumerate(point_cloud_storeys):
         wall_id += 1
         walls.append({'wall_id': wall_id, 'storey': i + 1, 'start_point': start_points[j], 'end_point': end_points[j],
                       'thickness': wall_thicknesses[j], 'material': wall_materials[j], 'z_placement': z_placement,
-                      'height': wall_height, 'label': wall_labels[j]})
+                      'height': wall_height, 'label': wall_labels[j],
+                      'preview': wall_override is not None})
 
-        (opening_widths, opening_heights,
-         opening_types) = identify_openings(j + 1, translated_filtered_rotated_wall_groups[j],
-                                            wall_labels[j], pc_resolution, grid_coefficient,
-                                            min_opening_width=0.4, min_opening_height=0.6,
-                                            max_opening_aspect_ratio=4, door_z_max=0.1,
-                                            door_min_height=1.6, opening_min_z_top=1.6,
-                                            plot_histograms_for_openings=False)
+        if j in override_openings_by_axis:
+            # o cliente definiu as esquadrias desta parede no editor: usa
+            # exatamente essas, sem redetectar (contrato tela->IFC)
+            opening_widths = [op[0] for op in override_openings_by_axis[j]]
+            opening_heights = [op[1] for op in override_openings_by_axis[j]]
+            opening_types = [op[2] for op in override_openings_by_axis[j]]
+        elif override_openings_manual:
+            # editor: parede aprovada mas sem esquadria marcada = sem abertura
+            # (o cliente é a fonte da verdade das portas/janelas)
+            opening_widths, opening_heights, opening_types = [], [], []
+        else:
+            (opening_widths, opening_heights,
+             opening_types) = identify_openings(j + 1, translated_filtered_rotated_wall_groups[j],
+                                                wall_labels[j], pc_resolution, grid_coefficient,
+                                                min_opening_width=0.4, min_opening_height=0.6,
+                                                max_opening_aspect_ratio=4, door_z_max=0.1,
+                                                door_min_height=1.6, opening_min_z_top=1.6,
+                                                plot_histograms_for_openings=False)
 
         # Temporary list to store openings for the current wall
         wall_openings = []
@@ -382,7 +419,10 @@ for wall in walls:
     product_definition_shape = ifc_model.product_definition_shape(wall_axis_representation,
                                                                   wall_swept_solid_representation)
     current_story = wall['storey']
-    wall = ifc_model.create_wall(wall_placement, product_definition_shape)
+    # paredes aprovadas no preview sao marcadas: passos posteriores (aparo de
+    # telhado, remocao de fantasma) e a auditoria do job as reconhecem
+    wall_description = 'preview-locked' if wall.get('preview') else 'Wall Description'
+    wall = ifc_model.create_wall(wall_placement, product_definition_shape, wall_description)
     assign_material = ifc_model.assign_material(wall, material_layer_set_usage)
     wall_type = ifc_model.create_wall_type(wall, wall_thickness)
     assign_material_2 = ifc_model.assign_material(wall_type[0], material_layer_set)

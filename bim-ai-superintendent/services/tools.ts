@@ -121,6 +121,13 @@ export interface ScanParedesResult {
   n_paredes: number;
   png: string;                 // base64 (backdrop de densidade)
   bounds: [number, number, number, number];  // xmin,ymin,xmax,ymax
+  contorno_teto: [number, number][];          // footprint detectada (pra editor)
+}
+
+// abertura aprovada no editor de finalização, ancorada a um eixo do preview
+export interface ScanAbertura {
+  eixo_idx: number; tipo: 'door' | 'window';
+  s_centro: number; largura: number;
 }
 export interface ScanJobStatus {
   status: 'rodando' | 'pronto' | 'erro';
@@ -166,11 +173,15 @@ export const scanGerarIfc = (sid: string, thr: number, zloFrac: number,
                              zhiFrac: number, singleMinlen: number,
                              minLen: number, contoursAll: boolean,
                              bandaIdx: number,
-                             eixos: ScanParedesResult['eixos'] | null): Promise<{ job: string }> =>
+                             eixos: ScanParedesResult['eixos'] | null,
+                             aberturas?: ScanAbertura[],
+                             config?: PlantaConfig): Promise<{ job: string }> =>
   postJson('/api/scan/gerar-ifc', { sid, thr, zlo_frac: zloFrac, zhi_frac: zhiFrac,
                                     single_minlen: singleMinlen,
                                     min_len: minLen, contours_all: contoursAll,
-                                    banda_idx: bandaIdx, eixos });
+                                    banda_idx: bandaIdx, eixos,
+                                    aberturas: aberturas ?? null,
+                                    config: config ?? null });
 
 export const scanJob = async (jid: string): Promise<ScanJobStatus> => {
   const r = await fetch(`${API_BASE_URL}/api/scan/job/${jid}`);

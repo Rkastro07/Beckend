@@ -1,12 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   FileUp, Loader2, Download, RotateCcw, ScanLine, Layers,
-  CheckCircle2, AlertCircle, Sparkles, ChevronRight, TrendingUp,
+  CheckCircle2, AlertCircle, Sparkles, ChevronRight, TrendingUp, PencilRuler,
 } from 'lucide-react';
 import {
   scanUpload, scanLajes, scanParedes, scanEscadas, scanGerarIfc, scanJob, downloadUrl,
-  ScanUploadResult, ScanParedesResult, ScanLance,
+  ScanUploadResult, ScanParedesResult, ScanLance, ScanAbertura,
+  ModeloPlanta, PlantaConfig,
 } from '../services/tools';
+import { PlantaEditor, ResultadoGeracao } from './PlantaEditor';
 
 type Fase = 1 | 2 | 3;
 
@@ -47,6 +49,9 @@ export const ScanToBim: React.FC = () => {
   const [jobEtapa, setJobEtapa] = useState('');
   const [ifcUrl, setIfcUrl] = useState<string | null>(null);
   const [detalhes, setDetalhes] = useState<Record<string, string> | null>(null);
+
+  // finalizacao opcional no editor (portas/janelas/teto)
+  const [modeloEditor, setModeloEditor] = useState<ModeloPlanta | null>(null);
 
   // ---------- upload ----------
   const onFile = async (f: File) => {
@@ -139,6 +144,70 @@ export const ScanToBim: React.FC = () => {
     } catch (e: any) { setErro(e.message); }
   };
 
+  // ---- finalização opcional: paredes aprovadas -> ModeloPlanta do editor ----
+  const abrirEditor = () => {
+    if (!preview) return;
+    const [xmin, ymin, xmax, ymax] = preview.bounds;
+    const paredes = preview.eixos.map((e, i) => ({
+      id: `w${i}`, ax: e[0], ay: e[1], bx: e[2], by: e[3],
+      espessura: e[4], layer: e[5],
+    }));
+    const contorno: [number, number][] =
+      preview.contorno_teto && preview.contorno_teto.length >= 3
+        ? preview.contorno_teto
+        : [[xmin, ymin], [xmax, ymin], [xmax, ymax], [xmin, ymax]];
+    setModeloEditor({
+      escala: 1, single_line: false, nome: 'scan',
+      bbox: { xmin, ymin, xmax, ymax },
+      diagnostico: { sobras: 0, cantos_costurados: 0, blocos_esquadria: 0 },
+      paredes, aberturas: [],
+      laje: { contorno, piso: { ativo: true, espessura: 0.15 },
+              teto: { ativo: false, espessura: 0.15 } },
+    });
+  };
+
+  // gerador do editor: as PAREDES e as portas/janelas EDITADAS na tela viram
+  // overrides na cadeia cloud2bim (o IFC = exatamente o que o cliente desenhou)
+  const gerarDoEditor = async (
+    modelo: { paredes: any[]; aberturas: any[] }, cfg: PlantaConfig,
+  ): Promise<ResultadoGeracao> => {
+    if (!up || !preview) throw new Error('sessão do scan expirada');
+    if (!modelo.paredes.length) throw new Error('nenhuma parede no editor');
+    // eixos = as paredes como estão AGORA no editor (movidas/adicionadas/removidas),
+    // não o preview original. Índice na lista é o que ancora as aberturas.
+    const eixos = modelo.paredes.map((p) =>
+      [p.ax, p.ay, p.bx, p.by, p.espessura, p.layer] as
+        [number, number, number, number, number, string]);
+    const idxDaParede = new Map<string, number>(
+      modelo.paredes.map((p, i) => [p.id, i]));
+    const aberturas: ScanAbertura[] = modelo.aberturas
+      .map((a) => {
+        const eixo_idx = idxDaParede.get(String(a.parede_id));
+        return eixo_idx === undefined ? null
+          : { eixo_idx, tipo: a.tipo, s_centro: a.s_centro, largura: a.largura };
+      })
+      .filter((a): a is ScanAbertura => a !== null);
+    const { job: jid } = await scanGerarIfc(
+      up.sid, thr, zloFrac, zhiFrac, 1.0, minLen, contoursAll,
+      bandaIdx, eixos, aberturas, cfg);
+    setJob(null);  // este fluxo tem poll próprio (resolve a Promise do editor)
+    return await new Promise((resolve, reject) => {
+      const h = window.setInterval(async () => {
+        try {
+          const st = await scanJob(jid);
+          setJobEtapa(st.etapa || '');
+          if (st.detalhes) setDetalhes(st.detalhes);
+          if (st.status === 'pronto') {
+            window.clearInterval(h); resolve({ ifc_url: st.url || '' });
+          }
+          if (st.status === 'erro') {
+            window.clearInterval(h); reject(new Error(st.erro || 'Falha na geração'));
+          }
+        } catch { /* tenta de novo */ }
+      }, 2500);
+    });
+  };
+
   // =====================================================================
   if (!up) {
     return (
@@ -162,6 +231,23 @@ export const ScanToBim: React.FC = () => {
   }
 
   const banda = bandas[bandaIdx];
+
+  // finalização opcional: reusa o editor da planta com as paredes aprovadas
+  if (modeloEditor) {
+    return (
+      <PlantaEditor
+        modeloInicial={modeloEditor}
+        onGerar={gerarDoEditor}
+        ocultarPreviewPly
+        titulo="Finalizar planta do scan"
+        subtitulo="Edite paredes, portas e janelas EM CIMA do mapa da nuvem captada; o tracejado é a leitura do teto. Depois gere o IFC."
+        onVoltar={() => setModeloEditor(null)}
+        rotuloVoltar="Voltar às paredes"
+        backdropPng={preview?.png}
+        backdropBounds={preview?.bounds}
+      />
+    );
+  }
 
   return (
     <div className="flex flex-col h-full">
@@ -299,18 +385,27 @@ export const ScanToBim: React.FC = () => {
             {job ? `Gerando (${jobEtapa})...` : 'Gerar IFC com esses thresholds'}
           </button>
 
+          <button onClick={abrirEditor} disabled={!!job || carregando || !preview?.eixos.length}
+            className="w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg
+                       text-sm font-medium border border-blue-300 text-blue-700 bg-white
+                       hover:bg-blue-50 disabled:opacity-40 transition-colors">
+            <PencilRuler className="w-4 h-4" />
+            Finalizar no editor (portas / janelas)
+          </button>
+
           {detalhes && (
             <div className="bg-white rounded-lg border border-slate-200 px-3 py-2.5 text-xs flex flex-col gap-1">
               <span className="font-semibold text-slate-700 mb-0.5">Etapas da montagem</span>
               {Object.entries(detalhes).map(([etapa, res]) => {
-                const ok = res === 'ok';
+                const ok = res === 'ok' || res.startsWith('ok — ');
+                const msg = res === 'ok' ? '' : res.replace(/^ok — /, '');
                 return (
                   <div key={etapa} className="flex items-start gap-1.5">
                     {ok ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 shrink-0 mt-0.5" />
                         : <AlertCircle className="w-3.5 h-3.5 text-amber-500 shrink-0 mt-0.5" />}
                     <span className={ok ? 'text-slate-600' : 'text-amber-700'}>
                       <span className="font-medium capitalize">{etapa}</span>
-                      {!ok && <span className="text-slate-500"> — {res}</span>}
+                      {msg && <span className={ok ? 'text-emerald-700' : 'text-slate-500'}> — {msg}</span>}
                     </span>
                   </div>
                 );

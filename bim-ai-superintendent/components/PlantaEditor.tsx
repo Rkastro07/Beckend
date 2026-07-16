@@ -2,6 +2,7 @@ import React, { useRef, useState, useEffect, useMemo } from 'react';
 import {
   FileUp, Loader2, Download, Trash2, Plus, DoorOpen, RectangleHorizontal,
   Sparkles, AlertCircle, CheckCircle2, RotateCcw, Move, Square, Layers, Maximize,
+  ScanLine,
 } from 'lucide-react';
 import {
   parsePlanta, gerarPlantaIfc, downloadUrl,
@@ -22,10 +23,39 @@ const COR_PORTA = '#2ecc71';
 const COR_JANELA = '#5db4e2';
 const COR_SEL = '#2563eb';
 
-export const PlantaEditor: React.FC = () => {
-  const [modelo, setModelo] = useState<ModeloPlanta | null>(null);
+export type ResultadoGeracao = { ifc_url: string; preview_url?: string };
+
+export interface PlantaEditorProps {
+  /** Modelo inicial (ex.: vindo do Scan → BIM). Se ausente, o editor pede um DXF. */
+  modeloInicial?: ModeloPlanta | null;
+  /** Gerador de IFC customizado; se ausente usa o gerarPlantaIfc (plantatobim/DXF). */
+  onGerar?: (
+    modelo: { paredes: Parede[]; aberturas: Abertura[]; laje: Laje },
+    cfg: PlantaConfig,
+    nome: string,
+  ) => Promise<ResultadoGeracao>;
+  titulo?: string;
+  subtitulo?: string;
+  /** O caminho do scan não produz PLY de preview do plantatobim. */
+  ocultarPreviewPly?: boolean;
+  /** Voltar pra etapa anterior (ex.: fase de paredes do scan) em vez de trocar planta. */
+  onVoltar?: () => void;
+  rotuloVoltar?: string;
+  /** Mapa de densidade da nuvem (PNG base64) desenhado por baixo — o cliente
+   *  edita EM CIMA do que o scanner captou. */
+  backdropPng?: string;
+  /** [xmin, ymin, xmax, ymax] do backdrop, em coords de mundo. */
+  backdropBounds?: [number, number, number, number];
+}
+
+export const PlantaEditor: React.FC<PlantaEditorProps> = ({
+  modeloInicial, onGerar, titulo, subtitulo, ocultarPreviewPly,
+  onVoltar, rotuloVoltar, backdropPng, backdropBounds,
+} = {}) => {
+  const [modelo, setModelo] = useState<ModeloPlanta | null>(modeloInicial ?? null);
   const [sel, setSel] = useState<Sel>(null);
   const [modoLaje, setModoLaje] = useState(false);
+  const [mostrarBackdrop, setMostrarBackdrop] = useState(true);
   const [selVertice, setSelVertice] = useState<number | null>(null);
   const [view, setView] = useState<View | null>(null);
   const [busy, setBusy] = useState(false);
@@ -51,6 +81,15 @@ export const PlantaEditor: React.FC = () => {
     const pad = Math.max(xmax - xmin, ymax - ymin) * 0.08 + 0.5;
     setView({ x: xmin - pad, y: -(ymax + pad), w: xmax - xmin + 2 * pad, h: ymax - ymin + 2 * pad });
   };
+
+  // Modelo injetado de fora (Scan → BIM): adota e enquadra quando muda.
+  useEffect(() => {
+    if (modeloInicial) {
+      setModelo(modeloInicial);
+      setSel(null); setSelVertice(null); setResultado(null);
+      fitView(modeloInicial);
+    }
+  }, [modeloInicial]);
 
   const onFile = async (file: File) => {
     setBusy(true); setErro(null); setResultado(null); setSel(null); setSelVertice(null);
@@ -190,10 +229,12 @@ export const PlantaEditor: React.FC = () => {
     if (!modelo) return;
     setBusy(true); setErro(null); setResultado(null);
     try {
-      const r = await gerarPlantaIfc(
-        { paredes: modelo.paredes, aberturas: modelo.aberturas, laje: modelo.laje },
-        cfg, modelo.nome || 'planta');
-      setResultado(r);
+      const payload = { paredes: modelo.paredes, aberturas: modelo.aberturas, laje: modelo.laje };
+      const nome = modelo.nome || 'planta';
+      const r = onGerar
+        ? await onGerar(payload, cfg, nome)
+        : await gerarPlantaIfc(payload, cfg, nome);
+      setResultado({ ifc_url: r.ifc_url, preview_url: r.preview_url ?? '' });
     } catch (e: any) { setErro(e.message || 'Falha ao gerar IFC'); }
     finally { setBusy(false); }
   };
@@ -208,7 +249,7 @@ export const PlantaEditor: React.FC = () => {
   if (!modelo) {
     return (
       <div className="p-8">
-        <Cabecalho />
+        <Cabecalho titulo={titulo} subtitulo={subtitulo} />
         <label className="mt-6 flex flex-col items-center justify-center gap-3 h-64 max-w-2xl
                           border-2 border-dashed border-slate-300 rounded-2xl cursor-pointer
                           hover:bg-slate-50 hover:border-blue-300 transition-colors">
@@ -228,7 +269,7 @@ export const PlantaEditor: React.FC = () => {
 
   return (
     <div className="flex flex-col h-full">
-      <div className="px-8 pt-6"><Cabecalho /></div>
+      <div className="px-8 pt-6"><Cabecalho titulo={titulo} subtitulo={subtitulo} /></div>
 
       <div className="flex-1 flex gap-4 px-8 pb-6 pt-4 min-h-0">
         {/* ---------- CANVAS ---------- */}
@@ -254,6 +295,13 @@ export const PlantaEditor: React.FC = () => {
                 ${modoLaje ? 'bg-blue-600 text-white border-blue-600' : 'bg-white border-slate-200 hover:bg-slate-50'}`}>
               <Layers className="w-3.5 h-3.5" /> {modoLaje ? 'Editando laje' : 'Editar laje'}
             </button>
+            {backdropPng && (
+              <button onClick={() => setMostrarBackdrop((v) => !v)}
+                className={`flex items-center gap-1 text-xs px-2.5 py-1.5 border rounded-lg shadow-sm
+                  ${mostrarBackdrop ? 'bg-slate-700 text-white border-slate-700' : 'bg-white border-slate-200 hover:bg-slate-50'}`}>
+                <ScanLine className="w-3.5 h-3.5" /> Nuvem captada
+              </button>
+            )}
           </div>
 
           <button onClick={() => modelo && fitView(modelo)} title="Ajustar zoom à planta"
@@ -270,6 +318,15 @@ export const PlantaEditor: React.FC = () => {
                    dragRef.current = { kind: 'pan', px: e.clientX, py: e.clientY, vx: view.x, vy: view.y };
                }}
                onClick={(e) => { if (e.target === svgRef.current) { setSel(null); setSelVertice(null); } }}>
+            {/* mapa de densidade da nuvem captada — o cliente edita EM CIMA dela */}
+            {mostrarBackdrop && backdropPng && backdropBounds && (
+              <image href={`data:image/png;base64,${backdropPng}`}
+                     x={backdropBounds[0]} y={-backdropBounds[3]}
+                     width={backdropBounds[2] - backdropBounds[0]}
+                     height={backdropBounds[3] - backdropBounds[1]}
+                     opacity={0.45} preserveAspectRatio="none"
+                     style={{ imageRendering: 'pixelated', pointerEvents: 'none' }} />
+            )}
             {/* laje (contorno de piso/teto) — por baixo das paredes */}
             {modelo.laje.contorno.length >= 3 && (
               <polygon
@@ -395,17 +452,23 @@ export const PlantaEditor: React.FC = () => {
                  className="flex items-center gap-1 justify-center px-2 py-1.5 bg-emerald-600 text-white rounded-md hover:bg-emerald-700">
                 <Download className="w-3.5 h-3.5" /> Baixar IFC
               </a>
-              <a href={downloadUrl(resultado.preview_url)} download
-                 className="flex items-center gap-1 justify-center px-2 py-1.5 bg-slate-600 text-white rounded-md hover:bg-slate-700">
-                <Download className="w-3.5 h-3.5" /> Preview PLY (CloudCompare)
-              </a>
+              {!ocultarPreviewPly && resultado.preview_url && (
+                <a href={downloadUrl(resultado.preview_url)} download
+                   className="flex items-center gap-1 justify-center px-2 py-1.5 bg-slate-600 text-white rounded-md hover:bg-slate-700">
+                  <Download className="w-3.5 h-3.5" /> Preview PLY (CloudCompare)
+                </a>
+              )}
             </div>
           )}
           {erro && <ErroBox msg={erro} />}
 
-          <button onClick={() => { setModelo(null); setSel(null); setResultado(null); }}
+          <button
+            onClick={() => {
+              if (onVoltar) { onVoltar(); return; }
+              setModelo(null); setSel(null); setResultado(null);
+            }}
             className="flex items-center justify-center gap-1 text-xs text-slate-400 hover:text-slate-600">
-            <RotateCcw className="w-3 h-3" /> Trocar planta
+            <RotateCcw className="w-3 h-3" /> {rotuloVoltar ?? 'Trocar planta'}
           </button>
         </div>
       </div>
@@ -414,11 +477,11 @@ export const PlantaEditor: React.FC = () => {
 };
 
 // ---------- sub-componentes ----------
-const Cabecalho: React.FC = () => (
+const Cabecalho: React.FC<{ titulo?: string; subtitulo?: string }> = ({ titulo, subtitulo }) => (
   <div>
-    <h1 className="text-xl font-bold text-slate-800">Planta → BIM</h1>
+    <h1 className="text-xl font-bold text-slate-800">{titulo ?? 'Planta → BIM'}</h1>
     <p className="text-sm text-slate-500">
-      Suba um DXF, revise e edite o que o sistema entendeu, e gere o IFC.
+      {subtitulo ?? 'Suba um DXF, revise e edite o que o sistema entendeu, e gere o IFC.'}
     </p>
   </div>
 );
