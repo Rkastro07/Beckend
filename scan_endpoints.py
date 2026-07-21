@@ -39,6 +39,62 @@ _LOCK = threading.Lock()
 _DETECTOR_LOCK = threading.Lock()   # identify_walls usa env vars (processo-global)
 Z_STEP = 0.15          # mesmo passo do identify_slabs (autodiag comparavel)
 
+# --- descarte automatico (o scan e' "usa e joga fora") ---------------------
+# Nada do fluxo pode sobreviver ao uso: a nuvem enviada e a area de trabalho do
+# job somam ~2,3 GB por scan grande. So o IFC final (em output_folder) fica,
+# porque e' o entregavel. Sem isto o disco enche em dias de uso.
+SESSAO_TTL_S = 30 * 60          # sessao inativa por 30 min -> descartada
+JOB_TTL_S = 60 * 60             # status de job entregue expira em 1 h
+_GC_INTERVALO_S = 5 * 60        # varredura a cada 5 min
+
+
+def _descartar_sessao(sid, sessao):
+    """Some com a nuvem enviada e libera a grade voxel da RAM."""
+    try:
+        p = Path(sessao.get('path', ''))
+        if p.is_file():
+            tam = p.stat().st_size
+            p.unlink()
+            print(f'[gc] sessao {sid}: nuvem descartada ({tam / 1e6:.0f} MB)')
+    except OSError as e:
+        print(f'[gc] sessao {sid}: nao consegui apagar a nuvem ({e})')
+    sessao.clear()   # solta occ/amostra pro coletor do Python
+
+
+def _gc_passada(agora=None):
+    """Descarta sessoes inativas e status de job velhos. Devolve o que limpou."""
+    import time
+    agora = agora if agora is not None else time.monotonic()
+    with _LOCK:
+        expiradas = [sid for sid, s in _SESSOES.items()
+                     if agora - s.get('ultimo_acesso', agora) > SESSAO_TTL_S]
+        for sid in expiradas:
+            _descartar_sessao(sid, _SESSOES.pop(sid))
+        jobs_velhos = [jid for jid, j in _JOBS.items()
+                       if j.get('status') in ('pronto', 'erro')
+                       and agora - j.get('fim', agora) > JOB_TTL_S]
+        for jid in jobs_velhos:
+            _JOBS.pop(jid, None)
+    return len(expiradas), len(jobs_velhos)
+
+
+def _gc_loop():
+    import time
+    while True:
+        time.sleep(_GC_INTERVALO_S)
+        try:
+            _gc_passada()
+        except Exception:
+            traceback.print_exc()   # o coletor nunca pode derrubar o server
+
+
+def _tocar(sessao):
+    """Marca uso — adia o descarte enquanto o cliente esta' calibrando."""
+    import time
+    if sessao is not None:
+        sessao['ultimo_acesso'] = time.monotonic()
+    return sessao
+
 
 def _json_errors(contexto):
     """Impede que excecoes de rotas scan virem a pagina HTML 500 do Flask."""
@@ -285,12 +341,14 @@ def register_scan(app, upload_folder, output_folder):
                                                               replace=False)]
             else:
                 amostra = pts
+            import time as _time
             with _LOCK:
                 _SESSOES[sid] = {
                     'path': str(path), 'occ': occ, 'cell': cell, 'zbin': zbin,
                     'xmin': xmin, 'ymin': ymin, 'zmin': zmin,
                     'npts': int(len(pts)), 'z_counts': zhist,
                     'grupos_para': grupos_para, 'amostra': amostra,
+                    'ultimo_acesso': _time.monotonic(),
                 }
             grupos = grupos_para(thr_sugerido)
             zh_min, zh_max, zh_cnt = zhist
@@ -313,7 +371,7 @@ def register_scan(app, upload_folder, output_folder):
     @app.route('/api/scan/lajes', methods=['POST'])
     def _scan_lajes():
         d = request.get_json(force=True)
-        s = _SESSOES.get(d.get('sid'))
+        s = _tocar(_SESSOES.get(d.get('sid')))
         if not s:
             return jsonify({'error': 'sessao expirada — refaça o upload'}), 404
         grupos = s['grupos_para'](float(d.get('thr', 0.3)))
@@ -329,7 +387,7 @@ def register_scan(app, upload_folder, output_folder):
     def _scan_paredes():
         import os
         d = request.get_json(force=True)
-        s = _SESSOES.get(d.get('sid'))
+        s = _tocar(_SESSOES.get(d.get('sid')))
         if not s:
             return jsonify({'error': 'sessao expirada — refaça o upload'}), 404
         zlo, zhi = float(d['zlo']), float(d['zhi'])
@@ -467,7 +525,7 @@ def register_scan(app, upload_folder, output_folder):
     @app.route('/api/scan/escadas', methods=['POST'])
     def _scan_escadas():
         d = request.get_json(force=True)
-        s = _SESSOES.get(d.get('sid'))
+        s = _tocar(_SESSOES.get(d.get('sid')))
         if not s:
             return jsonify({'error': 'sessao expirada — refaça o upload'}), 404
         zlo, zhi = float(d['zlo']), float(d['zhi'])
@@ -503,7 +561,7 @@ def register_scan(app, upload_folder, output_folder):
     @app.route('/api/scan/gerar-ifc', methods=['POST'])
     def _scan_gerar():
         d = request.get_json(force=True)
-        s = _SESSOES.get(d.get('sid'))
+        s = _tocar(_SESSOES.get(d.get('sid')))
         if not s:
             return jsonify({'error': 'sessao expirada — refaça o upload'}), 404
         jid = uuid.uuid4().hex[:12]
@@ -536,6 +594,8 @@ def register_scan(app, upload_folder, output_folder):
             import os
             detalhes = {}
             _JOBS[jid]['detalhes'] = detalhes
+            # fora do try: o finally descarta esta pasta mesmo se o job explodir
+            outdir = upload_folder / f"scanjob_{jid}"
 
             def passo(nome, cmd, timeout, env=None):
                 _JOBS[jid]['etapa'] = nome
@@ -545,7 +605,6 @@ def register_scan(app, upload_folder, output_folder):
                 return r.returncode == 0, cauda
 
             try:
-                outdir = upload_folder / f"scanjob_{jid}"
                 outdir.mkdir(parents=True, exist_ok=True)
                 pipeline_env = {**os.environ, **env_extra}
                 if eixos_preview is not None:
@@ -647,6 +706,17 @@ def register_scan(app, upload_folder, output_folder):
                 _JOBS[jid].update(status='pronto', url=f'/outputs/{nome}')
             except Exception as e:
                 _JOBS[jid].update(status='erro', erro=str(e)[-400:])
+            finally:
+                import time as _t
+                _JOBS[jid]['fim'] = _t.monotonic()
+                # o IFC ja' esta' salvo em output_folder; a area de trabalho
+                # (nuvem.xyz ~1,1 GB + intermediarios) nao serve mais pra nada
+                try:
+                    if outdir.exists():
+                        shutil.rmtree(outdir, ignore_errors=True)
+                        print(f'[gc] job {jid}: area de trabalho descartada')
+                except Exception:
+                    traceback.print_exc()
 
         threading.Thread(target=_job, daemon=True).start()
         return jsonify({'job': jid})
@@ -658,4 +728,7 @@ def register_scan(app, upload_folder, output_folder):
             return jsonify({'error': 'job desconhecido'}), 404
         return jsonify(j)
 
+    threading.Thread(target=_gc_loop, daemon=True).start()
     print("🔍 Scan→BIM registrado: /api/scan/{upload,lajes,paredes,gerar-ifc,job}")
+    print(f"🧹 Descarte automático: nuvem enviada some após {SESSAO_TTL_S // 60} min "
+          f"sem uso; área de trabalho do job some ao terminar (IFC fica).")
