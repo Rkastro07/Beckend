@@ -1,0 +1,34 @@
+e57_input: false
+xyz_files:
+  - input_xyz/allplan_completo.xyz
+exterior_scan: false
+dilute: false
+dilution_factor: 10
+pc_resolution: 0.03
+grid_coefficient: 3
+
+bfs_thickness: 0.3
+tfs_thickness: 0.3
+
+min_wall_length: 0.30
+min_wall_thickness: 0.05
+max_wall_thickness: 0.75
+exterior_walls_thickness: 0.3
+
+output_ifc: output_IFC/allplan_completo_cloud2bim.ifc
+ifc_project_name: Allplan Institute completo
+ifc_project_long_name: Teste Cloud2BIM nuvem 100% completa (sem oclusao)
+ifc_project_version: v1.0
+
+ifc_author_name: Rafael
+ifc_author_surname: Corrigliano
+ifc_author_organization: Beckend
+
+ifc_building_name: Institute Var 2
+ifc_building_type: Institutional
+ifc_building_phase: Teste
+
+ifc_site_latitude: [0, 0, 0]
+ifc_site_longitude: [0, 0, 0]
+ifc_site_elevation: 0.0
+material_for_objects: Concrete

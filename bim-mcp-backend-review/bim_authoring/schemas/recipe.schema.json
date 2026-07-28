@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "bim://authoring/schemas/recipe-1.0",
+  "title": "BIM Authoring Recipe",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "version",
+    "title",
+    "summary",
+    "status",
+    "ifc_versions",
+    "tags",
+    "inputs",
+    "entities",
+    "relationships",
+    "geometry",
+    "steps",
+    "checks",
+    "failure_modes",
+    "references"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.-]+$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 3
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 10
+    },
+    "status": {
+      "enum": ["implemented", "documented", "experimental"]
+    },
+    "ifc_versions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "enum": ["IFC2X3", "IFC4", "IFC4X3"]
+      }
+    },
+    "tags": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9-]+$"
+      }
+    },
+    "executor": {
+      "type": ["string", "null"]
+    },
+    "inputs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/input"
+      }
+    },
+    "entities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/entity"
+      }
+    },
+    "relationships": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/relationship"
+      }
+    },
+    "geometry": {
+      "type": "object"
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/step"
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/check"
+      }
+    },
+    "failure_modes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/failure"
+      }
+    },
+    "references": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/reference"
+      }
+    }
+  },
+  "$defs": {
+    "input": {
+      "type": "object",
+      "required": ["name", "type", "required", "description"],
+      "properties": {
+        "name": {"type": "string"},
+        "type": {"type": "string"},
+        "unit": {"type": ["string", "null"]},
+        "required": {"type": "boolean"},
+        "default": {},
+        "minimum": {"type": "number"},
+        "maximum": {"type": "number"},
+        "description": {"type": "string"}
+      }
+    },
+    "entity": {
+      "type": "object",
+      "required": ["key", "ifc_class", "role"],
+      "properties": {
+        "key": {"type": "string"},
+        "ifc_class": {"type": "string", "pattern": "^Ifc[A-Za-z0-9]+$"},
+        "role": {"type": "string"},
+        "predefined_type": {"type": ["string", "null"]}
+      }
+    },
+    "relationship": {
+      "type": "object",
+      "required": ["ifc_class", "from", "to", "meaning"],
+      "properties": {
+        "ifc_class": {"type": "string", "pattern": "^IfcRel[A-Za-z0-9]+$"},
+        "from": {"type": "string"},
+        "to": {"type": "string"},
+        "meaning": {"type": "string"}
+      }
+    },
+    "step": {
+      "type": "object",
+      "required": ["order", "operation", "purpose"],
+      "properties": {
+        "order": {"type": "integer", "minimum": 1},
+        "operation": {"type": "string"},
+        "purpose": {"type": "string"},
+        "notes": {"type": "string"}
+      }
+    },
+    "check": {
+      "type": "object",
+      "required": ["code", "severity", "rule"],
+      "properties": {
+        "code": {"type": "string"},
+        "severity": {"enum": ["error", "warning", "info"]},
+        "rule": {"type": "string"}
+      }
+    },
+    "failure": {
+      "type": "object",
+      "required": ["symptom", "cause", "prevention"],
+      "properties": {
+        "symptom": {"type": "string"},
+        "cause": {"type": "string"},
+        "prevention": {"type": "string"}
+      }
+    },
+    "reference": {
+      "type": "object",
+      "required": ["title", "url"],
+      "properties": {
+        "title": {"type": "string"},
+        "url": {"type": "string", "format": "uri"}
+      }
+    }
+  }
+}
+

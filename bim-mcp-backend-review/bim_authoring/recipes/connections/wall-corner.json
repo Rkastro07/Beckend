@@ -1,0 +1,55 @@
+{
+  "schema_version": "1.0",
+  "id": "connection.wall-corner",
+  "version": "1.0.0",
+  "title": "Encontro de paredes em L, T ou cruz",
+  "summary": "Documenta a conexao topologica entre eixos de paredes e a regeneracao das geometrias para um canto sem frestas ou sobreposicoes indevidas.",
+  "status": "documented",
+  "ifc_versions": ["IFC4", "IFC4X3"],
+  "tags": ["wall", "connection", "corner", "topology", "geometry"],
+  "executor": null,
+  "inputs": [
+    {"name": "wall_a", "type": "IfcWall", "required": true, "description": "Primeira parede conectada."},
+    {"name": "wall_b", "type": "IfcWall", "required": true, "description": "Segunda parede conectada."},
+    {"name": "connection_type", "type": "enum", "required": true, "description": "ATSTART, ATEND ou ATPATH em cada parede."},
+    {"name": "tolerance", "type": "number", "unit": "m", "required": false, "default": 0.02, "minimum": 0.0, "description": "Tolerancia de intersecao dos eixos."}
+  ],
+  "entities": [
+    {"key": "wall_a", "ifc_class": "IfcWall", "role": "connected-element"},
+    {"key": "wall_b", "ifc_class": "IfcWall", "role": "connected-element"}
+  ],
+  "relationships": [
+    {"ifc_class": "IfcRelConnectsPathElements", "from": "wall_a", "to": "wall_b", "meaning": "Registra quais extremidades ou trechos dos caminhos se conectam."}
+  ],
+  "geometry": {
+    "axis_context": "Plan/Axis/GRAPH_VIEW",
+    "body_context": "Model/Body/MODEL_VIEW",
+    "intersection": "Intersecao dos eixos 2D dentro da tolerancia.",
+    "regeneration": "geometry.connect_path seguido de geometry.regenerate_wall_representation.",
+    "units": "SI"
+  },
+  "steps": [
+    {"order": 1, "operation": "read_axis_representations", "purpose": "Obter eixos e extremos das paredes."},
+    {"order": 2, "operation": "intersect_wall_paths", "purpose": "Calcular o ponto e o tipo L/T/cruz."},
+    {"order": 3, "operation": "geometry.connect_path", "purpose": "Criar IfcRelConnectsPathElements com prioridades."},
+    {"order": 4, "operation": "geometry.regenerate_wall_representation:wall_a", "purpose": "Atualizar corpo e eixo da primeira parede."},
+    {"order": 5, "operation": "geometry.regenerate_wall_representation:wall_b", "purpose": "Atualizar corpo e eixo da segunda parede."},
+    {"order": 6, "operation": "validate_corner_mesh", "purpose": "Verificar fresta, sobreposicao e continuidade."}
+  ],
+  "checks": [
+    {"code": "WALL_AXIS_CONTEXT", "severity": "error", "rule": "As duas paredes possuem representacao Plan/Axis/GRAPH_VIEW."},
+    {"code": "WALL_PATH_CONNECTION", "severity": "error", "rule": "Relacao identifica extremidades corretas."},
+    {"code": "CORNER_GAP", "severity": "warning", "rule": "Fresta residual abaixo da tolerancia."},
+    {"code": "CORNER_OVERLAP", "severity": "warning", "rule": "Sobreposicao nao cria volume duplicado relevante."}
+  ],
+  "failure_modes": [
+    {"symptom": "Canto parece correto mas nao tem relacao IFC.", "cause": "Solidos foram alongados manualmente sem connect_path.", "prevention": "Criar a relacao topologica antes de regenerar."},
+    {"symptom": "Paredes encurtam para o lado errado.", "cause": "ATSTART/ATEND invertidos pelo sentido do eixo.", "prevention": "Derivar extremidade pelo frame local de cada parede."},
+    {"symptom": "Regeneracao remove recortes existentes.", "cause": "Booleans nao registrados com o elemento.", "prevention": "Usar APIs de feature/boolean que preservam autoria na regeneracao."}
+  ],
+  "references": [
+    {"title": "IfcOpenShell geometry API", "url": "https://docs.ifcopenshell.org/autoapi/ifcopenshell/api/geometry/index.html"},
+    {"title": "IfcOpenShell geometry creation", "url": "https://docs.ifcopenshell.org/ifcopenshell-python/geometry_creation.html"}
+  ]
+}
+

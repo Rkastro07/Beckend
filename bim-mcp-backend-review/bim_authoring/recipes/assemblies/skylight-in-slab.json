@@ -1,0 +1,58 @@
+{
+  "schema_version": "1.0",
+  "id": "assembly.skylight-in-slab",
+  "version": "1.0.0",
+  "title": "Claraboia hospedada em laje ou cobertura",
+  "summary": "Aplica o mesmo padrao void/filling a uma abertura horizontal, com IfcWindow ou elemento apropriado preenchendo uma IfcOpeningElement.",
+  "status": "documented",
+  "ifc_versions": ["IFC4", "IFC4X3"],
+  "tags": ["window", "slab", "roof", "opening", "filling", "skylight"],
+  "executor": null,
+  "inputs": [
+    {"name": "host", "type": "IfcSlab_or_IfcRoof", "required": true, "description": "Laje ou cobertura hospedeira."},
+    {"name": "footprint", "type": "point2_list", "unit": "m", "required": true, "description": "Contorno fechado da abertura no plano local."},
+    {"name": "height", "type": "number", "unit": "m", "required": true, "minimum": 0.02, "description": "Altura do preenchimento acima do plano."},
+    {"name": "boolean_margin", "type": "number", "unit": "m", "required": false, "default": 0.05, "description": "Margem de corte alem das faces do hospedeiro."}
+  ],
+  "entities": [
+    {"key": "host", "ifc_class": "IfcSlab", "role": "host", "predefined_type": "ROOF"},
+    {"key": "opening", "ifc_class": "IfcOpeningElement", "role": "void"},
+    {"key": "skylight", "ifc_class": "IfcWindow", "role": "filling", "predefined_type": "SKYLIGHT"}
+  ],
+  "relationships": [
+    {"ifc_class": "IfcRelVoidsElement", "from": "host", "to": "opening", "meaning": "Abertura corta laje/cobertura."},
+    {"ifc_class": "IfcRelFillsElement", "from": "opening", "to": "skylight", "meaning": "Claraboia preenche o vao."}
+  ],
+  "geometry": {
+    "local_plane": "XY do hospedeiro; Z segue a normal da face.",
+    "opening_depth": "Espessura do hospedeiro mais margem nas duas faces.",
+    "placement": "Filling relativo ao opening; ambos acompanham inclinacao do host.",
+    "units": "SI"
+  },
+  "steps": [
+    {"order": 1, "operation": "resolve_host_local_plane", "purpose": "Obter frame e espessura da laje/cobertura."},
+    {"order": 2, "operation": "validate_footprint_inside_host", "purpose": "Garantir abertura totalmente dentro do contorno."},
+    {"order": 3, "operation": "root.create_entity:IfcOpeningElement", "purpose": "Criar vazio horizontal."},
+    {"order": 4, "operation": "feature.add_feature", "purpose": "Relacionar abertura e hospedeiro."},
+    {"order": 5, "operation": "root.create_entity:IfcWindow", "purpose": "Criar claraboia."},
+    {"order": 6, "operation": "geometry.assign_representation", "purpose": "Associar marco e paineis no frame inclinado."},
+    {"order": 7, "operation": "feature.add_filling", "purpose": "Relacionar claraboia e abertura."},
+    {"order": 8, "operation": "validate_filling", "purpose": "Validar void, filling, placement e contencao."}
+  ],
+  "checks": [
+    {"code": "OPENING_INSIDE_HOST", "severity": "error", "rule": "Footprint da abertura dentro do host."},
+    {"code": "OPENING_CUTS_FULL_DEPTH", "severity": "error", "rule": "Corpo de corte atravessa toda a espessura."},
+    {"code": "FILL_RELATION_COUNT", "severity": "error", "rule": "Claraboia preenche exatamente uma abertura."},
+    {"code": "HOST_NORMAL_ALIGNMENT", "severity": "warning", "rule": "Eixo Z local acompanha normal da cobertura."}
+  ],
+  "failure_modes": [
+    {"symptom": "Abertura vertical em uma cobertura inclinada.", "cause": "Foi usado Z global em vez do frame do host.", "prevention": "Derivar placement da representacao da cobertura."},
+    {"symptom": "Chuva atravessa no modelo de coordenacao.", "cause": "Filling menor ou deslocado em relacao ao opening.", "prevention": "Validar contornos projetados e sobreposicao."},
+    {"symptom": "Claraboia fica no pavimento errado.", "cause": "Contencao copiada da laje inferior sem analisar cobertura.", "prevention": "Resolver estrutura espacial pelo host."}
+  ],
+  "references": [
+    {"title": "IFC 4.3.2 IfcWindow", "url": "https://ifc43-docs.standards.buildingsmart.org/IFC/RELEASE/IFC4x3/HTML/lexical/IfcWindow.htm"},
+    {"title": "IfcOpenShell feature API", "url": "https://docs.ifcopenshell.org/autoapi/ifcopenshell/api/feature/index.html"}
+  ]
+}
+

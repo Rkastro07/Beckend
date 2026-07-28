@@ -1,0 +1,22 @@
+{
+  "schema": "cloud2bim.wall-validity-ground-truth.v1",
+  "source": "user_png_review",
+  "cloud": "kladno_2andar_voxel3cm - Cloudmeiuca.e57",
+  "reviewed_at": "2026-07-28",
+  "non_walls": [
+    "W-S01-002",
+    "W-S01-009",
+    "W-S01-011",
+    "W-S01-013",
+    "W-S01-017",
+    "W-S01-021",
+    "W-S01-023",
+    "W-S01-026",
+    "W-S01-027",
+    "W-S01-028"
+  ],
+  "notes": [
+    "IDs fornecidos pelo usuario depois da execucao cega do pipeline.",
+    "A lista serve para avaliacao; nenhum ID e usado como regra do detector."
+  ]
+}

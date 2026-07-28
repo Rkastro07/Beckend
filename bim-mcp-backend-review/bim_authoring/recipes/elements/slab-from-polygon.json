@@ -1,0 +1,56 @@
+{
+  "schema_version": "1.0",
+  "id": "element.slab-from-polygon",
+  "version": "1.0.0",
+  "title": "Laje a partir de contorno",
+  "summary": "Documenta uma IfcSlab extrudada de um poligono simples fechado, com orientacao, espessura e contencao espacial coerentes.",
+  "status": "documented",
+  "ifc_versions": ["IFC4", "IFC4X3"],
+  "tags": ["slab", "polygon", "geometry", "spatial"],
+  "executor": null,
+  "inputs": [
+    {"name": "contour", "type": "point2_list", "unit": "m", "required": true, "description": "Poligono simples sem repetir o primeiro ponto."},
+    {"name": "thickness", "type": "number", "unit": "m", "required": true, "minimum": 0.02, "description": "Espessura da laje."},
+    {"name": "elevation", "type": "number", "unit": "m", "required": true, "description": "Cota da face de referencia."},
+    {"name": "predefined_type", "type": "IfcSlabTypeEnum", "required": false, "default": "FLOOR", "description": "Funcao da laje."}
+  ],
+  "entities": [
+    {"key": "slab", "ifc_class": "IfcSlab", "role": "element", "predefined_type": "FLOOR"},
+    {"key": "storey", "ifc_class": "IfcBuildingStorey", "role": "spatial-container"}
+  ],
+  "relationships": [
+    {"ifc_class": "IfcRelContainedInSpatialStructure", "from": "storey", "to": "slab", "meaning": "A laje pertence ao pavimento apropriado."}
+  ],
+  "geometry": {
+    "profile": "IfcArbitraryClosedProfileDef de um IfcPolyline fechado.",
+    "body": "IfcExtrudedAreaSolid ao longo do Z local.",
+    "winding": "Contorno externo anti-horario visto de +Z.",
+    "holes": "IfcArbitraryProfileDefWithVoids quando existirem vazios.",
+    "units": "SI"
+  },
+  "steps": [
+    {"order": 1, "operation": "validate_polygon", "purpose": "Validar area, fechamento, winding e auto-intersecoes."},
+    {"order": 2, "operation": "root.create_entity:IfcSlab", "purpose": "Criar ocorrencia da laje."},
+    {"order": 3, "operation": "create_arbitrary_closed_profile", "purpose": "Construir perfil fechado com coordenadas locais."},
+    {"order": 4, "operation": "create_extruded_area_solid", "purpose": "Extrudar o perfil pela espessura."},
+    {"order": 5, "operation": "geometry.assign_representation", "purpose": "Associar Model/Body a laje."},
+    {"order": 6, "operation": "spatial.assign_container", "purpose": "Conter a laje no pavimento."},
+    {"order": 7, "operation": "geometry.edit_object_placement", "purpose": "Aplicar a elevacao sem duplicar Z no perfil."}
+  ],
+  "checks": [
+    {"code": "SLAB_POLYGON_SIMPLE", "severity": "error", "rule": "Contorno tem pelo menos tres vertices e nao se auto-intersecta."},
+    {"code": "SLAB_AREA_POSITIVE", "severity": "error", "rule": "Area projetada maior que zero."},
+    {"code": "SLAB_THICKNESS_POSITIVE", "severity": "error", "rule": "Espessura positiva e coerente com material layer set."},
+    {"code": "SLAB_CONTAINMENT", "severity": "error", "rule": "Laje contida no pavimento correto."}
+  ],
+  "failure_modes": [
+    {"symptom": "Laje nao aparece ou fica invertida.", "cause": "Winding errado ou perfil degenerado.", "prevention": "Normalizar contorno anti-horario e area positiva."},
+    {"symptom": "Laje aparece duas vezes acima da cota.", "cause": "Elevacao aplicada no perfil e no ObjectPlacement.", "prevention": "Manter perfil em Z local zero e cota apenas no placement."},
+    {"symptom": "Vao de escada fica preenchido.", "cause": "Contorno modelado sem inner curves.", "prevention": "Usar perfil com vazios ou IfcOpeningElement semantico."}
+  ],
+  "references": [
+    {"title": "IfcOpenShell geometry creation", "url": "https://docs.ifcopenshell.org/ifcopenshell-python/geometry_creation.html"},
+    {"title": "IfcOpenShell geometry API", "url": "https://docs.ifcopenshell.org/autoapi/ifcopenshell/api/geometry/index.html"}
+  ]
+}
+

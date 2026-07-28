@@ -1,0 +1,59 @@
+{
+  "schema_version": "1.0",
+  "id": "element.wall-basic",
+  "version": "1.0.0",
+  "title": "Parede reta basica",
+  "summary": "Cria uma IfcWall extrudada entre dois pontos, orientada por um frame local e contida em um pavimento.",
+  "status": "implemented",
+  "ifc_versions": ["IFC4", "IFC4X3"],
+  "tags": ["wall", "geometry", "placement", "spatial"],
+  "executor": "bim_authoring.engine:IfcAuthoringEngine.create_wall",
+  "inputs": [
+    {"name": "start", "type": "point2_or_3", "unit": "m", "required": true, "description": "Inicio do eixo da parede."},
+    {"name": "end", "type": "point2_or_3", "unit": "m", "required": true, "description": "Fim do eixo da parede."},
+    {"name": "height", "type": "number", "unit": "m", "required": true, "minimum": 0.1, "description": "Altura da extrusao."},
+    {"name": "thickness", "type": "number", "unit": "m", "required": true, "minimum": 0.02, "description": "Espessura total da parede."},
+    {"name": "elevation", "type": "number", "unit": "m", "required": false, "default": 0.0, "description": "Cota da base."},
+    {"name": "storey", "type": "IfcBuildingStorey", "required": false, "description": "Pavimento de contencao espacial."},
+    {"name": "body_context", "type": "IfcGeometricRepresentationSubContext", "required": true, "description": "Contexto Model/Body/MODEL_VIEW reutilizado pelo projeto."}
+  ],
+  "entities": [
+    {"key": "wall", "ifc_class": "IfcWall", "role": "element", "predefined_type": "STANDARD"},
+    {"key": "storey", "ifc_class": "IfcBuildingStorey", "role": "spatial-container"}
+  ],
+  "relationships": [
+    {"ifc_class": "IfcRelContainedInSpatialStructure", "from": "storey", "to": "wall", "meaning": "A parede pertence ao pavimento."}
+  ],
+  "geometry": {
+    "representation": "IfcExtrudedAreaSolid por geometry.add_wall_representation",
+    "local_x": "start -> end",
+    "local_y": "normal horizontal a esquerda do eixo",
+    "local_z": "vertical global positiva",
+    "origin": "start na elevacao informada",
+    "units": "SI"
+  },
+  "steps": [
+    {"order": 1, "operation": "root.create_entity", "purpose": "Criar a ocorrencia IfcWall."},
+    {"order": 2, "operation": "geometry.add_wall_representation", "purpose": "Gerar corpo parametrico com comprimento, altura e espessura."},
+    {"order": 3, "operation": "geometry.assign_representation", "purpose": "Associar o corpo a parede."},
+    {"order": 4, "operation": "spatial.assign_container", "purpose": "Conter a parede no pavimento."},
+    {"order": 5, "operation": "geometry.edit_object_placement", "purpose": "Aplicar origem e orientacao em matriz 4x4 SI."}
+  ],
+  "checks": [
+    {"code": "WALL_LENGTH_POSITIVE", "severity": "error", "rule": "Distancia start-end maior que zero."},
+    {"code": "WALL_DIMENSIONS_POSITIVE", "severity": "error", "rule": "Altura e espessura positivas."},
+    {"code": "WALL_BODY", "severity": "error", "rule": "IfcWall possui representacao Model/Body."},
+    {"code": "WALL_PLACEMENT", "severity": "error", "rule": "Elemento com geometria possui IfcLocalPlacement."},
+    {"code": "WALL_CONTAINMENT", "severity": "error", "rule": "Parede contida em exatamente um pavimento quando storey foi fornecido."}
+  ],
+  "failure_modes": [
+    {"symptom": "Parede aparece girada ou espelhada.", "cause": "Eixos locais nao formam sistema destro.", "prevention": "Calcular Y como cross(Z, X)."},
+    {"symptom": "Espessura do tipo difere da geometria.", "cause": "Material layer set e corpo extrudado usam totais diferentes.", "prevention": "Validar soma das camadas contra thickness."},
+    {"symptom": "Parede flutua fora do pavimento.", "cause": "Mistura de coordenadas locais, mundo e georreferenciadas.", "prevention": "Receber metros SI e usar edit_object_placement com is_si=true."}
+  ],
+  "references": [
+    {"title": "IfcOpenShell geometry creation", "url": "https://docs.ifcopenshell.org/ifcopenshell-python/geometry_creation.html"},
+    {"title": "IfcOpenShell high-level API", "url": "https://docs.ifcopenshell.org/autoapi/ifcopenshell/api/index.html"}
+  ]
+}
+

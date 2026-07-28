@@ -1,0 +1,192 @@
+{
+  "schema_version": "1.0",
+  "copied_at": "2026-07-24",
+  "source": "backend-original",
+  "root": "source_docs",
+  "file_count": 24,
+  "total_bytes": 139768,
+  "selection": {
+    "included": [
+      "documentacao Markdown/RST",
+      "notebooks de receita",
+      "configuracoes-exemplo YAML"
+    ],
+    "excluded": [
+      "dependencias e ambientes virtuais",
+      "worktrees e caches",
+      "datasets e labels",
+      "outputs e logs gerados",
+      "artefatos temporarios e builds"
+    ]
+  },
+  "documents": [
+    {
+      "path": "bim-ai-superintendent/README.md",
+      "title": "Run and deploy your AI Studio app",
+      "bytes": 493,
+      "sha256": "2b80d9cc879de0c5b04db151ea81457e3eb64cfb370d8ea2cd888a782af2e641",
+      "tags": ["frontend", "deploy"]
+    },
+    {
+      "path": "bim-ai-superintendent-v2/README.md",
+      "title": "BIM AI Superintendent - v2",
+      "bytes": 2745,
+      "sha256": "ab8c9bbd088881fb06575925a9e8d8b422a7153fbd780c4a132d3f0befc01f15",
+      "tags": ["frontend", "v2", "arquitetura"]
+    },
+    {
+      "path": "docs/CHANGELOG_2026-04-28.md",
+      "title": "Changelog - 2026-04-28",
+      "bytes": 9262,
+      "sha256": "842768e1f23871d598bb120b67d809a936da22c41d2c9355862061e248a8e630",
+      "tags": ["changelog", "implementacao", "historico"]
+    },
+    {
+      "path": "docs/colab_minkowski_recipe.md",
+      "title": "Receita: MinkowskiEngine no Colab Pro A100 (CUDA 12)",
+      "bytes": 5249,
+      "sha256": "77bcc488121de46598bd7d409f1471573d1918cd89e1c8bce8a694f69b050194",
+      "tags": ["receita", "colab", "minkowski", "cuda", "mask3d"]
+    },
+    {
+      "path": "docs/FEATURES_E_APZINHOS.md",
+      "title": "Features do sistema - inventario de apzinhos",
+      "bytes": 8275,
+      "sha256": "87a722782a47e9c83268b2ca38000c4795f3ee85ffcd993718ddfc717f52a5e9",
+      "tags": ["produto", "features", "inventario", "api"]
+    },
+    {
+      "path": "docs/FUTURO.md",
+      "title": "Roadmap Futuro - Deteccao de Problemas Estruturais",
+      "bytes": 7388,
+      "sha256": "8d58858fe10ddeeb5ddef39bdea2395ceeeec790fdfc7ef5cb2dd87645eb8886",
+      "tags": ["roadmap", "analise", "estrutura", "visao-computacional"]
+    },
+    {
+      "path": "docs/handoff_mask3d_colab_session.md",
+      "title": "Handoff - Treino Mask3D BIM no Colab",
+      "bytes": 6699,
+      "sha256": "203e5781a3797e3ff18dfabd6afe91760631b4e18c42604dab4d98b61aede45e",
+      "tags": ["handoff", "receita", "colab", "mask3d", "treino"]
+    },
+    {
+      "path": "docs/helios_dataset_plan.md",
+      "title": "HELIOS++ - Plano de geracao de dataset realista para Mask3D",
+      "bytes": 8096,
+      "sha256": "ee47d19006d7ab3948168bfd069f834be7df26c0b6146e97288897ba64401119",
+      "tags": ["dataset", "helios", "mask3d", "simulacao", "plano"]
+    },
+    {
+      "path": "docs/JORNADA_HORIZONTE.md",
+      "title": "Jornada Horizonte - validacao do sintetico ao real",
+      "bytes": 12992,
+      "sha256": "68398e9f5eba67739723f6abc78685db0a8b6f0fb0d814540495eb3539c2287c",
+      "tags": ["analise", "validacao", "scan-real", "ifc", "licoes"]
+    },
+    {
+      "path": "docs/PIPELINE_BACK_FRONT.md",
+      "title": "Pipeline Back - JSON - Front",
+      "bytes": 7964,
+      "sha256": "d4e1f165c49959671abe3c98a3750da92bf0f19108850c71740ad09059b18546",
+      "tags": ["arquitetura", "backend", "frontend", "json", "contratos"]
+    },
+    {
+      "path": "docs/PLANO_ASBUILT_IFC.md",
+      "title": "Plano: Gerador de As-Built IFC",
+      "bytes": 5818,
+      "sha256": "f8d7f32c2abfc040041a6cc74e83696c6c0c3f6438a58aee64f83f5e9349ceb9",
+      "tags": ["plano", "as-built", "ifc", "scan", "cloud-to-bim"]
+    },
+    {
+      "path": "docs/RANDOM_FOREST.md",
+      "title": "Aula: scikit-learn RandomForestClassifier",
+      "bytes": 8587,
+      "sha256": "bccf524adc25f747840f8f4212326ec2b892bb8a93bc70dc1b23d2f5b39cebc5",
+      "tags": ["machine-learning", "random-forest", "analise", "aula"]
+    },
+    {
+      "path": "documentation.md",
+      "title": "BIM vs. Point Cloud Analysis API (Hybrid V2.0)",
+      "bytes": 5351,
+      "sha256": "22034b29f968d1ed788d46fb52c9a02a951f7e34131c7aacac6e5e9aea138321",
+      "tags": ["api", "analise", "ifc", "point-cloud"]
+    },
+    {
+      "path": "experiments/cloud2bim/cloud2bim_patched/README_original.md",
+      "title": "Cloud2BIM original",
+      "bytes": 2878,
+      "sha256": "31bb3bf6cff01ba1cdd1b863c22d813a0e11ea31f86971fb9c99696478adf5d3",
+      "tags": ["cloud-to-bim", "referencia", "receita"]
+    },
+    {
+      "path": "experiments/cloud2bim/configs_exemplo/config_allplan.yaml",
+      "title": "Configuracao Cloud2BIM para Allplan",
+      "bytes": 799,
+      "sha256": "f91ce3ae21e9e9d12d8649a04fb11d244b839fe8643fe8c10e9f2fe9dc4e4066",
+      "tags": ["configuracao", "cloud-to-bim", "allplan", "receita"]
+    },
+    {
+      "path": "experiments/cloud2bim/configs_exemplo/config_real_xyz.yaml",
+      "title": "Configuracao Cloud2BIM para XYZ real",
+      "bytes": 743,
+      "sha256": "818de8813cf64e433ed4c0c88cb2fae8514507d02918399ee037f7789846e2f6",
+      "tags": ["configuracao", "cloud-to-bim", "xyz", "scan-real"]
+    },
+    {
+      "path": "experiments/cloud2bim/configs_exemplo/config_sim.yaml",
+      "title": "Configuracao Cloud2BIM para simulacao",
+      "bytes": 724,
+      "sha256": "daa38687b8fb21e234809b376463563bd1b3e673bf6c5ef52ef940a3b113dc8c",
+      "tags": ["configuracao", "cloud-to-bim", "simulacao"]
+    },
+    {
+      "path": "experiments/cloud2bim/README.md",
+      "title": "Cloud2BIM adaptado - scan para IFC sem ML",
+      "bytes": 7480,
+      "sha256": "cc454d65206c7c0154189e95c8073d6ed809c5af33a8ac9a51946a306fb4ab29",
+      "tags": ["cloud-to-bim", "receita", "scan", "ifc", "visao-computacional"]
+    },
+    {
+      "path": "experiments/mask3d/Mask3D_BIM_Colab.ipynb",
+      "title": "Mask3D BIM no Colab",
+      "bytes": 12313,
+      "sha256": "e881f79a7cb5fcd8743d62ea3680c611e097fb931d65eade490314cfce339ab7",
+      "tags": ["notebook", "receita", "mask3d", "colab", "treino"]
+    },
+    {
+      "path": "experiments/sonata/repo/.github/CODE_OF_CONDUCT.md",
+      "title": "Sonata Code of Conduct",
+      "bytes": 3623,
+      "sha256": "c3684e15d4fff5ca6654af27ba8f533ec40e4ab517d4a46c81fb6f2e42a702ac",
+      "tags": ["sonata", "terceiros", "governanca"]
+    },
+    {
+      "path": "experiments/sonata/repo/.github/CONTRIBUTING.md",
+      "title": "Contributing to Sonata",
+      "bytes": 1273,
+      "sha256": "d9568e1ce86928bed7e730744f65db709162e91bd157afd5f39fab76236070b3",
+      "tags": ["sonata", "terceiros", "contribuicao"]
+    },
+    {
+      "path": "experiments/sonata/repo/README.md",
+      "title": "Sonata",
+      "bytes": 11499,
+      "sha256": "8941b9ff79d9f15d80362c541b5d00e178dfa0f920ef476ab8091c9f9c904436",
+      "tags": ["sonata", "visao-computacional", "point-cloud", "referencia"]
+    },
+    {
+      "path": "README.md",
+      "title": "BIM Analysis API - Backend",
+      "bytes": 5632,
+      "sha256": "8d38f67396f9bfa8a5bca5294994bb1e425ffbcb4752e53ee6d9501a80824631",
+      "tags": ["backend", "arquitetura", "produto", "api"]
+    },
+    {
+      "path": "STACK.md",
+      "title": "Stack do Sistema BIM Superintendent",
+      "bytes": 3885,
+      "sha256": "38dafb507c10d9e3b25454ddcd4d50fbe5d0cecc115de44c9c480b3d307170b4",
+      "tags": ["stack", "arquitetura", "dependencias"]
+    }
+  ]
+}

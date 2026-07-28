@@ -1,0 +1,28 @@
+{
+  "schema": "cloud2bim.opening-detector-frozen-baseline.v1",
+  "frozen_at": "2026-07-27",
+  "purpose": "Versao congelada antes do teste cego em uma nova nuvem.",
+  "execution": {
+    "opening_review_layer_used": false,
+    "wall_geometry_mode": "kladno-reviewed",
+    "language_model_required": false
+  },
+  "detectors": [
+    "wall_local_density_deficit",
+    "repeated_frame_family",
+    "wall_axis_topology"
+  ],
+  "kladno_development_benchmark": {
+    "expected_local_openings": 12,
+    "proposed_local_openings": 12,
+    "matched_local_openings": 12,
+    "precision": 1.0,
+    "recall": 1.0,
+    "expected_topology_doors": 3,
+    "detected_topology_doors": 3
+  },
+  "sha256": {
+    "cloud2bim_patched/opening_detector_v2.py": "EE3112A3D1EA1564500D434FEDB6FEE8EF290DDDBBC2F8EE0CF7A7C1F59FB56C",
+    "run_opening_detector_v2.py": "6904BDCE7238B90DCEB270D2147C4D675EAB009FBA5D3812E709C673B3562216"
+  }
+}

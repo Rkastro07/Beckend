@@ -1,0 +1,73 @@
+{
+  "schema_version": "1.0",
+  "id": "assembly.window-in-wall",
+  "version": "1.0.0",
+  "title": "Janela hospedada em parede",
+  "summary": "Abre semanticamente uma IfcWall e insere uma IfcWindow parametrica, mantendo preenchimento, placement e contencao espacial.",
+  "status": "implemented",
+  "ifc_versions": ["IFC4", "IFC4X3"],
+  "tags": ["window", "wall", "opening", "filling", "geometry", "placement"],
+  "executor": "bim_authoring.engine:IfcAuthoringEngine.insert_window",
+  "inputs": [
+    {"name": "host", "type": "WallHandle", "required": true, "description": "Parede criada ou medida pela biblioteca."},
+    {"name": "offset_from_start", "type": "number", "unit": "m", "required": true, "minimum": 0.0, "description": "Distancia do inicio da parede ao inicio do vao."},
+    {"name": "width", "type": "number", "unit": "m", "required": true, "minimum": 0.1, "description": "Largura total da janela e do vao."},
+    {"name": "height", "type": "number", "unit": "m", "required": true, "minimum": 0.1, "description": "Altura total da janela e do vao."},
+    {"name": "sill_height", "type": "number", "unit": "m", "required": true, "minimum": 0.0, "description": "Peitoril medido desde a base da parede."},
+    {"name": "partition_type", "type": "IfcWindowTypePartitioningEnum", "required": false, "default": "SINGLE_PANEL", "description": "Arranjo parametrico dos paineis."},
+    {"name": "boolean_margin", "type": "number", "unit": "m", "required": false, "default": 0.05, "minimum": 0.001, "description": "Sobre-espessura do vao em cada face."}
+  ],
+  "entities": [
+    {"key": "host", "ifc_class": "IfcWall", "role": "host"},
+    {"key": "opening", "ifc_class": "IfcOpeningElement", "role": "void"},
+    {"key": "window", "ifc_class": "IfcWindow", "role": "filling", "predefined_type": "WINDOW"},
+    {"key": "storey", "ifc_class": "IfcBuildingStorey", "role": "spatial-container"}
+  ],
+  "relationships": [
+    {"ifc_class": "IfcRelVoidsElement", "from": "host", "to": "opening", "meaning": "A abertura subtrai volume da parede."},
+    {"ifc_class": "IfcRelFillsElement", "from": "opening", "to": "window", "meaning": "A janela preenche semanticamente a abertura."},
+    {"ifc_class": "IfcRelContainedInSpatialStructure", "from": "storey", "to": "window", "meaning": "A janela tambem pertence ao pavimento, independentemente do preenchimento."}
+  ],
+  "geometry": {
+    "opening_body": "Prisma com largura/altura da janela e espessura host.thickness + 2*boolean_margin.",
+    "opening_origin": "Frame da parede + offset X - boolean_margin Y + sill Z.",
+    "window_body": "geometry.add_window_representation com marco, paineis e partition_type.",
+    "window_origin": "Frame da parede + offset X + centro da espessura Y + sill Z.",
+    "placement_rule": "Depois de IfcRelFillsElement, editar placement em coordenadas mundo para permitir PlacementRelTo na abertura.",
+    "units": "SI"
+  },
+  "steps": [
+    {"order": 1, "operation": "validate_hosted_opening", "purpose": "Impedir vao fora do comprimento ou acima da parede."},
+    {"order": 2, "operation": "root.create_entity:IfcOpeningElement", "purpose": "Criar um vazio semantico separado."},
+    {"order": 3, "operation": "geometry.add_wall_representation", "purpose": "Criar prisma de corte com margem numerica."},
+    {"order": 4, "operation": "feature.add_feature", "purpose": "Gerar IfcRelVoidsElement entre parede e abertura."},
+    {"order": 5, "operation": "geometry.edit_object_placement:opening", "purpose": "Posicionar o vao no frame da parede."},
+    {"order": 6, "operation": "root.create_entity:IfcWindow", "purpose": "Criar ocorrencia da janela."},
+    {"order": 7, "operation": "geometry.add_window_representation", "purpose": "Gerar geometria parametrica de marco e paineis."},
+    {"order": 8, "operation": "feature.add_filling", "purpose": "Gerar IfcRelFillsElement entre abertura e janela."},
+    {"order": 9, "operation": "spatial.assign_container", "purpose": "Conter a janela no mesmo pavimento da parede."},
+    {"order": 10, "operation": "geometry.edit_object_placement:window", "purpose": "Alinhar a janela ao vao e estabelecer placement relativo."}
+  ],
+  "checks": [
+    {"code": "OPENING_INSIDE_HOST", "severity": "error", "rule": "offset + width <= comprimento e sill + height <= altura."},
+    {"code": "VOID_RELATION_COUNT", "severity": "error", "rule": "A abertura corta exatamente um hospedeiro."},
+    {"code": "FILL_RELATION_COUNT", "severity": "error", "rule": "A janela preenche exatamente uma abertura."},
+    {"code": "OPENING_BOOLEAN_MARGIN", "severity": "error", "rule": "Espessura do vao e maior que a espessura da parede."},
+    {"code": "PLACEMENT_RELATIVE_TO_OPENING", "severity": "warning", "rule": "PlacementRelTo da janela aponta para o placement da abertura."},
+    {"code": "SPATIAL_CONTAINMENT", "severity": "error", "rule": "Janela contida em exatamente uma estrutura espacial."},
+    {"code": "WINDOW_DIMENSIONS", "severity": "error", "rule": "OverallWidth e OverallHeight positivos e coerentes com o vao."}
+  ],
+  "failure_modes": [
+    {"symptom": "Parede nao aparece cortada.", "cause": "Abertura sem representacao, sem IfcRelVoidsElement ou sem sobre-espessura.", "prevention": "Usar feature.add_feature e margem positiva nas duas faces."},
+    {"symptom": "Janela fica solta quando a parede move.", "cause": "Janela apenas contida no pavimento, sem IfcRelFillsElement/placement relativo.", "prevention": "Criar preenchimento antes do placement final."},
+    {"symptom": "Janela aparece de costas.", "cause": "Frame local da parede invertido ou operacao/partition_type incoerente.", "prevention": "Padronizar X ao longo da parede, Y normal e Z vertical."},
+    {"symptom": "Viewer mostra o vao mas nao a janela.", "cause": "IfcWindow sem representacao ou atributos dimensionais invalidos.", "prevention": "Usar add_window_representation e preencher OverallWidth/OverallHeight."}
+  ],
+  "references": [
+    {"title": "IFC 4.3.2 IfcWindow", "url": "https://ifc43-docs.standards.buildingsmart.org/IFC/RELEASE/IFC4x3/HTML/lexical/IfcWindow.htm"},
+    {"title": "IfcOpenShell add_feature", "url": "https://docs.ifcopenshell.org/autoapi/ifcopenshell/api/feature/add_feature/index.html"},
+    {"title": "IfcOpenShell add_filling", "url": "https://docs.ifcopenshell.org/autoapi/ifcopenshell/api/feature/add_filling/index.html"},
+    {"title": "IfcOpenShell geometry API", "url": "https://docs.ifcopenshell.org/autoapi/ifcopenshell/api/geometry/index.html"}
+  ]
+}
+

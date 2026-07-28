@@ -1,0 +1,37 @@
+{
+  "schema": "cloud2bim.opening-count-ground-truth.v1",
+  "notes": "Validado visualmente pelo usuario; W-S01-022 foi absorvida pela parede final W-S01-027.",
+  "walls": {
+    "W-S01-001": {"door": 1, "window": 0, "exact": true},
+    "W-S01-003": {"door": 2, "window": 0, "exact": true},
+    "W-S01-004": {"door": 1, "window": 0, "exact": true},
+    "W-S01-012": {
+      "door": 0,
+      "window": 3,
+      "exact": true,
+      "review": {
+        "J-W-S01-012-01": "localizacao correta; corrigir extensao no eixo Z",
+        "J-W-S01-012-02": "tamanho aproximadamente correto; deslocada para a esquerda, mover para a direita",
+        "J-W-S01-012-03": "localizacao correta; usar dimensoes da familia J01/J02 e aumentar no eixo Z",
+        "J-W-S01-012-04": "falso positivo; nao existe"
+      }
+    },
+    "W-S01-015": {
+      "door": 0,
+      "window": 2,
+      "exact": true,
+      "review": {
+        "J-W-S01-015-01": "localizacao correta; retangulo esta quadrado e precisa de altura correta",
+        "second_window": "existe outra janela a esquerda de J01",
+        "D-W-S01-015-01": "falso positivo"
+      }
+    },
+    "W-S01-016": {"door": 1, "window": 0, "exact": false},
+    "W-S01-027": {"door": 0, "window": 2, "exact": true}
+  },
+  "topology_doors": [
+    {"between": ["W-S01-023", "W-S01-016"], "type": "door"},
+    {"between": ["W-S01-023", "W-S01-015"], "type": "door"},
+    {"between": ["W-S01-001", "W-S01-005"], "type": "door"}
+  ]
+}

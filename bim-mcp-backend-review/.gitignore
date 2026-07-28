@@ -1,0 +1,69 @@
+node_modules/
+dist/
+.vite/
+__pycache__/
+*.pyc
+.pytest_cache/
+.runtime/
+artifacts/
+_check_*.py
+_test_*.py
+.env
+.env.local
+
+# Dataset (muito grande para git)
+dataset/
+randlanet/data/*.npz
+randlanet/data/debug_report.json
+randlanet/data_instances/
+randlanet/checkpoints/
+
+# ML models (binarios grandes)
+ml/models/random_forest.pkl
+ml/__pycache__/
+
+# Outputs
+output_instances/
+bim_uploads/
+bim_outputs/
+tmp/
+
+# Arquivos de projeto e scans ficam fora da distribuição do servidor
+*.e57
+*.xyz
+*.asc
+*.las
+*.laz
+*.ifc
+*.dxf
+*.dwf
+*.dwl
+*.dwl2
+*.obj
+*.zip
+
+# Claude Code
+.claude/
+bim-ai-superintendent/.claude/
+
+# Temp
+nul
+server_test_output.txt
+
+# Logs
+*.log
+~$*
+
+# PLY uploads / outputs grandes no root
+*.ply
+checkpoints/
+
+# Sonata experiments — venv + clone + checkpoints (todos grandes)
+experiments/sonata/venv_sonata/
+experiments/sonata/checkpoints/
+experiments/sonata/repo/
+
+# Frontend v2 build artifacts
+bim-ai-superintendent-v2/node_modules/
+bim-ai-superintendent-v2/dist/
+bim-ai-superintendent-v2/.vite/

@@ -1,0 +1,57 @@
+{
+  "schema_version": "1.0",
+  "id": "type.layered-wall",
+  "version": "1.0.0",
+  "title": "Tipo de parede com camadas materiais",
+  "summary": "Documenta IfcWallType, IfcMaterialLayerSet e a obrigacao de manter a espessura geometrica igual a soma das camadas.",
+  "status": "documented",
+  "ifc_versions": ["IFC4", "IFC4X3"],
+  "tags": ["wall", "type", "material", "layers", "properties"],
+  "executor": null,
+  "inputs": [
+    {"name": "name", "type": "string", "required": true, "description": "Nome estavel do tipo construtivo."},
+    {"name": "layers", "type": "material_layer_list", "required": true, "description": "Materiais ordenados com espessura em metros."},
+    {"name": "priority", "type": "integer", "required": false, "default": 0, "description": "Prioridade de uniao quando aplicavel."},
+    {"name": "occurrences", "type": "IfcWall_list", "required": false, "description": "Paredes que recebem o tipo."}
+  ],
+  "entities": [
+    {"key": "wall_type", "ifc_class": "IfcWallType", "role": "type", "predefined_type": "STANDARD"},
+    {"key": "material_set", "ifc_class": "IfcMaterialLayerSet", "role": "material-definition"},
+    {"key": "wall", "ifc_class": "IfcWall", "role": "occurrence"}
+  ],
+  "relationships": [
+    {"ifc_class": "IfcRelDefinesByType", "from": "wall_type", "to": "wall", "meaning": "Ocorrencias herdam o tipo."},
+    {"ifc_class": "IfcRelAssociatesMaterial", "from": "material_set", "to": "wall_type", "meaning": "Tipo recebe o conjunto ordenado de camadas."}
+  ],
+  "geometry": {
+    "thickness_rule": "Espessura do corpo de cada ocorrencia = soma LayerThickness.",
+    "direction": "Camadas ordenadas ao longo do eixo Y local da parede.",
+    "usage": "IfcMaterialLayerSetUsage define offset e sentido nas ocorrencias quando necessario.",
+    "units": "SI na API; valores IFC seguem unidades do projeto"
+  },
+  "steps": [
+    {"order": 1, "operation": "root.create_entity:IfcWallType", "purpose": "Criar tipo reutilizavel."},
+    {"order": 2, "operation": "material.add_material_set", "purpose": "Criar IfcMaterialLayerSet."},
+    {"order": 3, "operation": "material.add_layer", "purpose": "Adicionar materiais na ordem construtiva."},
+    {"order": 4, "operation": "material.edit_layer", "purpose": "Definir LayerThickness de cada camada."},
+    {"order": 5, "operation": "material.assign_material", "purpose": "Associar o layer set ao tipo."},
+    {"order": 6, "operation": "type.assign_type", "purpose": "Vincular ocorrencias ao IfcWallType."},
+    {"order": 7, "operation": "validate_geometry_thickness", "purpose": "Comparar soma das camadas com cada corpo geometrico."}
+  ],
+  "checks": [
+    {"code": "MATERIAL_LAYERS_NONEMPTY", "severity": "error", "rule": "Tipo possui ao menos uma camada."},
+    {"code": "LAYER_THICKNESS_POSITIVE", "severity": "error", "rule": "Todas as camadas possuem espessura positiva."},
+    {"code": "GEOMETRY_MATCHES_LAYERSET", "severity": "error", "rule": "Espessura geometrica igual a soma das camadas dentro da tolerancia."},
+    {"code": "TYPE_ASSIGNMENT", "severity": "warning", "rule": "Ocorrencias equivalentes compartilham o mesmo IfcWallType."}
+  ],
+  "failure_modes": [
+    {"symptom": "Quantidade de material difere do volume visual.", "cause": "Corpo e layer set usam espessuras diferentes.", "prevention": "Derivar thickness da soma das camadas."},
+    {"symptom": "Camadas aparecem invertidas.", "cause": "DirectionSense ou eixo Y local incoerente.", "prevention": "Padronizar frame e validar face externa/interna."},
+    {"symptom": "Cada parede cria materiais duplicados.", "cause": "Materiais e tipos nao sao reutilizados.", "prevention": "Buscar por identificador antes de criar e usar assign_type."}
+  ],
+  "references": [
+    {"title": "IfcOpenShell geometry creation - material layer sets", "url": "https://docs.ifcopenshell.org/ifcopenshell-python/geometry_creation.html"},
+    {"title": "IfcOpenShell high-level API", "url": "https://docs.ifcopenshell.org/autoapi/ifcopenshell/api/index.html"}
+  ]
+}
+

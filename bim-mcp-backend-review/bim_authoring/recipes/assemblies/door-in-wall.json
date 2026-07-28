@@ -1,0 +1,65 @@
+{
+  "schema_version": "1.0",
+  "id": "assembly.door-in-wall",
+  "version": "1.0.0",
+  "title": "Porta hospedada em parede",
+  "summary": "Cria vao semantico desde a base da parede e insere uma IfcDoor parametrica com operacao de abertura declarada.",
+  "status": "implemented",
+  "ifc_versions": ["IFC4", "IFC4X3"],
+  "tags": ["door", "wall", "opening", "filling", "geometry", "placement"],
+  "executor": "bim_authoring.engine:IfcAuthoringEngine.insert_door",
+  "inputs": [
+    {"name": "host", "type": "WallHandle", "required": true, "description": "Parede criada ou medida pela biblioteca."},
+    {"name": "offset_from_start", "type": "number", "unit": "m", "required": true, "minimum": 0.0, "description": "Distancia do inicio da parede ao inicio do vao."},
+    {"name": "width", "type": "number", "unit": "m", "required": true, "minimum": 0.4, "description": "Largura total da porta e do vao."},
+    {"name": "height", "type": "number", "unit": "m", "required": true, "minimum": 1.0, "description": "Altura total da porta e do vao."},
+    {"name": "operation_type", "type": "IfcDoorTypeOperationEnum", "required": false, "default": "SINGLE_SWING_LEFT", "description": "Modo e sentido de abertura."},
+    {"name": "boolean_margin", "type": "number", "unit": "m", "required": false, "default": 0.05, "minimum": 0.001, "description": "Sobre-espessura do vao em cada face."}
+  ],
+  "entities": [
+    {"key": "host", "ifc_class": "IfcWall", "role": "host"},
+    {"key": "opening", "ifc_class": "IfcOpeningElement", "role": "void"},
+    {"key": "door", "ifc_class": "IfcDoor", "role": "filling", "predefined_type": "DOOR"},
+    {"key": "storey", "ifc_class": "IfcBuildingStorey", "role": "spatial-container"}
+  ],
+  "relationships": [
+    {"ifc_class": "IfcRelVoidsElement", "from": "host", "to": "opening", "meaning": "A abertura subtrai volume da parede desde a base."},
+    {"ifc_class": "IfcRelFillsElement", "from": "opening", "to": "door", "meaning": "A porta preenche semanticamente o vao."},
+    {"ifc_class": "IfcRelContainedInSpatialStructure", "from": "storey", "to": "door", "meaning": "A porta pertence ao pavimento."}
+  ],
+  "geometry": {
+    "opening_body": "Prisma com sill=0 e espessura maior que a parede.",
+    "door_body": "geometry.add_door_representation com operation_type, lining e panel.",
+    "local_axes": "X largura/parede, Y normal da parede, Z vertical.",
+    "units": "SI"
+  },
+  "steps": [
+    {"order": 1, "operation": "validate_hosted_opening", "purpose": "Validar largura, altura, offset e folgas."},
+    {"order": 2, "operation": "root.create_entity:IfcOpeningElement", "purpose": "Criar o vao semantico."},
+    {"order": 3, "operation": "geometry.add_wall_representation", "purpose": "Criar corpo de subtracao com margem."},
+    {"order": 4, "operation": "feature.add_feature", "purpose": "Relacionar o vao a parede."},
+    {"order": 5, "operation": "geometry.edit_object_placement:opening", "purpose": "Posicionar vao na base da parede."},
+    {"order": 6, "operation": "root.create_entity:IfcDoor", "purpose": "Criar ocorrencia da porta."},
+    {"order": 7, "operation": "geometry.add_door_representation", "purpose": "Gerar marco, folha e operacao parametricos."},
+    {"order": 8, "operation": "feature.add_filling", "purpose": "Relacionar porta e abertura."},
+    {"order": 9, "operation": "spatial.assign_container", "purpose": "Conter porta no pavimento."},
+    {"order": 10, "operation": "geometry.edit_object_placement:door", "purpose": "Alinhar porta ao vao."}
+  ],
+  "checks": [
+    {"code": "DOOR_SILL_ZERO", "severity": "error", "rule": "Porta comum inicia em z=0 da parede."},
+    {"code": "FILL_RELATION_COUNT", "severity": "error", "rule": "Porta preenche exatamente uma abertura."},
+    {"code": "VOID_RELATION_COUNT", "severity": "error", "rule": "Abertura corta exatamente uma parede."},
+    {"code": "DOOR_OPERATION", "severity": "warning", "rule": "OperationType corresponde ao sentido de uso e ao desenho 2D."},
+    {"code": "SPATIAL_CONTAINMENT", "severity": "error", "rule": "Porta pertence ao mesmo pavimento da parede."}
+  ],
+  "failure_modes": [
+    {"symptom": "Porta fica acima ou abaixo do piso.", "cause": "Sill diferente de zero ou base da parede incoerente.", "prevention": "Usar sill=0 no frame local da parede."},
+    {"symptom": "Arco de abertura contradiz a folha.", "cause": "OperationType nao corresponde ao orientation frame.", "prevention": "Validar sentido de abertura em plan view."},
+    {"symptom": "Vao nao corta a face oposta.", "cause": "Opening thickness igual ou menor que a parede.", "prevention": "Somar boolean_margin nas duas faces."}
+  ],
+  "references": [
+    {"title": "IfcOpenShell add_filling", "url": "https://docs.ifcopenshell.org/autoapi/ifcopenshell/api/feature/add_filling/index.html"},
+    {"title": "IfcOpenShell geometry API", "url": "https://docs.ifcopenshell.org/autoapi/ifcopenshell/api/geometry/index.html"}
+  ]
+}
+
