@@ -1,0 +1,58 @@
+{
+  "schema": "cloud2bim.user-ground-truth.v1",
+  "source_cloud": "dataset/RCP/kladno/kladno_saal- Cloud.e57",
+  "reference_run": "bim_outputs/kladno_saal_v2_multiaxis_backend",
+  "purpose": "Regression evaluation only; identifiers must never be used by detector rules.",
+  "walls": {
+    "confirmed_non_walls": [
+      "W-S01-006",
+      "W-S01-007",
+      "W-S01-008",
+      "W-S01-009",
+      "W-S01-011",
+      "W-S01-017",
+      "W-S01-018",
+      "W-S01-019",
+      "W-S01-020",
+      "W-S01-021",
+      "W-S01-024",
+      "W-S01-025"
+    ],
+    "corrections": [
+      "W-S01-015 is a real long facade wall; the earlier non-wall label was corrected by the user.",
+      "W-S01-025 is the compact false appendage attached near W-S01-022."
+    ],
+    "window_leaf_examples": [
+      {
+        "reference_run_wall": "W-S01-007",
+        "corrected_run_wall": "W-S01-006",
+        "description": "Open window leaf connected at both projected endpoints; lower vertical layers are absent."
+      },
+      {
+        "reference_run_wall": "W-S01-011",
+        "corrected_run_wall": "W-S01-009",
+        "description": "Open window leaf with a free edge and approximately 45 degree articulation."
+      }
+    ],
+    "missing_real_wall": {
+      "description": "Parede que sai da ponta livre de W-S01-005, oposta a W-S01-001, e encontra W-S01-003.",
+      "expected_length_m_approx": 1.62,
+      "expected_thickness_m_approx": 0.10
+    },
+    "facade_exception": {
+      "reference_wall": "W-S01-014",
+      "description": "Grande abertura envidracada; vidro sem parede macica foi considerado aceitavel pelo usuario."
+    }
+  },
+  "openings": {
+    "missing_real_door": {
+      "description": "Porta no fim de W-S01-001, no vao que conecta a W-S01-005.",
+      "expected_width_m_approx": 0.87
+    },
+    "legacy_review_labels": {
+      "doors": ["J1", "J2", "J3", "J4"],
+      "windows": ["J5", "J6", "J7", "J8", "J9", "J10", "J11", "J12", "J13", "J14"]
+    },
+    "note": "Legacy J labels are review labels, not stable V2 candidate identifiers."
+  }
+}

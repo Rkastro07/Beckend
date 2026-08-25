@@ -42,6 +42,8 @@ class SegmentFrame:
 class RefinementContext:
     points: np.ndarray
     tree: object
+    z_min: float
+    z_max: float
 
 
 def build_multislice_wall_grid(points, z_min: float, z_max: float,
@@ -220,22 +222,32 @@ def _grid_signature(segment: Sequence[Sequence[float]], grid,
     return hits.mean(axis=1)
 
 
-def face_pair_vertical_metrics(pair, grid, *, corridor_pixels: int = 1,
-                               persistent_slices: int = 4):
-    """Measure height persistence on each proposed wall face independently.
-
-    The old final check counted all points assigned to a broad wall corridor.
-    A false parallel axis could therefore borrow support from a nearby real
-    wall, and furniture visible in only the lower half could satisfy a simple
-    "3 of 6 slices" count.  Here every face retains a longitudinal hit matrix:
-    rows are height slices and columns are positions along the face.
-    """
-    if len(pair) != 2:
-        raise ValueError("a wall candidate must contain exactly two faces")
-    face_hits = [
-        _grid_hits(face, grid, corridor_pixels=corridor_pixels)
-        for face in pair
+def _common_face_hits(pair, grid, corridor_pixels: int):
+    """Sample both proposed faces at identical longitudinal positions."""
+    u, n, rho_a, rho_b, t0, t1 = _pair_geometry(pair)
+    common_pair = [
+        [(u * t0 + n * rho).tolist(), (u * t1 + n * rho).tolist()]
+        for rho in (rho_a, rho_b)
     ]
+    return [
+        _grid_hits(face, grid, corridor_pixels=corridor_pixels)
+        for face in common_pair
+    ]
+
+
+def _longest_true_run(values) -> int:
+    longest = current = 0
+    for value in np.asarray(values, dtype=bool):
+        if value:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return int(longest)
+
+
+def _face_hits_metrics(face_hits, persistent_slices: int = 4):
+    """Summarise two aligned ``height x length`` occupancy matrices."""
     n_slices = max((hits.shape[0] for hits in face_hits), default=0)
     if n_slices == 0:
         return {
@@ -244,55 +256,239 @@ def face_pair_vertical_metrics(pair, grid, *, corridor_pixels: int = 1,
             "bottom_coverage": 0.0,
             "top_coverage": 0.0,
             "persistent_coverage": 0.0,
+            "face_persistent_coverages": np.zeros(2, dtype=float),
+            "second_face_persistent_coverage": 0.0,
+            "paired_persistent_coverage": 0.0,
+            "pair_coherence": 0.0,
+            "upper_run_coverage": 0.0,
             "score": 0.0,
         }
 
     coverages = []
     persistences = []
+    persistent_columns = []
     for hits in face_hits:
         if hits.shape[1] == 0:
             coverages.append(np.zeros(n_slices, dtype=float))
             persistences.append(0.0)
+            persistent_columns.append(np.zeros(0, dtype=bool))
             continue
         coverage = hits.mean(axis=1)
         coverages.append(coverage)
         required = min(max(2, int(persistent_slices)), hits.shape[0])
-        persistences.append(float((hits.sum(axis=0) >= required).mean()))
+        columns = hits.sum(axis=0) >= required
+        persistent_columns.append(columns)
+        persistences.append(float(columns.mean()))
     coverages = np.asarray(coverages, dtype=float)
+    persistences = np.asarray(persistences, dtype=float)
     edge_count = max(1, min(2, n_slices // 2))
     bottom = coverages[:, :edge_count].mean(axis=1)
     top = coverages[:, -edge_count:].mean(axis=1)
     # One coherent observed face is enough for an exterior or single-line wall;
     # its synthetic hidden face is expected to have little or no cloud support.
-    face_scores = 0.40 * top + 0.25 * bottom + 0.35 * np.asarray(persistences)
+    face_scores = 0.40 * top + 0.25 * bottom + 0.35 * persistences
     accepted_face = int(np.argmax(face_scores))
+    same_width = (face_hits[0].shape == face_hits[1].shape and
+                  face_hits[0].shape[1] > 0)
+    if same_width:
+        union = np.logical_or(face_hits[0], face_hits[1])
+        coincidence = np.logical_and(face_hits[0], face_hits[1])
+        pair_coherence = float(coincidence.sum() / max(int(union.sum()), 1))
+        paired_columns = np.logical_and(
+            persistent_columns[0], persistent_columns[1])
+        paired_persistence = float(paired_columns.mean())
+        upper_columns = face_hits[accepted_face][-edge_count:, :].any(axis=0)
+        upper_run = (_longest_true_run(upper_columns) /
+                     max(len(upper_columns), 1))
+    else:
+        pair_coherence = 0.0
+        paired_persistence = 0.0
+        upper_run = 0.0
+    score = float(np.clip(
+        0.80 * face_scores[accepted_face] +
+        0.10 * pair_coherence + 0.10 * paired_persistence,
+        0.0, 1.0))
     return {
         "accepted_face": accepted_face,
         "face_coverages": coverages,
         "bottom_coverage": float(bottom[accepted_face]),
         "top_coverage": float(top[accepted_face]),
         "persistent_coverage": float(persistences[accepted_face]),
-        "score": float(face_scores[accepted_face]),
+        "face_persistent_coverages": persistences,
+        "second_face_persistent_coverage": float(np.min(persistences)),
+        "paired_persistent_coverage": paired_persistence,
+        "pair_coherence": pair_coherence,
+        "upper_run_coverage": float(upper_run),
+        "score": score,
     }
+
+
+def face_pair_vertical_metrics(pair, grid, *, corridor_pixels: int = 1,
+                               persistent_slices: int = 4):
+    """Measure vertical and lateral persistence on the coarse raster grid."""
+    if len(pair) != 2:
+        raise ValueError("a wall candidate must contain exactly two faces")
+    metrics = _face_hits_metrics(
+        _common_face_hits(pair, grid, corridor_pixels),
+        persistent_slices=persistent_slices,
+    )
+    metrics.update({
+        "profile_source": "raster",
+        "profile_point_count": 0,
+        "profile_face_point_counts": np.zeros(2, dtype=int),
+        "measured_thickness": 0.0,
+        "thickness_mad": 0.0,
+        "face_rms": 0.0,
+    })
+    return metrics
+
+
+def face_pair_point_metrics(pair, context: RefinementContext | None, *,
+                            n_slices: int = 6,
+                            persistent_slices: int = 4,
+                            longitudinal_bin_size: float = 0.15,
+                            minimum_points_per_cell: int = 2,
+                            face_band: float | None = None):
+    """Build a local ``z x s x face`` profile from original XYZ points."""
+    if context is None or len(pair) != 2:
+        return None
+    u, n, rho_a, rho_b, t0, t1 = _pair_geometry(pair)
+    length = float(t1 - t0)
+    separation = float(abs(rho_b - rho_a))
+    z_span = float(context.z_max - context.z_min)
+    if length <= _EPS or separation <= _EPS or z_span <= _EPS:
+        return None
+    n_slices = max(3, int(n_slices))
+    longitudinal_bin_size = max(0.06, float(longitudinal_bin_size))
+    n_longitudinal = max(2, int(math.ceil(length / longitudinal_bin_size)))
+    actual_bin_size = length / n_longitudinal
+    sample_t = t0 + (np.arange(n_longitudinal) + 0.5) * actual_bin_size
+    rho_mid = 0.5 * (rho_a + rho_b)
+    sample_centres = (sample_t[:, None] * u[None, :] +
+                      rho_mid * n[None, :])
+    band = (max(0.025, min(0.060, 0.35 * separation))
+            if face_band is None else max(0.015, float(face_band)))
+    query_radius = 0.5 * separation + band + 0.04
+    neighbours = context.tree.query_ball_point(sample_centres, r=query_radius)
+    nonempty = [np.asarray(ids, dtype=np.int64)
+                for ids in neighbours if len(ids)]
+    if not nonempty:
+        return None
+    indices = np.unique(np.concatenate(nonempty))
+    xyz = np.asarray(context.points[indices, :3], dtype=float)
+    along = xyz[:, :2] @ u
+    normal = xyz[:, :2] @ n
+    valid = (
+        (along >= t0) & (along <= t1) &
+        (xyz[:, 2] >= context.z_min) & (xyz[:, 2] <= context.z_max) &
+        (normal >= min(rho_a, rho_b) - band) &
+        (normal <= max(rho_a, rho_b) + band)
+    )
+    if int(valid.sum()) < 12:
+        return None
+    xyz, along, normal = xyz[valid], along[valid], normal[valid]
+    s_index = np.floor((along - t0) / length * n_longitudinal).astype(int)
+    z_index = np.floor(
+        (xyz[:, 2] - context.z_min) / z_span * n_slices).astype(int)
+    s_index = np.clip(s_index, 0, n_longitudinal - 1)
+    z_index = np.clip(z_index, 0, n_slices - 1)
+    distances = np.column_stack([
+        np.abs(normal - rho_a), np.abs(normal - rho_b)])
+    nearest_face = np.argmin(distances, axis=1)
+    face_hits = []
+    face_point_counts = []
+    face_residuals = []
+    for face_index in range(2):
+        selected = ((nearest_face == face_index) &
+                    (distances[:, face_index] <= band))
+        counts = np.zeros((n_slices, n_longitudinal), dtype=np.int32)
+        np.add.at(counts, (z_index[selected], s_index[selected]), 1)
+        face_hits.append(counts >= max(1, int(minimum_points_per_cell)))
+        face_point_counts.append(int(selected.sum()))
+        residual = distances[selected, face_index]
+        face_residuals.append(float(np.sqrt(np.mean(residual ** 2)))
+                              if len(residual) else 0.0)
+    if max(face_point_counts, default=0) < max(12, n_longitudinal // 2):
+        return None
+    metrics = _face_hits_metrics(
+        face_hits, persistent_slices=persistent_slices)
+    thickness_samples = []
+    for longitudinal_index in range(n_longitudinal):
+        in_bin = s_index == longitudinal_index
+        face_a = normal[in_bin & (nearest_face == 0) &
+                        (distances[:, 0] <= band)]
+        face_b = normal[in_bin & (nearest_face == 1) &
+                        (distances[:, 1] <= band)]
+        if len(face_a) >= 3 and len(face_b) >= 3:
+            thickness_samples.append(abs(
+                float(np.median(face_b)) - float(np.median(face_a))))
+    if thickness_samples:
+        measured_thickness = float(np.median(thickness_samples))
+        thickness_mad = float(np.median(np.abs(
+            np.asarray(thickness_samples) - measured_thickness)))
+    else:
+        measured_thickness = 0.0
+        thickness_mad = 0.0
+    metrics.update({
+        "profile_source": "original_points",
+        "profile_point_count": int(sum(face_point_counts)),
+        "profile_face_point_counts": np.asarray(face_point_counts, dtype=int),
+        "measured_thickness": measured_thickness,
+        "thickness_mad": thickness_mad,
+        "face_rms": float(max(face_residuals, default=0.0)),
+        "longitudinal_bins": int(n_longitudinal),
+        "longitudinal_bin_size": float(actual_bin_size),
+        "face_band": float(band),
+    })
+    return metrics
 
 
 def wall_pair_has_vertical_support(pair, grid, *, corridor_pixels: int = 1,
                                    persistent_slices: int = 4,
                                    minimum_bottom_coverage: float = 0.12,
                                    minimum_top_coverage: float = 0.25,
-                                   minimum_persistent_coverage: float = 0.10):
-    """Return whether one physical face behaves like a vertically tall wall."""
-    metrics = face_pair_vertical_metrics(
+                                   minimum_persistent_coverage: float = 0.10,
+                                   require_two_faces: bool = False,
+                                   minimum_second_face_persistence: float = 0.08,
+                                   minimum_pair_coherence: float = 0.08,
+                                   minimum_paired_persistence: float = 0.05,
+                                   context: RefinementContext | None = None,
+                                   n_slices: int = 6,
+                                   longitudinal_bin_size: float = 0.15,
+                                   minimum_points_per_cell: int = 2,
+                                   face_band: float | None = None):
+    """Return whether the local height-by-length signature is wall-like."""
+    raster_metrics = face_pair_vertical_metrics(
         pair,
         grid,
         corridor_pixels=corridor_pixels,
         persistent_slices=persistent_slices,
     )
-    accepted = (
+    point_metrics = face_pair_point_metrics(
+        pair, context, n_slices=n_slices,
+        persistent_slices=persistent_slices,
+        longitudinal_bin_size=longitudinal_bin_size,
+        minimum_points_per_cell=minimum_points_per_cell,
+        face_band=face_band)
+    metrics = point_metrics if point_metrics is not None else raster_metrics
+    metrics["raster_score"] = float(raster_metrics["score"])
+    single_face_accepted = (
         metrics["bottom_coverage"] >= float(minimum_bottom_coverage)
         and metrics["top_coverage"] >= float(minimum_top_coverage)
         and metrics["persistent_coverage"] >= float(minimum_persistent_coverage)
     )
+    accepted = single_face_accepted
+    if require_two_faces:
+        accepted = accepted and (
+            metrics["second_face_persistent_coverage"] >=
+            float(minimum_second_face_persistence)
+            and metrics["pair_coherence"] >= float(minimum_pair_coherence)
+            and metrics["paired_persistent_coverage"] >=
+            float(minimum_paired_persistence)
+        )
+    metrics["single_face_accepted"] = bool(single_face_accepted)
+    metrics["two_face_accepted"] = bool(
+        accepted if require_two_faces else False)
     return bool(accepted), metrics
 
 
@@ -423,6 +619,95 @@ def _pair_candidate(a: SegmentFrame, b: SegmentFrame, min_thickness: float,
     return score, separation, overlap
 
 
+def _maximum_weight_pair_candidates(candidates, *, exact_component_limit=22):
+    """Choose a globally best strict 1:1 matching in each candidate component.
+
+    Greedy edge selection can consume a face needed by two slightly lower
+    scoring but jointly better wall pairs.  Contour candidate graphs are small
+    disconnected components, so an exact bit-mask search is both deterministic
+    and cheap.  Very large pathological components retain a bounded greedy
+    fallback rather than making runtime exponential.
+    """
+    if not candidates:
+        return []
+    adjacency = {}
+    for item in candidates:
+        i, j = int(item[1]), int(item[2])
+        adjacency.setdefault(i, set()).add(j)
+        adjacency.setdefault(j, set()).add(i)
+
+    components = []
+    unseen = set(adjacency)
+    while unseen:
+        start = min(unseen)
+        stack = [start]
+        component = set()
+        while stack:
+            node = stack.pop()
+            if node in component:
+                continue
+            component.add(node)
+            stack.extend(adjacency.get(node, ()))
+        unseen.difference_update(component)
+        components.append(sorted(component))
+
+    selected = []
+    for component in components:
+        component_set = set(component)
+        edges = [
+            item for item in candidates
+            if int(item[1]) in component_set and int(item[2]) in component_set
+        ]
+        if len(component) > int(exact_component_limit):
+            used = set()
+            for item in sorted(edges, reverse=True, key=lambda edge: edge[0]):
+                i, j = int(item[1]), int(item[2])
+                if item[0] > 0.0 and i not in used and j not in used:
+                    selected.append(item)
+                    used.update((i, j))
+            continue
+
+        local = {node: position for position, node in enumerate(component)}
+        edge_for_local = {}
+        local_adjacency = {position: [] for position in range(len(component))}
+        for item in edges:
+            i, j = local[int(item[1])], local[int(item[2])]
+            if i > j:
+                i, j = j, i
+            edge_for_local[(i, j)] = item
+            local_adjacency[i].append(j)
+            local_adjacency[j].append(i)
+
+        cache = {}
+
+        def solve(mask):
+            if mask == 0:
+                return 0.0, ()
+            if mask in cache:
+                return cache[mask]
+            first_bit = mask & -mask
+            first = first_bit.bit_length() - 1
+            remaining = mask & ~first_bit
+            best_score, best_edges = solve(remaining)
+            for neighbour in local_adjacency[first]:
+                neighbour_bit = 1 << neighbour
+                if not (remaining & neighbour_bit):
+                    continue
+                edge_key = (min(first, neighbour), max(first, neighbour))
+                edge = edge_for_local[edge_key]
+                tail_score, tail_edges = solve(remaining & ~neighbour_bit)
+                candidate_score = float(edge[0]) + tail_score
+                if candidate_score > best_score + 1e-12:
+                    best_score = candidate_score
+                    best_edges = (edge_key,) + tail_edges
+            cache[mask] = (best_score, best_edges)
+            return cache[mask]
+
+        _, chosen_edges = solve((1 << len(component)) - 1)
+        selected.extend(edge_for_local[edge] for edge in chosen_edges)
+    return sorted(selected, reverse=True, key=lambda item: item[0])
+
+
 def pair_wall_faces(segments, min_thickness: float, max_thickness: float, *,
                     angle_tolerance=3.0, minimum_overlap=0.20):
     """Return strict 1:1 face pairs and unpaired evidence segments."""
@@ -440,13 +725,10 @@ def pair_wall_faces(segments, min_thickness: float, max_thickness: float, *,
                                         minimum_overlap)
             if candidate is not None:
                 candidates.append((candidate[0], i, j, candidate))
-    candidates.sort(reverse=True, key=lambda item: item[0])
     used = set()
     pairs = []
     diagnostics = []
-    for _score, i, j, candidate in candidates:
-        if i in used or j in used:
-            continue
+    for _score, i, j, candidate in _maximum_weight_pair_candidates(candidates):
         used.update((i, j))
         pairs.append([frames[i].segment, frames[j].segment])
         diagnostics.append({
@@ -478,7 +760,12 @@ def build_refinement_context(points, z_floor: float, z_ceiling: float,
         step = int(math.ceil(len(array) / max_points))
         array = array[::step]
     array = np.asarray(array, dtype=np.float32)
-    return RefinementContext(points=array, tree=cKDTree(array[:, :2]))
+    return RefinementContext(
+        points=array,
+        tree=cKDTree(array[:, :2]),
+        z_min=lo,
+        z_max=hi,
+    )
 
 
 def _pair_geometry(pair):
@@ -507,6 +794,10 @@ def refine_face_pair(pair, context: RefinementContext | None, pixel_size: float,
     if context is None:
         return pair
     u, n, rho_a, rho_b, t0, t1 = _pair_geometry(pair)
+    pair_endpoints = np.vstack([
+        np.asarray(pair[0], dtype=float),
+        np.asarray(pair[1], dtype=float),
+    ])
     length = t1 - t0
     if length <= _EPS:
         return pair
@@ -552,6 +843,14 @@ def refine_face_pair(pair, context: RefinementContext | None, pixel_size: float,
             float(values.max()) > 4.0 * max(float(values.min()), _EPS)):
         u = candidate_u / np.linalg.norm(candidate_u)
         n = np.array([-u[1], u[0]])
+
+        # ``t0`` and ``t1`` belong to the previous longitudinal basis. Using
+        # them after rotating ``u`` translates a wall by an amount proportional
+        # to its global coordinates. Reproject the raster endpoints into the
+        # accepted TLS basis before refining their robust percentiles.
+        endpoint_t = pair_endpoints @ u
+        t0 = float(endpoint_t.min())
+        t1 = float(endpoint_t.max())
 
     points_a, points_b = np.asarray(pair[0]), np.asarray(pair[1])
     predicted_a = float(np.mean(points_a @ n))
@@ -744,12 +1043,17 @@ def _leaf_vertical_profile(points, hinge, free, thickness,
 def detect_articulated_leaf_walls(
         axes, thicknesses, wall_ids, opening_anchors, points,
         z_floor: float, z_ceiling: float, *,
+        wall_labels=None,
         minimum_length: float = 0.45,
         maximum_length: float = 2.10,
         maximum_thickness: float = 0.23,
         hinge_tolerance: float = 0.30,
         minimum_open_angle: float = 15.0,
-        minimum_free_clearance: float = 0.24):
+        minimum_free_clearance: float = 0.24,
+        allow_unanchored: bool = True,
+        unanchored_maximum_length: float = 1.10,
+        unanchored_hinge_tolerance: float = 0.25,
+        exact_connection_tolerance: float = 0.05):
     """Detect wall candidates that are probably open door/window leaves.
 
     ``opening_anchors`` is a generic list of dictionaries containing ``id``,
@@ -762,13 +1066,26 @@ def detect_articulated_leaf_walls(
     """
     if not (len(axes) == len(thicknesses) == len(wall_ids)):
         raise ValueError("axes, thicknesses and wall_ids must have equal size")
+    if wall_labels is not None and len(wall_labels) != len(axes):
+        raise ValueError("wall_labels must be absent or have one item per axis")
     frames = [segment_frame(axis) for axis in axes]
     wall_index = {str(identifier): index
                   for index, identifier in enumerate(wall_ids)}
+    # Avoid circular evidence: a weak opening proposed on a compact panel must
+    # not make that same panel structural.  Protect only credible openings that
+    # physically fit inside their host with some solid material left.
     hosted_openings = {
         str(anchor.get("host_wall"))
         for anchor in opening_anchors
-        if anchor.get("host_wall")
+        if (
+            anchor.get("host_wall")
+            and str(anchor.get("status", "proposed")).lower()
+            in {"approved", "proposed", "auto_accepted"}
+            and float(anchor.get("confidence", 1.0)) >= 0.50
+            and str(anchor.get("host_wall")) in wall_index
+            and frames[wall_index[str(anchor.get("host_wall"))]].length
+            >= float(anchor.get("width", 0.0)) + 0.20
+        )
     }
     results = []
     for index, (frame, thickness, identifier) in enumerate(zip(
@@ -924,6 +1241,134 @@ def detect_articulated_leaf_walls(
                 best = candidate
         if best is not None:
             results.append(best)
+            continue
+
+        if not allow_unanchored or frame.length > float(
+                unanchored_maximum_length):
+            continue
+        if wall_labels is not None and str(wall_labels[index]).lower() != "interior":
+            continue
+
+        # The opening raster can be incomplete while the hinge remains clear in
+        # plan.  A leaf has a compact axis at a non-structural angle to a much
+        # longer host.  Its outer edge is either free, or it floats close to an
+        # opposite jamb without forming precise wall-to-wall topology.
+        for host_index, host_frame in enumerate(frames):
+            if host_index == index:
+                continue
+            if host_frame.length < max(1.50, 1.50 * frame.length):
+                continue
+            angle = angle_difference_deg(frame, host_frame)
+            non_orthogonality = min(angle, abs(90.0 - angle))
+            if non_orthogonality < 20.0:
+                continue
+            endpoints = np.asarray(frame.segment, dtype=float)
+            host_distances = [
+                _point_to_segment_distance(endpoint, host_frame.segment)
+                for endpoint in endpoints
+            ]
+            hinge_index = int(np.argmin(host_distances))
+            hinge_distance = float(host_distances[hinge_index])
+            if hinge_distance > float(unanchored_hinge_tolerance):
+                continue
+            hinge = endpoints[hinge_index]
+            free = endpoints[1 - hinge_index]
+
+            endpoint_connections = []
+            for endpoint in endpoints:
+                distances = [
+                    _point_to_segment_distance(endpoint, other_frame.segment)
+                    for other_index, other_frame in enumerate(frames)
+                    if other_index != index
+                ]
+                endpoint_connections.append(min(distances, default=float("inf")))
+            other_distances = [
+                _point_to_segment_distance(free, other_frame.segment)
+                for other_index, other_frame in enumerate(frames)
+                if other_index not in {index, host_index}
+            ]
+            nearest_other = min(other_distances, default=float("inf"))
+            free_edge = nearest_other >= float(minimum_free_clearance)
+            floating_between_jambs = (
+                max(endpoint_connections) <= float(unanchored_hinge_tolerance)
+                and min(endpoint_connections) > float(exact_connection_tolerance)
+            )
+            profile = _leaf_vertical_profile(
+                points, hinge, free, thickness, z_floor, z_ceiling)
+            coverage = profile.get("layer_coverage") or []
+            lower_layers = coverage[:2]
+            lower_layer_support = (
+                max(lower_layers) if lower_layers else 1.0
+            )
+            attached_both_ends = (
+                max(endpoint_connections) <= float(exact_connection_tolerance)
+            )
+            window_leaf_between_hosts = (
+                attached_both_ends
+                and non_orthogonality >= 25.0
+                and profile.get("bottom_offset") is not None
+                and float(profile["bottom_offset"]) >= 0.20
+                and float(lower_layer_support) <= 0.25
+            )
+            if not (
+                free_edge
+                or floating_between_jambs
+                or window_leaf_between_hosts
+            ):
+                continue
+            hinge_score = max(
+                0.0,
+                1.0 - hinge_distance /
+                max(float(unanchored_hinge_tolerance), _EPS),
+            )
+            length_score = max(
+                0.0, 1.0 - abs(frame.length - 0.85) / 0.85)
+            angle_score = min(1.0, non_orthogonality / 30.0)
+            geometry_score = (
+                0.35 * hinge_score
+                + 0.25 * length_score
+                + 0.40 * angle_score
+            )
+            suppression_proposal = geometry_score >= (
+                0.64 if window_leaf_between_hosts else 0.62
+            )
+            candidate = {
+                "wall_id": str(identifier),
+                "wall_index": int(index),
+                "opening_id": "",
+                "host_wall": str(wall_ids[host_index]),
+                "type": "articulated_panel",
+                "source": (
+                    "window_leaf_between_hosts"
+                    if window_leaf_between_hosts
+                    else (
+                        "floating_hinged_panel"
+                        if floating_between_jambs and not free_edge
+                        else "wall_hinge_geometry"
+                    )
+                ),
+                "hinge": [float(value) for value in hinge],
+                "free_edge": [float(value) for value in free],
+                "matched_jamb": None,
+                "hinge_distance": hinge_distance,
+                "length": float(frame.length),
+                "opening_width": None,
+                "length_width_ratio": None,
+                "thickness": float(thickness),
+                "open_angle_deg": float(angle),
+                "non_orthogonality_deg": float(non_orthogonality),
+                "free_edge_clearance": float(nearest_other),
+                "vertical_match": bool(window_leaf_between_hosts),
+                "profile": profile,
+                "geometry_score": float(geometry_score),
+                "score": float(geometry_score),
+                "status": "proposed" if suppression_proposal else "review",
+                "suppress": bool(suppression_proposal),
+            }
+            if best is None or candidate["score"] > best["score"]:
+                best = candidate
+        if best is not None:
+            results.append(best)
     return sorted(results, key=lambda result: result["wall_id"])
 
 
@@ -935,6 +1380,88 @@ def keep_non_leaf_wall_indices(count: int, leaf_results):
         if result.get("suppress")
     }
     return [index for index in range(int(count)) if index not in suppressed]
+
+
+def keep_quality_wall_indices(thicknesses, wall_labels, diagnostics, *,
+                              wall_axes=None,
+                              thick_ratio: float = 2.0,
+                              thick_minimum: float = 0.30):
+    """Reject double-line candidates with several independent red flags.
+
+    Absolute thickness alone is valid for old masonry.  A candidate is removed
+    only when a floor-relative thickness outlier also has weak two-face
+    evidence, or when score, coherence and paired persistence are all poor.
+    A long facade may legitimately have low upper-run coverage because of
+    windows, so thickness outlier rejection is limited to compact candidates.
+    Conversely, a compact exterior appendage with uniformly weak paired-face
+    evidence is rejected by the same quality contract as an interior object.
+    """
+    if not (len(thicknesses) == len(wall_labels) == len(diagnostics)):
+        raise ValueError("wall quality inputs must have equal size")
+    if wall_axes is not None and len(wall_axes) != len(thicknesses):
+        raise ValueError("wall axes and quality inputs must have equal size")
+    interior_thicknesses = [
+        float(thickness)
+        for thickness, label in zip(thicknesses, wall_labels)
+        if str(label).lower() == "interior"
+        and np.isfinite(float(thickness))
+        and float(thickness) > 0.0
+    ]
+    typical = float(np.median(interior_thicknesses)) \
+        if interior_thicknesses else 0.0
+    kept = []
+    decisions = []
+    for index, (thickness, label, metrics) in enumerate(zip(
+            thicknesses, wall_labels, diagnostics)):
+        thickness = float(thickness)
+        length = (
+            float(np.linalg.norm(
+                np.asarray(wall_axes[index], dtype=float)[1]
+                - np.asarray(wall_axes[index], dtype=float)[0]
+            ))
+            if wall_axes is not None else 0.0
+        )
+        compact_candidate = wall_axes is None or length <= 4.0
+        score = float(metrics.get("detection_score", 0.0))
+        coherence = float(metrics.get("pair_coherence", 0.0))
+        paired = float(metrics.get("paired_persistent_coverage", 0.0))
+        upper_run = float(metrics.get("upper_run_coverage", 0.0))
+        thick_outlier = (
+            str(label).lower() == "interior"
+            and compact_candidate
+            and typical > 0.0
+            and thickness >= max(
+                float(thick_minimum), float(thick_ratio) * typical)
+            and score < 0.75
+            and coherence < 0.65
+            and paired < 0.50
+            and upper_run < 0.35
+        )
+        weak_pair = (
+            compact_candidate
+            and score < 0.50
+            and coherence < 0.40
+            and paired < 0.15
+        )
+        if thick_outlier or weak_pair:
+            decisions.append({
+                "wall_index": int(index),
+                "reason": (
+                    "thickness_outlier_with_weak_faces"
+                    if thick_outlier else "weak_two_face_evidence"
+                ),
+                "typical_thickness": typical,
+                "length": length,
+                "wall_label": str(label),
+                "thickness": thickness,
+                "detection_score": score,
+                "pair_coherence": coherence,
+                "paired_persistent_coverage": paired,
+                "upper_run_coverage": upper_run,
+            })
+        else:
+            kept.append(index)
+    return kept, decisions
 
 
 def deduplicate_overlapping_wall_axes(axes, thicknesses, quality_scores=None, *,

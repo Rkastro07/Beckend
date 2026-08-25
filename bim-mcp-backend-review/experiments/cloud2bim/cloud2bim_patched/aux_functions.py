@@ -20,7 +20,7 @@ except ImportError:
         return np.ones(tuple(map(int, shape)), dtype=bool)
 from shapely.geometry import Polygon as ShapelyPolygon
 import open3d as o3d
-import e57
+from e57_compat import read_e57_points
 from tqdm import tqdm
 from plotting_functions import *
 
@@ -113,9 +113,7 @@ def log(message, last_time, filename):
 
 
 def read_e57(file_name):
-    # read the documentation at https://github.com/davidcaron/pye57
-    e57_array = e57.read_points(file_name)
-    return e57_array
+    return read_e57_points(file_name)
 
 
 def e57_data_to_xyz(e57_data, output_file_name, chunk_size=10000):
@@ -168,7 +166,13 @@ def load_selective_lines(filename, step):
 
 
 def load_xyz_file(file_name, plot_xyz=False, select_ith_lines=True, ith_lines=20):
-    if select_ith_lines:
+    if str(file_name).lower().endswith('.npy'):
+        pcd = np.load(file_name, mmap_mode='r')
+        if select_ith_lines:
+            pcd = pcd[::max(1, int(ith_lines))]
+        xyz = np.asarray(pcd[:, :3])
+        rgb = np.asarray(pcd[:, 3:6])
+    elif select_ith_lines:
         pcd = np.array(load_selective_lines(file_name, ith_lines))
         xyz = pcd[1:, :3]
         rgb = pcd[1:, 3:6]
@@ -1246,6 +1250,10 @@ def identify_walls(pointcloud, pointcloud_resolution, minimum_wall_length, minim
                    maximum_wall_thickness, z_floor, z_ceiling, grid_coefficient=5, slab_polygon=None,
                    exterior_scan=False, exterior_walls_thickness=0.3):
     detector_v2 = os.environ.get('WALL_DETECTOR', 'v2').lower() == 'v2'
+    trace_v2_candidates = (
+        detector_v2 and
+        os.environ.get('WALL_V2_TRACE_CANDIDATES', '0') == '1'
+    )
     if pointcloud is None or len(pointcloud) == 0:
         return [], [], [], [], [], [], []
     x_coords, y_coords, z_coords = zip(*pointcloud)
@@ -1377,6 +1385,9 @@ def identify_walls(pointcloud, pointcloud_resolution, minimum_wall_length, minim
             wall_pair_has_vertical_support,
             deduplicate_overlapping_wall_axes,
             adjust_axis_intersections,
+            detect_articulated_leaf_walls,
+            keep_non_leaf_wall_indices,
+            keep_quality_wall_indices,
         )
         print("Merging co-linear evidence intervals (V2)")
         final_wall_segments = merge_collinear_fragments(
@@ -1398,6 +1409,15 @@ def identify_walls(pointcloud, pointcloud_resolution, minimum_wall_length, minim
         wall_labels = ['interior'] * len(parallel_groups)
         print('Wall detector V2: %d observed faces -> %d pairs, %d unpaired' %
               (len(final_wall_segments), len(parallel_groups), len(facade_wall_candidates)))
+        if trace_v2_candidates:
+            for candidate_index, candidate_pair in enumerate(parallel_groups):
+                candidate_axis, candidate_thickness = wall_axis_from_pair(
+                    candidate_pair)
+                print('WALL_V2_TRACE paired[%d] axis=%s thickness=%.4f' % (
+                    candidate_index,
+                    np.round(np.asarray(candidate_axis, dtype=float), 4).tolist(),
+                    candidate_thickness,
+                ))
     else:
         # Legacy detector retained for A/B comparison with WALL_DETECTOR=legacy.
         print("Merging the co-linear segments")
@@ -1444,6 +1464,8 @@ def identify_walls(pointcloud, pointcloud_resolution, minimum_wall_length, minim
 
     # --- Single-line walls: rescue unpaired observed faces (thin partitions and
     # glass seen from one side in interior-only scans). Toggle via env SINGLE_LINE. ---
+    centroid = (float(np.mean(points_2d[:, 0])),
+                float(np.mean(points_2d[:, 1])))
     if os.environ.get('SINGLE_LINE', '0') == '1':
         single_thk = float(os.environ.get('SINGLE_LINE_THK', 0.15))
         # single-line walls need a stricter, dedicated length gate: a one-sided
@@ -1451,7 +1473,6 @@ def identify_walls(pointcloud, pointcloud_resolution, minimum_wall_length, minim
         # full-height projection scatters everywhere.
         single_minlen = float(os.environ.get('SINGLE_LINE_MINLEN', 1.0))
         swollen_ids = {id(s) for s in swollen_polygon_segments}
-        centroid = (float(np.mean(points_2d[:, 0])), float(np.mean(points_2d[:, 1])))
         n_single = 0
         n_single_excluded = 0
         confirmed_double_line_groups = list(parallel_groups)
@@ -1489,8 +1510,13 @@ def identify_walls(pointcloud, pointcloud_resolution, minimum_wall_length, minim
         # deliberately after single-line rescue so its observed face is also
         # corrected even though the hidden face is synthetic.
         refine_context = build_refinement_context(
-            pointcloud, z_floor, z_ceiling,
+            pointcloud, z_min, z_max,
             max_points=int(os.environ.get('WALL_V2_REFINE_POINTS', '1000000')))
+        use_point_profile = os.environ.get(
+            'WALL_V2_POINT_PROFILE', '1') == '1'
+        if not use_point_profile:
+            print('Wall detector V2 ablation: original-point lateral profile '
+                  'disabled; raster profile only')
         parallel_groups = refine_face_pairs(
             parallel_groups, refine_context, pixel_size,
             minimum_wall_thickness, maximum_wall_thickness)
@@ -1504,7 +1530,9 @@ def identify_walls(pointcloud, pointcloud_resolution, minimum_wall_length, minim
         vertical_pair_diagnostics = []
         vertically_supported = []
         rejected_profiles = []
+        demoted_to_single = []
         for index, group in enumerate(parallel_groups):
+            require_two_faces = wall_labels[index] == 'interior'
             accepted, metrics = wall_pair_has_vertical_support(
                 group,
                 wall_grid_v2,
@@ -1517,8 +1545,49 @@ def identify_walls(pointcloud, pointcloud_resolution, minimum_wall_length, minim
                     'WALL_V2_MIN_TOP_FACE_COVERAGE', '0.25')),
                 minimum_persistent_coverage=float(os.environ.get(
                     'WALL_V2_MIN_PERSISTENT_FACE_COVERAGE', '0.10')),
+                require_two_faces=require_two_faces,
+                minimum_second_face_persistence=float(os.environ.get(
+                    'WALL_V2_MIN_SECOND_FACE_PERSISTENCE', '0.08')),
+                minimum_pair_coherence=float(os.environ.get(
+                    'WALL_V2_MIN_PAIR_COHERENCE', '0.08')),
+                minimum_paired_persistence=float(os.environ.get(
+                    'WALL_V2_MIN_PAIRED_PERSISTENCE', '0.05')),
+                context=refine_context if use_point_profile else None,
+                n_slices=n_slices,
+                longitudinal_bin_size=float(os.environ.get(
+                    'WALL_V2_LONGITUDINAL_BIN_M', '0.15')),
+                minimum_points_per_cell=max(1, int(os.environ.get(
+                    'WALL_V2_MIN_POINTS_PER_CELL', '2'))),
+                face_band=(
+                    float(os.environ['WALL_V2_FACE_BAND_M'])
+                    if 'WALL_V2_FACE_BAND_M' in os.environ else None
+                ),
             )
+            if (not accepted and require_two_faces and
+                    metrics.get('single_face_accepted', False)):
+                accepted_face = int(metrics.get('accepted_face', -1))
+                if accepted_face in (0, 1):
+                    _axis, fallback_thickness = wall_axis_from_pair(group)
+                    parallel_groups[index] = make_single_line_group_v2(
+                        group[accepted_face], fallback_thickness,
+                        wall_grid_v2, centroid)
+                    wall_labels[index] = 'single-fallback'
+                    metrics['review_status'] = 'AUTO_ACCEPTED_ONE_FACE'
+                    metrics['profile_decision'] = 'DEMOTED_TO_SINGLE'
+                    accepted = True
+                    demoted_to_single.append(index)
             if accepted:
+                if trace_v2_candidates:
+                    candidate_axis, candidate_thickness = wall_axis_from_pair(
+                        parallel_groups[index])
+                    print('WALL_V2_TRACE vertical[%d] accepted axis=%s '
+                          'thickness=%.4f score=%.3f' % (
+                              index,
+                              np.round(np.asarray(
+                                  candidate_axis, dtype=float), 4).tolist(),
+                              candidate_thickness,
+                              metrics['score'],
+                          ))
                 vertically_supported.append(index)
                 vertical_pair_scores.append(metrics['score'])
                 accepted_face = metrics['accepted_face']
@@ -1540,25 +1609,70 @@ def identify_walls(pointcloud, pointcloud_resolution, minimum_wall_length, minim
                     'top_coverage': float(metrics['top_coverage']),
                     'persistent_coverage': float(
                         metrics['persistent_coverage']),
+                    'second_face_persistent_coverage': float(
+                        metrics['second_face_persistent_coverage']),
+                    'paired_persistent_coverage': float(
+                        metrics['paired_persistent_coverage']),
+                    'pair_coherence': float(metrics['pair_coherence']),
+                    'upper_run_coverage': float(
+                        metrics['upper_run_coverage']),
+                    'profile_source': metrics.get(
+                        'profile_source', 'raster'),
+                    'profile_point_count': int(metrics.get(
+                        'profile_point_count', 0)),
+                    'measured_thickness': float(metrics.get(
+                        'measured_thickness', 0.0)),
+                    'thickness_mad': float(metrics.get(
+                        'thickness_mad', 0.0)),
+                    'face_rms': float(metrics.get('face_rms', 0.0)),
+                    'longitudinal_bins': int(metrics.get(
+                        'longitudinal_bins', 0)),
+                    'longitudinal_bin_size': float(metrics.get(
+                        'longitudinal_bin_size', 0.0)),
+                    'face_band': float(metrics.get('face_band', 0.0)),
+                    'raster_score': float(metrics.get('raster_score', 0.0)),
                     'detection_score': float(metrics['score']),
                     'layer_coverage': [
                         float(value) for value in selected_layers],
-                    'review_status': 'AUTO_ACCEPTED',
+                    'review_status': metrics.get(
+                        'review_status', 'AUTO_ACCEPTED'),
+                    'profile_decision': metrics.get(
+                        'profile_decision', 'ACCEPTED'),
                 })
             else:
+                if trace_v2_candidates:
+                    candidate_axis, candidate_thickness = wall_axis_from_pair(
+                        parallel_groups[index])
+                    print('WALL_V2_TRACE vertical[%d] rejected axis=%s '
+                          'thickness=%.4f score=%.3f' % (
+                              index,
+                              np.round(np.asarray(
+                                  candidate_axis, dtype=float), 4).tolist(),
+                              candidate_thickness,
+                              metrics['score'],
+                          ))
                 rejected_profiles.append((
                     index,
                     metrics['bottom_coverage'],
                     metrics['top_coverage'],
                     metrics['persistent_coverage'],
+                    metrics['second_face_persistent_coverage'],
+                    metrics['pair_coherence'],
+                    metrics['paired_persistent_coverage'],
                 ))
         if rejected_profiles:
             print('Wall detector V2: rejected %d face pairs with furniture-like '
-                  'vertical profiles (index: bottom/top/persistent)' %
+                  'multidirectional profiles '
+                  '(index: bottom/top/persistent/second/coherence/paired)' %
                   len(rejected_profiles))
             print('  ' + ', '.join(
-                '%d:%.2f/%.2f/%.2f' % profile
+                '%d:%.2f/%.2f/%.2f/%.2f/%.2f/%.2f' % profile
                 for profile in rejected_profiles))
+        if demoted_to_single:
+            print('Wall detector V2: preserved %d strong one-face candidate(s) '
+                  'as single-fallback: %s' % (
+                      len(demoted_to_single),
+                      ', '.join(str(index) for index in demoted_to_single)))
         parallel_groups = [
             parallel_groups[index] for index in vertically_supported]
         wall_labels = [
@@ -1575,6 +1689,20 @@ def identify_walls(pointcloud, pointcloud_resolution, minimum_wall_length, minim
             'bottom_coverage': 0.0,
             'top_coverage': 0.0,
             'persistent_coverage': 0.0,
+            'second_face_persistent_coverage': 0.0,
+            'paired_persistent_coverage': 0.0,
+            'pair_coherence': 0.0,
+            'upper_run_coverage': 0.0,
+            'profile_source': 'none',
+            'profile_point_count': 0,
+            'measured_thickness': 0.0,
+            'thickness_mad': 0.0,
+            'face_rms': 0.0,
+            'longitudinal_bins': 0,
+            'longitudinal_bin_size': 0.0,
+            'face_band': 0.0,
+            'raster_score': 0.0,
+            'profile_decision': 'NOT_SCORED',
             'detection_score': 0.0,
             'layer_coverage': [],
             'review_status': 'AUTO_ACCEPTED',
@@ -1615,6 +1743,20 @@ def identify_walls(pointcloud, pointcloud_resolution, minimum_wall_length, minim
             print('Wall detector V2: rejected %d compact wall-like objects '
                   '(minimum length/thickness ratio %.2f)' %
                   (compact_rejected, minimum_aspect))
+            if trace_v2_candidates:
+                valid_geometry_set = set(valid_geometry)
+                for candidate_index, (candidate_axis, candidate_thickness) in enumerate(
+                        zip(wall_axes, wall_thicknesses)):
+                    if candidate_index not in valid_geometry_set:
+                        print('WALL_V2_TRACE compact[%d] rejected axis=%s '
+                              'thickness=%.4f length=%.4f' % (
+                                  candidate_index,
+                                  np.round(np.asarray(
+                                      candidate_axis, dtype=float), 4).tolist(),
+                                  candidate_thickness,
+                                  distance_between_points(
+                                      candidate_axis[0], candidate_axis[1]),
+                              ))
     else:
         valid_geometry = [
             i for i, (axis, thickness) in enumerate(zip(wall_axes, wall_thicknesses))
@@ -1653,6 +1795,19 @@ def identify_walls(pointcloud, pointcloud_resolution, minimum_wall_length, minim
         if duplicate_count:
             print('Wall detector V2: removed %d overlapping parallel '
                   'duplicate wall(s)' % duplicate_count)
+            if trace_v2_candidates:
+                unique_axes_set = set(unique_axes)
+                for candidate_index, (candidate_axis, candidate_thickness) in enumerate(
+                        zip(wall_axes, wall_thicknesses)):
+                    if candidate_index not in unique_axes_set:
+                        print('WALL_V2_TRACE duplicate[%d] rejected axis=%s '
+                              'thickness=%.4f score=%.3f' % (
+                                  candidate_index,
+                                  np.round(np.asarray(
+                                      candidate_axis, dtype=float), 4).tolist(),
+                                  candidate_thickness,
+                                  vertical_pair_scores[candidate_index],
+                              ))
         wall_axes = [wall_axes[index] for index in unique_axes]
         wall_thicknesses = [
             wall_thicknesses[index] for index in unique_axes]
@@ -1663,6 +1818,69 @@ def identify_walls(pointcloud, pointcloud_resolution, minimum_wall_length, minim
             vertical_pair_scores[index] for index in unique_axes]
         vertical_pair_diagnostics = [
             vertical_pair_diagnostics[index] for index in unique_axes]
+
+        if os.environ.get('WALL_V2_PANEL_FILTER', '1') == '1':
+            candidate_ids = [
+                'candidate-%03d' % index for index in range(len(wall_axes))]
+            leaf_results = detect_articulated_leaf_walls(
+                wall_axes,
+                wall_thicknesses,
+                candidate_ids,
+                opening_anchors=[],
+                points=pointcloud,
+                z_floor=z_floor,
+                z_ceiling=z_ceiling,
+                wall_labels=wall_labels,
+                allow_unanchored=True,
+            )
+            non_leaf = keep_non_leaf_wall_indices(
+                len(wall_axes), leaf_results)
+            removed_leaf_count = len(wall_axes) - len(non_leaf)
+            if removed_leaf_count:
+                print('Wall detector V2: rejected %d articulated/floating '
+                      'panel(s): %s' % (
+                          removed_leaf_count,
+                          ', '.join(
+                              '%s[%s]' % (
+                                  result['wall_id'],
+                                  result.get('source', 'opening_anchor'))
+                              for result in leaf_results
+                              if result.get('suppress')),
+                      ))
+            wall_axes = [wall_axes[index] for index in non_leaf]
+            wall_thicknesses = [
+                wall_thicknesses[index] for index in non_leaf]
+            parallel_groups = [
+                parallel_groups[index] for index in non_leaf]
+            wall_labels = [wall_labels[index] for index in non_leaf]
+            vertical_pair_scores = [
+                vertical_pair_scores[index] for index in non_leaf]
+            vertical_pair_diagnostics = [
+                vertical_pair_diagnostics[index] for index in non_leaf]
+
+        quality_indices, quality_rejections = keep_quality_wall_indices(
+            wall_thicknesses,
+            wall_labels,
+            vertical_pair_diagnostics,
+            wall_axes=wall_axes,
+        )
+        if quality_rejections:
+            print('Wall detector V2: rejected %d low-quality wall pair(s): %s' % (
+                len(quality_rejections),
+                ', '.join(
+                    '%d[%s]' % (decision['wall_index'], decision['reason'])
+                    for decision in quality_rejections),
+            ))
+        wall_axes = [wall_axes[index] for index in quality_indices]
+        wall_thicknesses = [
+            wall_thicknesses[index] for index in quality_indices]
+        parallel_groups = [
+            parallel_groups[index] for index in quality_indices]
+        wall_labels = [wall_labels[index] for index in quality_indices]
+        vertical_pair_scores = [
+            vertical_pair_scores[index] for index in quality_indices]
+        vertical_pair_diagnostics = [
+            vertical_pair_diagnostics[index] for index in quality_indices]
     else:
         vertical_pair_diagnostics = [
             vertical_pair_diagnostics[i] for i in valid_geometry]
@@ -1777,6 +1995,12 @@ def identify_walls(pointcloud, pointcloud_resolution, minimum_wall_length, minim
         persistence = float(diagnostic.get('persistent_coverage', 0.0))
         if diagnostic.get('detector') == 'legacy':
             confidence = 'UNSCORED'
+        elif label == 'single-fallback':
+            confidence = (
+                'MEDIUM'
+                if top_coverage >= 0.50 and persistence >= 0.35
+                else 'LOW'
+            )
         elif top_coverage >= 0.50 and persistence >= 0.50:
             confidence = 'HIGH'
         elif top_coverage >= 0.35 and persistence >= 0.25:

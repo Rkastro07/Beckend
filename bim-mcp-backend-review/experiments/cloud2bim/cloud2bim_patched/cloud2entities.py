@@ -1,5 +1,7 @@
 import csv
 import json
+import os
+import sys
 
 from aux_functions import *
 from generate_ifc import IFCmodel
@@ -44,6 +46,48 @@ ifc_site_latitude = config["ifc_site_latitude"]
 ifc_site_longitude = config["ifc_site_longitude"]
 ifc_site_elevation = config["ifc_site_elevation"]
 material_for_objects = config["material_for_objects"]
+
+# Tiled Cloud-to-BIM only needs the geometric wall sidecar from each tile.
+# In this mode we deliberately skip the legacy opening/space passes and all
+# IFC authoring; the final model is authored once, after global stitching.
+geometry_only = os.environ.get('CLOUD2BIM_GEOMETRY_ONLY', '0') == '1'
+
+
+def write_wall_diagnostics(walls, all_openings, output='wall_diagnostics.csv'):
+    diagnostic_fields = [
+        'reference', 'storey', 'evidence_type', 'detector', 'confidence',
+        'review_status', 'length', 'thickness', 'start_x', 'start_y', 'end_x',
+        'end_y', 'height_layers', 'height_band_min', 'height_band_max',
+        'accepted_face', 'bottom_coverage', 'top_coverage',
+        'persistent_coverage', 'second_face_persistent_coverage',
+        'paired_persistent_coverage', 'pair_coherence', 'upper_run_coverage',
+        'profile_source', 'profile_decision', 'profile_point_count',
+        'measured_thickness', 'thickness_mad', 'face_rms',
+        'longitudinal_bins', 'longitudinal_bin_size', 'face_band', 'raster_score',
+        'detection_score', 'point_count',
+        'final_vertical_slices', 'opening_count',
+    ] + ['layer_%02d_coverage' % layer for layer in range(1, 13)]
+    with open(output, 'w', newline='', encoding='utf-8') as diagnostic_stream:
+        diagnostic_writer = csv.DictWriter(
+            diagnostic_stream, fieldnames=diagnostic_fields)
+        diagnostic_writer.writeheader()
+        for wall_record in walls:
+            diagnostic = dict(wall_record.get('diagnostics') or {})
+            layers = list(diagnostic.pop('layer_coverage', []) or [])
+            row = {
+                'reference': wall_record.get('reference'),
+                'storey': wall_record.get('storey'),
+                'evidence_type': wall_record.get('label'),
+                'opening_count': sum(
+                    opening['opening_wall_id'] == wall_record['wall_id']
+                    for opening in all_openings),
+                **diagnostic,
+            }
+            for layer, coverage in enumerate(layers, start=1):
+                if layer <= 12:
+                    row['layer_%02d_coverage' % layer] = coverage
+            diagnostic_writer.writerow({
+                field: row.get(field, '') for field in diagnostic_fields})
 
 # Optional contract from the interactive preview. Storeys present in this
 # file use exactly the approved axes; absent storeys keep automatic detection.
@@ -97,7 +141,11 @@ for xyz_filename in xyz_filenames:
                                                      ith_lines=dilution_factor)
     points_xyz = np.vstack((points_xyz, np.array(points_xyz_temp)))
     # points_rgb = np.vstack((points_rgb, np.array(points_rgb_temp)))
-points_xyz = np.round(points_xyz, 3)  # round the xyz coordinates to 3 decimals
+# Keep the source coordinates intact.  Rounding the complete cloud before
+# rasterisation can move points across pixel and height-slice boundaries; a
+# valid pair of wall faces may then disappear before the original-point TLS
+# refinement has a chance to measure it.
+points_xyz = np.asarray(points_xyz, dtype=float)
 last_time = log('All point cloud data imported.', last_time, log_filename)
 
 # SECTION: Segment Slabs and Split the Point Cloud to Storeys
@@ -109,6 +157,100 @@ slabs, horizontal_surface_planes = identify_slabs(points_xyz, points_rgb, bfs_th
                                                   tfs_thickness, z_step=0.15,
                                                   pc_resolution=pc_resolution,
                                                   plot_segmented_plane=False)  # plot with open 3D
+
+# Quando a geometria foi aprovada no editor, os níveis do histograma completo
+# são mais confiáveis que uma nova detecção na amostra comprimida. Sem este
+# contrato, uma amostra esparsa pode encontrar apenas o teto, produzir uma laje
+# isolada e, consequentemente, zero pavimentos/IfcWall.
+for storey_index, override in wall_overrides.items():
+    approved_model = override.get('modelo') or {}
+    approved_slab = approved_model.get('laje') or {}
+    contour = approved_slab.get('contorno') or []
+    vertical = override.get('vertical') or {}
+    if (len(contour) < 3
+            or vertical.get('floor_bottom_z') is None
+            or vertical.get('ceiling_bottom_z') is None):
+        continue
+
+    xs = [float(value[0]) for value in contour]
+    ys = [float(value[1]) for value in contour]
+    polygon = Polygon(list(zip(xs, ys)))
+    floor_cfg = approved_slab.get('piso') or {}
+    ceiling_cfg = approved_slab.get('teto') or {}
+
+    def _approved_slab_record(bottom_z, thickness):
+        return {
+            'polygon': polygon,
+            'polygon_x_coords': list(xs),
+            'polygon_y_coords': list(ys),
+            'components': [],
+            'slab_bottom_z_coord': float(bottom_z),
+            'thickness': float(thickness),
+            'detector': 'approved-editor-vertical',
+        }
+
+    while len(slabs) <= storey_index + 1:
+        slabs.append(_approved_slab_record(
+            vertical['ceiling_bottom_z'],
+            ceiling_cfg.get('espessura', tfs_thickness),
+        ))
+    slabs[storey_index] = _approved_slab_record(
+        vertical['floor_bottom_z'],
+        floor_cfg.get('espessura', bfs_thickness),
+    )
+    slabs[storey_index + 1] = _approved_slab_record(
+        vertical['ceiling_bottom_z'],
+        ceiling_cfg.get('espessura', tfs_thickness),
+    )
+
+# O detector continua propondo os niveis. Quando o cliente aprovou o modelo no
+# editor, o contorno/espessura/altura exibidos na previa passam a ser a fonte da
+# verdade para o pavimento selecionado.
+for storey_index, override in wall_overrides.items():
+    if not (0 <= storey_index < len(slabs) - 1):
+        continue
+    approved_model = override.get('modelo') or {}
+    approved_slab = approved_model.get('laje') or {}
+    contour = approved_slab.get('contorno') or []
+    if len(contour) >= 3:
+        xs = [float(value[0]) for value in contour]
+        ys = [float(value[1]) for value in contour]
+        for slab_index in (storey_index, storey_index + 1):
+            slabs[slab_index]['polygon_x_coords'] = list(xs)
+            slabs[slab_index]['polygon_y_coords'] = list(ys)
+            try:
+                slabs[slab_index]['polygon'] = Polygon(list(zip(xs, ys)))
+            except Exception:
+                pass
+    floor_cfg = approved_slab.get('piso') or {}
+    ceiling_cfg = approved_slab.get('teto') or {}
+    if floor_cfg.get('espessura') is not None:
+        slabs[storey_index]['thickness'] = float(floor_cfg['espessura'])
+    if ceiling_cfg.get('espessura') is not None:
+        slabs[storey_index + 1]['thickness'] = float(ceiling_cfg['espessura'])
+    slabs[storey_index]['skip_ifc'] = not bool(floor_cfg.get('ativo', True))
+    slabs[storey_index + 1]['skip_ifc'] = not bool(ceiling_cfg.get('ativo', True))
+    approved_cfg = override.get('config') or {}
+    approved_walls = approved_model.get('paredes') or []
+    approved_wall_tops = []
+    for approved_wall in approved_walls:
+        if approved_wall.get('altura') is None:
+            continue
+        approved_wall_tops.append(
+            float(approved_wall.get('elevacao', 0.0))
+            + float(approved_wall['altura']))
+    if approved_wall_tops:
+        # O teto segue o nivel predominante aprovado no editor. Isso evita que
+        # um valor global antigo descole a laje de todas as paredes individuais.
+        ceiling_height = float(np.median(approved_wall_tops))
+    elif approved_cfg.get('altura') is not None:
+        ceiling_height = float(approved_cfg['altura'])
+    else:
+        ceiling_height = None
+    if ceiling_height is not None:
+        floor_base = float(slabs[storey_index]['slab_bottom_z_coord'])
+        slabs[storey_index + 1]['slab_bottom_z_coord'] = (
+            floor_base + ceiling_height)
 
 # SECTION: Segment Walls and Classify Openings
 print("-" * 50)
@@ -142,6 +284,11 @@ for i, storey_pointcloud in enumerate(point_cloud_storeys):
     top_z_placement = slabs[i + 1]['slab_bottom_z_coord']
 
     wall_override = wall_overrides.get(i)
+    approved_model = (wall_override or {}).get('modelo') or {}
+    approved_wall_metadata = approved_model.get('paredes') or []
+    approved_cfg = (wall_override or {}).get('config') or {}
+    if wall_override is not None and approved_cfg.get('altura') is not None:
+        wall_height = float(approved_cfg['altura'])
     # aberturas aprovadas no editor: {eixo_idx: [ {tipo, s_centro, largura}, ... ]}
     override_openings_by_axis = {}
     # True só quando o cliente passou pelo editor (lista presente, mesmo vazia):
@@ -187,7 +334,7 @@ for i, storey_pointcloud in enumerate(point_cloud_storeys):
             storey_pointcloud, wall_axes, wall_thicknesses,
             z_placement, top_z_placement)
         # config de alturas (mesmos defaults do plantatobim)
-        _cfg = wall_override.get('config') or {}
+        _cfg = approved_cfg
         _porta_h = float(_cfg.get('porta_altura', 2.1))
         _jan_h = float(_cfg.get('janela_altura', 1.2))
         _jan_peit = float(_cfg.get('janela_peitoril', 1.0))
@@ -197,10 +344,13 @@ for i, storey_pointcloud in enumerate(point_cloud_storeys):
                 _s = float(_ab['s_centro'])
                 _w = float(_ab['largura'])
                 _tp = 'window' if str(_ab.get('tipo')) == 'window' else 'door'
+                _individual_h = float(_ab.get(
+                    'altura', _jan_h if _tp == 'window' else _porta_h))
                 if _tp == 'window':
-                    _zmin, _zmax = _jan_peit, _jan_peit + _jan_h
+                    _individual_sill = float(_ab.get('peitoril', _jan_peit))
+                    _zmin, _zmax = _individual_sill, _individual_sill + _individual_h
                 else:
-                    _zmin, _zmax = 0.0, _porta_h
+                    _zmin, _zmax = 0.0, _individual_h
                 override_openings_by_axis.setdefault(_idx, []).append(
                     ((_s - _w / 2, _s + _w / 2), (_zmin, _zmax), _tp))
             except (KeyError, ValueError, TypeError):
@@ -243,9 +393,19 @@ for i, storey_pointcloud in enumerate(point_cloud_storeys):
                 'layer_coverage': [],
             }
         )
+        approved_wall = (
+            approved_wall_metadata[j]
+            if j < len(approved_wall_metadata) else {})
+        approved_height = float(approved_wall.get('altura', wall_height))
+        # No editor Scan-to-BIM a cota individual e relativa ao piso visual
+        # (Z=0). Converte para a cota absoluta da nuvem somente na exportacao.
+        approved_elevation = (
+            float(z_placement) + float(approved_wall['elevacao'])
+            if approved_wall.get('elevacao') is not None
+            else float(z_placement))
         walls.append({'wall_id': wall_id, 'storey': i + 1, 'start_point': start_points[j], 'end_point': end_points[j],
-                      'thickness': wall_thicknesses[j], 'material': wall_materials[j], 'z_placement': z_placement,
-                      'height': wall_height, 'label': wall_labels[j],
+                      'thickness': wall_thicknesses[j], 'material': wall_materials[j], 'z_placement': approved_elevation,
+                      'height': approved_height, 'label': wall_labels[j],
                       'preview': wall_override is not None,
                       'reference': wall_reference,
                       'diagnostics': wall_diagnostic})
@@ -256,7 +416,7 @@ for i, storey_pointcloud in enumerate(point_cloud_storeys):
             opening_widths = [op[0] for op in override_openings_by_axis[j]]
             opening_heights = [op[1] for op in override_openings_by_axis[j]]
             opening_types = [op[2] for op in override_openings_by_axis[j]]
-        elif override_openings_manual:
+        elif override_openings_manual or geometry_only:
             # editor: parede aprovada mas sem esquadria marcada = sem abertura
             # (o cliente é a fonte da verdade das portas/janelas)
             opening_widths, opening_heights, opening_types = [], [], []
@@ -298,18 +458,60 @@ for i, storey_pointcloud in enumerate(point_cloud_storeys):
     # SECTION: Split the Storeys to Zones (Spaces in the IFC)
     print('Segmenting the storey to zones (spaces)...')
     print("-" * 50)
-    try:
-        # A Space may repair only a small corner/junction error; it must not
-        # bridge a missing wall.  The former 80 cm tolerance fabricated room
-        # closures that were not present in the detected wall graph.
-        space_max_snap = float(os.environ.get('SPACE_MAX_SNAP', '0.15'))
-        zones_in_storey = identify_zones(
-            walls, snapping_distance=space_max_snap, plot_zones=False)
-    except Exception as _ze:
-        # zonas sao acessorias: falha aqui nao pode derrubar o pipeline inteiro
-        print(f'[!] identify_zones falhou neste pavimento ({_ze}); seguindo sem spaces.')
+    if geometry_only:
         zones_in_storey = {}
+        print('[geometry-only] Space detection skipped.')
+    else:
+        try:
+            # A Space may repair only a small corner/junction error; it must not
+            # bridge a missing wall.  The former 80 cm tolerance fabricated room
+            # closures that were not present in the detected wall graph.
+            space_max_snap = float(os.environ.get('SPACE_MAX_SNAP', '0.15'))
+            approved_spaces = approved_model.get('spaces') or []
+            if wall_override is not None and approved_spaces:
+                zones_in_storey = {
+                    str(space.get('id') or 'SPACE-%03d' % (index + 1)): {
+                        'vertices': [tuple(value) for value in space.get('contorno', [])],
+                        'height': float(approved_cfg.get('altura', wall_height)),
+                        'area': float(space.get('area', 0.0)),
+                        'source': 'approved-editor-snapshot',
+                    }
+                    for index, space in enumerate(approved_spaces)
+                    if len(space.get('contorno', [])) >= 3
+                }
+            elif wall_override is not None:
+                # O editor pode enviar apenas as paredes aprovadas. Spaces sao
+                # derivados topologicos: rode o mesmo reconhecedor de ciclos sobre
+                # esses eixos em vez de fabricar um Space pelo contorno da laje.
+                zones_in_storey = identify_zones(
+                    walls, snapping_distance=space_max_snap, plot_zones=False)
+                print(
+                    '[space] reconhecimento automatico sobre paredes aprovadas: '
+                    f'{len(zones_in_storey)} comodo(s) fechado(s).'
+                )
+                if (bool((approved_cfg.get('forro') or {}).get('ativo', False))
+                        and not zones_in_storey):
+                    print(
+                        '[!] Forro solicitado, mas nenhuma area fechada foi '
+                        'reconhecida; nenhum Space geral sera inventado.'
+                    )
+            else:
+                zones_in_storey = identify_zones(
+                    walls, snapping_distance=space_max_snap, plot_zones=False)
+        except Exception as _ze:
+            # zonas sao acessorias: falha aqui nao pode derrubar o pipeline inteiro
+            print(f'[!] identify_zones falhou neste pavimento ({_ze}); seguindo sem spaces.')
+            zones_in_storey = {}
     zones.append(zones_in_storey)
+
+write_wall_diagnostics(walls, all_openings)
+if geometry_only:
+    last_time = log(
+        '\nGeometry-only wall diagnostics saved to wall_diagnostics.csv.',
+        last_time,
+        log_filename,
+    )
+    sys.exit(0)
 
 # SECTION: Generate IFC
 print("-" * 50)
@@ -341,16 +543,17 @@ for idx, slab in enumerate(slabs):
     points_no_duplicates = [list(pt) for pt in points_no_duplicates]
 
     # The create_slab function internally creates the slab placement, extrusion, and shape representation.
-    slab_entity = ifc_model.create_slab(
-        slab_name='Slab %d' % (idx + 1),
-        points=points_no_duplicates,
-        slab_z_position=round(slab['slab_bottom_z_coord'], 3),
-        slab_height=round(slab['thickness'], 3),
-        material_name=material_for_objects,
-        components=slab.get('components')
-    )
+    if not slab.get('skip_ifc', False):
+        slab_entity = ifc_model.create_slab(
+            slab_name='Slab %d' % (idx + 1),
+            points=points_no_duplicates,
+            slab_z_position=round(slab['slab_bottom_z_coord'], 3),
+            slab_height=round(slab['thickness'], 3),
+            material_name=material_for_objects,
+            components=slab.get('components')
+        )
 
-    ifc_model.assign_product_to_storey(slab_entity, storeys_ifc[-1])
+        ifc_model.assign_product_to_storey(slab_entity, storeys_ifc[-1])
 
     # IfcSpace initialization
     if idx < len(zones) and zones[idx]:  # this means there are some zones inside
@@ -372,9 +575,37 @@ for idx, slab in enumerate(slabs):
                     (idx + 1),
                     zone_number,
                     storeys_ifc[-1],
-                    space_clear_height
+                    space_clear_height,
+                    approved_name=(
+                        space_name
+                        if str(space_data.get('source', '')).startswith('approved-editor-')
+                        else None
+                    ),
                 )
                 ifc_model.assign_material(ifc_space, space_material)
+                storey_cfg = (wall_overrides.get(idx) or {}).get('config') or {}
+                forro_cfg = storey_cfg.get('forro') or {}
+                if bool(forro_cfg.get('ativo', False)):
+                    forro_thickness = max(0.01, float(forro_cfg.get('espessura', 0.03)))
+                    # A configuracao pode vir de outro pavimento. Nunca deixe
+                    # o forro atravessar ou flutuar acima da laje superior.
+                    available_height = float(space_clear_height)
+                    if available_height > forro_thickness + 0.01:
+                        max_forro_height = available_height - forro_thickness
+                        requested_height = float(forro_cfg.get(
+                            'altura', max_forro_height))
+                        forro_height = min(
+                            max(0.1, requested_height),
+                            max_forro_height,
+                        )
+                        ifc_model.create_covering(
+                            space_data,
+                            ifc_space_placement,
+                            'Forro-%s' % space_name,
+                            ifc_space,
+                            forro_height,
+                            forro_thickness,
+                        )
                 zone_number += 1
     else:
         continue
@@ -454,39 +685,6 @@ for i, stair_parts in enumerate(stairs):
     stair_name = f"Stair_{i+1:03}"
     stair = ifc_model.create_stair(stair_name, storeys_ifc[stair_parts[0]["storey"] - 1], stair_parts, stair_material)
 '''
-# Flat sidecar table with the same wall references used by the IFC and PNG.
-# This makes sorting suspicious cases possible without parsing IFC properties.
-diagnostic_fields = [
-    'reference', 'storey', 'evidence_type', 'detector', 'confidence',
-    'review_status', 'length', 'thickness', 'start_x', 'start_y', 'end_x',
-    'end_y', 'height_layers', 'height_band_min', 'height_band_max',
-    'accepted_face', 'bottom_coverage', 'top_coverage',
-    'persistent_coverage', 'detection_score', 'point_count',
-    'final_vertical_slices', 'opening_count',
-] + ['layer_%02d_coverage' % layer for layer in range(1, 13)]
-with open('wall_diagnostics.csv', 'w', newline='',
-          encoding='utf-8') as diagnostic_stream:
-    diagnostic_writer = csv.DictWriter(
-        diagnostic_stream, fieldnames=diagnostic_fields)
-    diagnostic_writer.writeheader()
-    for wall_record in walls:
-        diagnostic = dict(wall_record.get('diagnostics') or {})
-        layers = list(diagnostic.pop('layer_coverage', []) or [])
-        row = {
-            'reference': wall_record.get('reference'),
-            'storey': wall_record.get('storey'),
-            'evidence_type': wall_record.get('label'),
-            'opening_count': sum(
-                opening['opening_wall_id'] == wall_record['wall_id']
-                for opening in all_openings),
-            **diagnostic,
-        }
-        for layer, coverage in enumerate(layers, start=1):
-            if layer <= 12:
-                row['layer_%02d_coverage' % layer] = coverage
-        diagnostic_writer.writerow({
-            field: row.get(field, '') for field in diagnostic_fields})
-
 # Wall definition for IFC
 for wall in walls:
     wall_record = wall
@@ -572,6 +770,50 @@ for wall in walls:
             'PersistentCoverage',
             float(wall_diagnostic.get('persistent_coverage', 0.0))),
         ifc_model.create_property_single_value(
+            'SecondFacePersistentCoverage',
+            float(wall_diagnostic.get(
+                'second_face_persistent_coverage', 0.0))),
+        ifc_model.create_property_single_value(
+            'PairedPersistentCoverage',
+            float(wall_diagnostic.get(
+                'paired_persistent_coverage', 0.0))),
+        ifc_model.create_property_single_value(
+            'PairCoherence',
+            float(wall_diagnostic.get('pair_coherence', 0.0))),
+        ifc_model.create_property_single_value(
+            'UpperRunCoverage',
+            float(wall_diagnostic.get('upper_run_coverage', 0.0))),
+        ifc_model.create_property_single_value(
+            'ProfileSource',
+            wall_diagnostic.get('profile_source', 'none')),
+        ifc_model.create_property_single_value(
+            'ProfileDecision',
+            wall_diagnostic.get('profile_decision', 'NOT_SCORED')),
+        ifc_model.create_property_single_value(
+            'ProfilePointCount',
+            int(wall_diagnostic.get('profile_point_count', 0))),
+        ifc_model.create_property_single_value(
+            'MeasuredThickness',
+            float(wall_diagnostic.get('measured_thickness', 0.0))),
+        ifc_model.create_property_single_value(
+            'ThicknessMAD',
+            float(wall_diagnostic.get('thickness_mad', 0.0))),
+        ifc_model.create_property_single_value(
+            'FaceRMS',
+            float(wall_diagnostic.get('face_rms', 0.0))),
+        ifc_model.create_property_single_value(
+            'LongitudinalBins',
+            int(wall_diagnostic.get('longitudinal_bins', 0))),
+        ifc_model.create_property_single_value(
+            'LongitudinalBinSize',
+            float(wall_diagnostic.get('longitudinal_bin_size', 0.0))),
+        ifc_model.create_property_single_value(
+            'FaceBand',
+            float(wall_diagnostic.get('face_band', 0.0))),
+        ifc_model.create_property_single_value(
+            'RasterScore',
+            float(wall_diagnostic.get('raster_score', 0.0))),
+        ifc_model.create_property_single_value(
             'DetectionScore',
             float(wall_diagnostic.get('detection_score', 0.0))),
         ifc_model.create_property_single_value(
@@ -649,7 +891,9 @@ for wall in walls:
                                                            end_point, float(window_sill_height), float(offset_from_start))
             window_representation = ifc_model.opening_representation(window_extrusion)
             window_product_definition = ifc_model.product_definition_shape_opening(window_representation)
-            window = ifc_model.create_window(opening_placement[1], window_product_definition, opening_id)
+            window = ifc_model.create_window(
+                opening_placement[1], window_product_definition, opening_id,
+                overall_height=opening_height, overall_width=opening_width)
             window_type = ifc_model.create_window_type()
             ifc_model.create_rel_defines_by_type(window, window_type)
             ifc_model.create_rel_fills_element(wall_opening, window)
@@ -661,7 +905,9 @@ for wall in walls:
                                                          end_point, float(window_sill_height), float(offset_from_start))
             door_representation = ifc_model.opening_representation(door_extrusion)
             door_product_definition = ifc_model.product_definition_shape_opening(door_representation)
-            door = ifc_model.create_door(opening_placement[1], door_product_definition, opening_id)
+            door = ifc_model.create_door(
+                opening_placement[1], door_product_definition, opening_id,
+                overall_height=opening_height, overall_width=opening_width)
             ifc_model.create_rel_fills_element(wall_opening, door)
             ifc_model.assign_product_to_storey(door, storeys_ifc[current_story - 1])
             ifc_model.assign_material(door, door_material)

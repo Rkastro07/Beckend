@@ -10,7 +10,10 @@ mcp>=1.27,<2
 # Nuvem de pontos e geometria
 numpy
 scipy
+scikit-learn==1.7.2
 open3d
+laspy
+lazrs
 opencv-python
 scikit-image
 ifcopenshell
@@ -19,6 +22,7 @@ PyYAML
 matplotlib
 pandas
 Pillow
+pdfplumber
 tqdm
 e57
 

@@ -4,13 +4,50 @@ import {
   CheckCircle2, AlertCircle, Sparkles, ChevronRight, TrendingUp, PencilRuler,
 } from 'lucide-react';
 import {
-  scanUpload, scanLajes, scanParedes, scanEscadas, scanGerarIfc, scanJob, downloadUrl,
+  scanUpload, scanLajes, scanParedes, scanEscadas, scanHibrido, scanGerarIfc, scanJob, scanCloudPreview, downloadUrl,
   ScanUploadResult, ScanParedesResult, ScanLance, ScanAbertura, ScanFatias,
-  ModeloPlanta, PlantaConfig,
+  ScanHybridResult, ModeloPlanta, PlantaConfig,
 } from '../services/tools';
 import { PlantaEditor, ResultadoGeracao } from './PlantaEditor';
 
 type Fase = 1 | 2 | 3;
+
+type PerfilAutomatico = {
+  id: string;
+  zloFrac: number;
+  zhiFrac: number;
+  minLen: number;
+  contoursAll: boolean;
+  singleMinlen: number;
+};
+
+// Perfis internos do Detector V2. Eles cobrem nuvens com paredes completas,
+// mobiliario/oclusao e plantas predominantemente desenhadas em linha unica.
+// A interface nunca pede que o cliente escolha estes valores.
+const PERFIS_AUTOMATICOS: PerfilAutomatico[] = [
+  { id: 'padrao',   zloFrac: 0.10, zhiFrac: 0.90, minLen: 0.30, contoursAll: true,  singleMinlen: 1.50 },
+  { id: 'linha',    zloFrac: 0.08, zhiFrac: 0.92, minLen: 0.20, contoursAll: true,  singleMinlen: 0.80 },
+  { id: 'oclusao',  zloFrac: 0.22, zhiFrac: 0.78, minLen: 0.20, contoursAll: true,  singleMinlen: 1.00 },
+  { id: 'baixo',    zloFrac: 0.04, zhiFrac: 0.58, minLen: 0.20, contoursAll: true,  singleMinlen: 0.80 },
+  { id: 'envoltoria', zloFrac: 0.08, zhiFrac: 0.92, minLen: 0.25, contoursAll: false, singleMinlen: 1.00 },
+];
+
+const comprimentoTotal = (r: ScanParedesResult) => r.eixos.reduce(
+  (s, e) => s + Math.hypot(e[2] - e[0], e[3] - e[1]), 0);
+
+// Prefere cobertura arquitetonica util, sem premiar centenas de fragmentos.
+const pontuarLeitura = (r: ScanParedesResult) => {
+  const comprimentos = r.eixos
+    .map((e) => Math.hypot(e[2] - e[0], e[3] - e[1]))
+    .filter((v) => Number.isFinite(v) && v > 0);
+  const uteis = comprimentos.filter((v) => v >= 0.45);
+  const curtos = comprimentos.length - uteis.length;
+  const excesso = Math.max(0, comprimentos.length - 220);
+  return uteis.reduce((s, v) => s + Math.min(v, 20), 0)
+    + Math.min(uteis.length, 120) * 0.65
+    - curtos * 0.35
+    - excesso * 1.5;
+};
 
 /**
  * Scan -> BIM em 3 FASES (fluxo proposto pelo Rafael): cada fase mostra o que
@@ -24,7 +61,9 @@ export const ScanToBim: React.FC = () => {
   const [busy, setBusy] = useState(false);
   const [erro, setErro] = useState<string | null>(null);
   const [up, setUp] = useState<ScanUploadResult | null>(null);
-  const [fase, setFase] = useState<Fase>(1);
+  // As fases continuam existindo internamente, mas o cliente entra direto na
+  // aprovação visual do Detector V2. Thresholds não fazem parte do produto.
+  const [fase, setFase] = useState<Fase>(2);
 
   // fase 1 — lajes
   const [thr, setThr] = useState(0.3);
@@ -39,10 +78,12 @@ export const ScanToBim: React.FC = () => {
   const [contoursAll, setContoursAll] = useState(true);
   const [preview, setPreview] = useState<ScanParedesResult | null>(null);
   const [carregando, setCarregando] = useState(false);
+  const [perfilAutomatico, setPerfilAutomatico] = useState<PerfilAutomatico>(PERFIS_AUTOMATICOS[0]);
+  const [tentativaAutomatica, setTentativaAutomatica] = useState(0);
 
   // fase 2 — classificacao multi-fatia (porta/janela por assinatura vertical)
   // faixas em fracao do pe-direito; defaults = joelho / meio / sob a laje
-  const [multiFatia, setMultiFatia] = useState(false);
+  const [multiFatia, setMultiFatia] = useState(true);
   const [fBaixa, setFBaixa] = useState<[number, number]>([0.10, 0.25]);
   const [fMedia, setFMedia] = useState<[number, number]>([0.40, 0.60]);
   const [fAlta, setFAlta] = useState<[number, number]>([0.80, 0.92]);
@@ -58,13 +99,19 @@ export const ScanToBim: React.FC = () => {
   const [ifcUrl, setIfcUrl] = useState<string | null>(null);
   const [detalhes, setDetalhes] = useState<Record<string, string> | null>(null);
 
+  // revisão híbrida: geometria heurística em tiles + YOLO + classificador ML
+  const [hybridJob, setHybridJob] = useState<string | null>(null);
+  const [hybridEtapa, setHybridEtapa] = useState('');
+  const [hybridResult, setHybridResult] = useState<ScanHybridResult | null>(null);
+
   // finalizacao opcional no editor (portas/janelas/teto)
   const [modeloEditor, setModeloEditor] = useState<ModeloPlanta | null>(null);
 
   // ---------- upload ----------
   const onFile = async (f: File) => {
     setBusy(true); setErro(null); setUp(null); setPreview(null);
-    setIfcUrl(null); setDetalhes(null); setLances(null); setFase(1);
+    setIfcUrl(null); setDetalhes(null); setLances(null); setFase(2);
+    setHybridJob(null); setHybridEtapa(''); setHybridResult(null);
     try {
       const r = await scanUpload(f);
       setUp(r); setThr(r.thr_sugerido);
@@ -96,14 +143,41 @@ export const ScanToBim: React.FC = () => {
     timer2.current = window.setTimeout(async () => {
       const [b0, b1] = bandas[bandaIdx];
       const minha = ++seq2.current;
-      const cfg = `pav ${bandaIdx + 1} · fatia ${(zloFrac * 100).toFixed(0)}–${(zhiFrac * 100).toFixed(0)}% · mín ${minLen.toFixed(2)}m`;
       try {
-        const r = await scanParedes(up.sid, b0, b1, zloFrac, zhiFrac, minLen, contoursAll,
-                                    multiFatia ? fatias : undefined);
-        if (seq2.current !== minha) return;      // chegou atrasada: ignora
-        setPreview(r); setCfgPreview(cfg); setErro(null);
+        let melhor: { resultado: ScanParedesResult; perfil: PerfilAutomatico; pontos: number } | null = null;
+        const diagonal = Math.hypot(up.extent[0] || 0, up.extent[1] || 0);
+
+        for (let i = 0; i < PERFIS_AUTOMATICOS.length; i += 1) {
+          if (seq2.current !== minha) return;
+          const perfil = PERFIS_AUTOMATICOS[i];
+          setTentativaAutomatica(i + 1);
+          const resultado = await scanParedes(
+            up.sid, b0, b1,
+            perfil.zloFrac, perfil.zhiFrac, perfil.minLen, perfil.contoursAll,
+            multiFatia ? fatias : undefined,
+            perfil.singleMinlen,
+          );
+          const pontos = pontuarLeitura(resultado);
+          if (!melhor || pontos > melhor.pontos) melhor = { resultado, perfil, pontos };
+
+          // Uma leitura que ja cobre uma parcela plausivel da planta nao precisa
+          // pagar o custo dos perfis de recuperacao.
+          if (resultado.n_paredes >= 4
+              && comprimentoTotal(resultado) >= Math.max(8, diagonal * 0.65)) break;
+        }
+
+        if (seq2.current !== minha || !melhor) return;
+        setPreview(melhor.resultado);
+        setPerfilAutomatico(melhor.perfil);
+        setCfgPreview(`Leitura automática · perfil ${melhor.perfil.id}`);
+        setErro(null);
       } catch (e: any) { if (seq2.current === minha) setErro(e.message); }
-      finally { if (seq2.current === minha) setCarregando(false); }
+      finally {
+        if (seq2.current === minha) {
+          setCarregando(false);
+          setTentativaAutomatica(0);
+        }
+      }
     }, 350);
     return () => { if (timer2.current) window.clearTimeout(timer2.current); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -138,31 +212,125 @@ export const ScanToBim: React.FC = () => {
         const st = await scanJob(job);
         setJobEtapa(st.etapa || '');
         if (st.detalhes) setDetalhes(st.detalhes);
-        if (st.status === 'pronto') { setIfcUrl(st.url || null); setJob(null); }
+        if (st.status === 'pronto') {
+          setIfcUrl(st.url || null);
+          setJob(null);
+        }
         if (st.status === 'erro') { setErro(st.erro || 'Falha na geração'); setJob(null); }
       } catch { /* tenta de novo */ }
     }, 2500);
     return () => window.clearInterval(h);
   }, [job]);
 
+  useEffect(() => {
+    if (!hybridJob) return;
+    const h = window.setInterval(async () => {
+      try {
+        const st = await scanJob(hybridJob);
+        setHybridEtapa(st.etapa || 'Processando');
+        if (st.status === 'pronto') {
+          if (!st.hybrid) throw new Error('O backend não devolveu a revisão híbrida.');
+          setHybridResult(st.hybrid);
+          setHybridJob(null);
+        }
+        if (st.status === 'erro') {
+          setErro(st.erro || 'Falha na análise híbrida');
+          setHybridJob(null);
+        }
+      } catch (e: any) {
+        setErro(e.message || 'Falha ao consultar a análise híbrida');
+        setHybridJob(null);
+      }
+    }, 2000);
+    return () => window.clearInterval(h);
+  }, [hybridJob]);
+
+  const rodarHibrido = async () => {
+    if (!up || hybridJob) return;
+    const selectedBand = bandas[bandaIdx];
+    if (!selectedBand) {
+      setErro('Nenhum pavimento disponível para a análise híbrida.');
+      return;
+    }
+    setErro(null);
+    setHybridResult(null);
+    setHybridEtapa('Enviando para o pipeline híbrido');
+    try {
+      const response = await scanHibrido(up.sid, selectedBand[0], selectedBand[1]);
+      setHybridJob(response.job);
+    } catch (e: any) {
+      setErro(e.message || 'Falha ao iniciar a análise híbrida');
+    }
+  };
+
   const gerar = async () => {
     if (!up || carregando || !preview) return;
     setErro(null); setIfcUrl(null); setDetalhes(null);
+    setCarregando(true);
     try {
-      const r = await scanGerarIfc(up.sid, thr, zloFrac, zhiFrac, 1.5, minLen,
-                                   contoursAll, areaMin, bandaIdx, preview.eixos);
+      const r = await scanGerarIfc(
+        up.sid, thr,
+        perfilAutomatico.zloFrac, perfilAutomatico.zhiFrac,
+        perfilAutomatico.singleMinlen, perfilAutomatico.minLen,
+        perfilAutomatico.contoursAll,
+        areaMin, bandaIdx,
+        preview.eixos,
+      );
       setJob(r.job); setJobEtapa('pipeline');
     } catch (e: any) { setErro(e.message); }
+    finally { setCarregando(false); }
   };
 
   // ---- finalização opcional: paredes aprovadas -> ModeloPlanta do editor ----
   const abrirEditor = () => {
     if (!preview) return;
     const [xmin, ymin, xmax, ymax] = preview.bounds;
+    const [storeyBase, storeyTop] = bandas[bandaIdx] ?? [0, 2.8];
+    const observedHeight = Math.max(0.1, storeyTop - storeyBase);
     const paredes = preview.eixos.map((e, i) => ({
       id: `w${i}`, ax: e[0], ay: e[1], bx: e[2], by: e[3],
-      espessura: e[4], layer: e[5],
+      espessura: e[4], layer: e[5], altura: observedHeight,
     }));
+    const aberturas = (preview.classificacao ?? [])
+      .filter((trecho) => trecho[4] === 'porta' || trecho[4] === 'janela')
+      .map((trecho, index) => {
+        const eixoIdx = trecho[5];
+        const parede = paredes[eixoIdx];
+        if (!parede) return null;
+        const dx = parede.bx - parede.ax;
+        const dy = parede.by - parede.ay;
+        const comprimento = Math.hypot(dx, dy);
+        const largura = Math.hypot(trecho[2] - trecho[0], trecho[3] - trecho[1]);
+        if (comprimento < 0.05 || largura < 0.40) return null;
+        const ux = dx / comprimento;
+        const uy = dy / comprimento;
+        const centroX = (trecho[0] + trecho[2]) / 2;
+        const centroY = (trecho[1] + trecho[3]) / 2;
+        const sCentro = Math.min(
+          comprimento - largura / 2,
+          Math.max(largura / 2,
+            (centroX - parede.ax) * ux + (centroY - parede.ay) * uy),
+        );
+        const tipo = trecho[4] === 'janela' ? 'window' as const : 'door' as const;
+        const peitoril = tipo === 'window'
+          ? Math.min(1.0, Math.max(0.45, observedHeight * 0.35))
+          : 0;
+        const altura = tipo === 'window'
+          ? Math.min(1.20, Math.max(0.40, observedHeight - peitoril - 0.15))
+          : Math.min(2.10, Math.max(0.60, observedHeight - 0.10));
+        return {
+          id: `O-SCAN-${String(index + 1).padStart(3, '0')}`,
+          parede_id: parede.id,
+          tipo,
+          s_centro: sCentro,
+          largura: Math.min(largura, comprimento),
+          altura,
+          peitoril,
+          origem: 'scan-multifatia',
+          confidence: 0.65,
+        };
+      })
+      .filter((abertura): abertura is NonNullable<typeof abertura> => abertura !== null);
     const contorno: [number, number][] =
       preview.contorno_teto && preview.contorno_teto.length >= 3
         ? preview.contorno_teto
@@ -171,16 +339,85 @@ export const ScanToBim: React.FC = () => {
       escala: 1, single_line: false, nome: 'scan',
       bbox: { xmin, ymin, xmax, ymax },
       diagnostico: { sobras: 0, cantos_costurados: 0, blocos_esquadria: 0 },
-      paredes, aberturas: [],
+      paredes, aberturas,
       laje: { contorno, piso: { ativo: true, espessura: 0.15 },
-              teto: { ativo: false, espessura: 0.15 } },
+              teto: { ativo: true, espessura: 0.15 } },
+    });
+  };
+
+  const abrirEditorHibrido = () => {
+    if (!hybridResult) return;
+    const [xmin, ymin, xmax, ymax] = hybridResult.bounds;
+    const observedHeight = Math.max(
+      0.30, hybridResult.ceiling_z - hybridResult.floor_z);
+    const paredes = hybridResult.walls.map((wall) => ({
+      id: wall.id,
+      ax: wall.ax, ay: wall.ay, bx: wall.bx, by: wall.by,
+      espessura: wall.espessura,
+      layer: 'scan-hybrid',
+      altura: observedHeight,
+      elevacao: hybridResult.floor_z,
+      origem: 'scan-hybrid-ml',
+      confidence: wall.wall_probability,
+      ml_status: wall.ml_class,
+      ml_probability: wall.ml_probability,
+      ml_proposed_keep: wall.proposed_keep,
+    }));
+    const wallById = new Map(paredes.map((wall) => [wall.id, wall]));
+    const aberturas = hybridResult.openings.flatMap((opening) => {
+      const wall = wallById.get(opening.wall_id);
+      if (!wall) return [];
+      const length = Math.hypot(wall.bx - wall.ax, wall.by - wall.ay);
+      const width = Math.min(Math.max(0.20, opening.width), length);
+      const center = Math.min(
+        Math.max(width / 2, opening.s_center),
+        Math.max(width / 2, length - width / 2),
+      );
+      return [{
+        id: opening.id,
+        parede_id: opening.wall_id,
+        tipo: opening.class,
+        s_centro: center,
+        largura: width,
+        altura: opening.height,
+        peitoril: opening.class === 'window' ? opening.sill : 0,
+        origem: 'scan-hybrid-yolo',
+        confidence: opening.confidence,
+      }];
+    });
+    const contorno: [number, number][] =
+      preview?.contorno_teto && preview.contorno_teto.length >= 3
+        ? preview.contorno_teto
+        : [[xmin, ymin], [xmax, ymin], [xmax, ymax], [xmin, ymax]];
+    setModeloEditor({
+      escala: 1,
+      single_line: false,
+      nome: 'scan-hybrid-review',
+      bbox: { xmin, ymin, xmax, ymax },
+      diagnostico: {
+        sobras: hybridResult.counts.proposed_remove,
+        cantos_costurados: 0,
+        blocos_esquadria: hybridResult.counts.openings,
+      },
+      paredes,
+      aberturas,
+      laje: {
+        contorno,
+        piso: { ativo: true, espessura: 0.15 },
+        teto: { ativo: true, espessura: 0.15 },
+      },
     });
   };
 
   // gerador do editor: as PAREDES e as portas/janelas EDITADAS na tela viram
   // overrides na cadeia cloud2bim (o IFC = exatamente o que o cliente desenhou)
   const gerarDoEditor = async (
-    modelo: { paredes: any[]; aberturas: any[] }, cfg: PlantaConfig,
+    modelo: {
+      paredes: any[];
+      aberturas: any[];
+      laje: ModeloPlanta['laje'];
+      spaces?: ModeloPlanta['spaces'];
+    }, cfg: PlantaConfig,
   ): Promise<ResultadoGeracao> => {
     if (!up || !preview) throw new Error('sessão do scan expirada');
     if (!modelo.paredes.length) throw new Error('nenhuma parede no editor');
@@ -195,12 +432,22 @@ export const ScanToBim: React.FC = () => {
       .map((a) => {
         const eixo_idx = idxDaParede.get(String(a.parede_id));
         return eixo_idx === undefined ? null
-          : { eixo_idx, tipo: a.tipo, s_centro: a.s_centro, largura: a.largura };
+          : {
+              eixo_idx,
+              tipo: a.tipo,
+              s_centro: a.s_centro,
+              largura: a.largura,
+              altura: a.altura,
+              peitoril: a.tipo === 'window' ? a.peitoril : 0,
+            };
       })
       .filter((a): a is ScanAbertura => a !== null);
     const { job: jid } = await scanGerarIfc(
-      up.sid, thr, zloFrac, zhiFrac, 1.5, minLen, contoursAll,
-      areaMin, bandaIdx, eixos, aberturas, cfg);
+      up.sid, thr,
+      perfilAutomatico.zloFrac, perfilAutomatico.zhiFrac,
+      perfilAutomatico.singleMinlen, perfilAutomatico.minLen,
+      perfilAutomatico.contoursAll,
+      areaMin, bandaIdx, eixos, aberturas, cfg, modelo);
     setJob(null);  // este fluxo tem poll próprio (resolve a Promise do editor)
     return await new Promise((resolve, reject) => {
       const h = window.setInterval(async () => {
@@ -251,11 +498,18 @@ export const ScanToBim: React.FC = () => {
         onGerar={gerarDoEditor}
         ocultarPreviewPly
         titulo="Finalizar planta do scan"
-        subtitulo="Edite paredes, portas e janelas EM CIMA do mapa da nuvem captada; o tracejado é a leitura do teto. Depois gere o IFC."
+        subtitulo="Revise paredes, portas e janelas sobre a nuvem. No fluxo híbrido: verde = parede, laranja = folha, vermelho = falso candidato e cinza = incerto. Nada é removido sem sua confirmação."
         onVoltar={() => setModeloEditor(null)}
         rotuloVoltar="Voltar às paredes"
         backdropPng={preview?.png}
         backdropBounds={preview?.bounds}
+        // A base visual e a face inferior da laje do pavimento. Usar banda[0]
+        // zerava pelo topo da laje e deixava a propria espessura abaixo do grid.
+        loadPointCloud={() => scanCloudPreview(
+          up.sid,
+          120_000,
+          lajes[bandaIdx]?.[0] ?? banda?.[0] ?? 0,
+        )}
       />
     );
   }
@@ -264,56 +518,54 @@ export const ScanToBim: React.FC = () => {
     <div className="flex flex-col h-full">
       <div className="px-8 pt-6 flex items-end justify-between">
         <Cabecalho />
-        {/* stepper */}
-        <div className="flex items-center gap-1 text-xs">
-          {([['1', 'Lajes'], ['2', 'Paredes'], ['3', 'Escadas']] as const).map(([n, nome], i) => (
-            <React.Fragment key={n}>
-              {i > 0 && <ChevronRight className="w-3.5 h-3.5 text-slate-300" />}
-              <button onClick={() => setFase(+n as Fase)}
-                className={`px-3 py-1.5 rounded-lg font-medium transition-colors
-                  ${fase === +n ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>
-                {n}. {nome}
-              </button>
-            </React.Fragment>
-          ))}
+        <div className={`flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium
+          ${carregando || hybridJob ? 'bg-blue-50 text-blue-700'
+            : preview && !preview.eixos.length ? 'bg-amber-50 text-amber-700'
+            : 'bg-emerald-50 text-emerald-700'}`}>
+          {carregando || hybridJob
+            ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            : preview && !preview.eixos.length
+              ? <AlertCircle className="h-3.5 w-3.5" />
+              : <CheckCircle2 className="h-3.5 w-3.5" />}
+          {hybridJob ? `Pipeline híbrido · ${hybridEtapa}`
+            : carregando ? 'Detector V2 analisando'
+            : preview && !preview.eixos.length ? 'Revisão necessária'
+            : hybridResult ? 'Revisão híbrida pronta'
+            : 'Detector V2 automático'}
         </div>
       </div>
 
       <div className="flex-1 flex gap-4 px-8 pb-6 pt-4 min-h-0">
         {/* ================= VISUAL ================= */}
         <div className="flex-1 bg-white rounded-xl border border-slate-200 relative overflow-hidden">
-          {carregando && (
+          {(carregando || hybridJob) && (
             <div className="absolute top-3 right-3 z-10">
               <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />
             </div>
           )}
 
-          {fase === 1 && <HistogramaLajes zHist={up.z_hist} lajes={lajes} />}
-
-          {fase === 2 && (preview ? (
+          {hybridResult ? (
+            <img
+              src={downloadUrl(hybridResult.png_url)}
+              alt="Revisão híbrida ML e heurística"
+              className="h-full w-full object-contain bg-slate-50"
+            />
+          ) : preview ? (
             <SvgPlanta preview={preview} lances={null} />
           ) : (
-            <Vazio msg={bandas.length ? 'Calculando preview...' : 'Nenhum pavimento — reduza o threshold na fase 1'} />
-          ))}
-
-          {fase === 3 && (preview ? (
-            <SvgPlanta preview={preview} lances={lances} />
-          ) : (
-            <Vazio msg="Passe pela fase 2 primeiro (o fundo da planta vem de lá)" />
-          ))}
+            <Vazio msg={bandas.length ? 'Detector V2 analisando a planta...' : 'Nenhum pavimento detectado automaticamente'} />
+          )}
 
           <div className="absolute bottom-3 left-3 text-[11px] text-slate-500 bg-white/85 rounded px-2 py-1">
-            {fase === 1 && `${lajes.length} nível(is) de laje → ${bandas.length} pavimento(s)`}
-            {fase === 2 && preview && (
+            {hybridResult ? (
+              <><span className="font-semibold text-emerald-700">ML + heurística</span>
+                {' '}· {hybridResult.counts.input_walls} candidatos
+                {' '}· {hybridResult.counts.openings} aberturas</>
+            ) : preview ? (
               <><span className="text-red-600 font-semibold">{preview.n_paredes ?? 0} paredes</span>
                 {' '}· <span className="text-slate-400">{preview.n_segmentos} contornos</span>
-                {' '}· <span className="text-amber-600">âmbar = single-line</span>
-                {cfgPreview && <span className="text-slate-400"> · desenho de: {cfgPreview}</span>}</>
-            )}
-            {fase === 3 && lances && (
-              <><span className="text-emerald-700 font-semibold">{lances.length} lance(s) de escada</span>
-                {cfgPreview && <span className="text-slate-400"> · fundo de: {cfgPreview}</span>}</>
-            )}
+                {' '}· <span className="text-amber-600">âmbar = linha única</span></>
+            ) : `${lajes.length} nível(is) · ${bandas.length} pavimento(s)`}
           </div>
         </div>
 
@@ -324,7 +576,41 @@ export const ScanToBim: React.FC = () => {
             {up.n_pontos.toLocaleString()} pontos · {up.extent[0]}×{up.extent[1]}×{up.extent[2]} m
           </div>
 
-          {fase === 1 && (
+          <Painel titulo="Detector V2 automático" icone={<ScanLine className="w-4 h-4 text-emerald-600" />}>
+            <div className="rounded-lg bg-emerald-50 px-3 py-2 text-[11px] text-emerald-800">
+              Lajes, paredes e candidatos a aberturas são calculados automaticamente.
+              Corrija as exceções no editor 2D/3D.
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-center">
+              <div className="rounded-lg bg-slate-50 px-2 py-2">
+                <div className="text-base font-semibold text-slate-800">{bandas.length}</div>
+                <div className="text-[10px] text-slate-500">pavimentos</div>
+              </div>
+              <div className="rounded-lg bg-slate-50 px-2 py-2">
+                <div className="text-base font-semibold text-slate-800">{preview?.n_paredes ?? '—'}</div>
+                <div className="text-[10px] text-slate-500">paredes detectadas</div>
+              </div>
+            </div>
+            {carregando && (
+              <div className="flex items-center gap-2 text-[11px] text-blue-600">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                {tentativaAutomatica
+                  ? `Validando leitura automática (${tentativaAutomatica}/${PERFIS_AUTOMATICOS.length})…`
+                  : 'Atualizando leitura automática…'}
+              </div>
+            )}
+            {!carregando && preview && (
+              <div className="text-[10px] text-slate-400">{cfgPreview}</div>
+            )}
+            {!carregando && preview && !preview.eixos.length && (
+              <div className="rounded-lg bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
+                Nenhuma parede passou pela validação automática. Abra o editor
+                para desenhar sobre a planta captada, sem regular thresholds.
+              </div>
+            )}
+          </Painel>
+
+          {false && fase === 1 && (
             <Painel titulo="Fase 1 — Lajes / pavimentos" icone={<Layers className="w-4 h-4 text-blue-600" />}>
               <Slider label={`Threshold de laje: ${thr.toFixed(2)}`}
                       min={0.1} max={0.6} step={0.05} value={thr} onChange={setThr} />
@@ -349,7 +635,7 @@ export const ScanToBim: React.FC = () => {
             </select>
           )}
 
-          {fase === 2 && (
+          {false && fase === 2 && (
             <Painel titulo="Fase 2 — Paredes" icone={<ScanLine className="w-4 h-4 text-blue-600" />}>
               <Slider label={`Base da fatia: ${(zloFrac * 100).toFixed(0)}% do pé-direito`}
                       min={0} max={0.8} step={0.05} value={zloFrac} onChange={setZloFrac} />
@@ -398,7 +684,7 @@ export const ScanToBim: React.FC = () => {
             </Painel>
           )}
 
-          {fase === 3 && (
+          {false && fase === 3 && (
             <Painel titulo="Fase 3 — Escadas" icone={<TrendingUp className="w-4 h-4 text-blue-600" />}>
               <Slider label={`Sensibilidade (área mín.): ${areaMin.toFixed(1)} m²`}
                       min={0.4} max={3} step={0.2} value={areaMin} onChange={setAreaMin} />
@@ -418,20 +704,77 @@ export const ScanToBim: React.FC = () => {
             </Painel>
           )}
 
-          <button onClick={gerar} disabled={!!job || !bandas.length || carregando || !preview}
+          <Painel titulo="ML + heurística em blocos" icone={<Sparkles className="w-4 h-4 text-violet-600" />}>
+            <div className="rounded-lg bg-violet-50 px-3 py-2 text-[11px] text-violet-800">
+              A heurística preserva escala e geometria; o YOLO encontra portas e
+              janelas; a ML colore paredes suspeitas para confirmação no editor.
+            </div>
+            {hybridResult ? (
+              <>
+                <div className="grid grid-cols-3 gap-1.5 text-center">
+                  <div className="rounded-lg bg-emerald-50 px-1 py-2">
+                    <div className="font-semibold text-emerald-700">{hybridResult.counts.wall}</div>
+                    <div className="text-[9px] text-emerald-700">paredes</div>
+                  </div>
+                  <div className="rounded-lg bg-amber-50 px-1 py-2">
+                    <div className="font-semibold text-amber-700">{hybridResult.counts.door_leaf}</div>
+                    <div className="text-[9px] text-amber-700">folhas</div>
+                  </div>
+                  <div className="rounded-lg bg-rose-50 px-1 py-2">
+                    <div className="font-semibold text-rose-700">{hybridResult.counts.non_wall}</div>
+                    <div className="text-[9px] text-rose-700">não-paredes</div>
+                  </div>
+                </div>
+                <div className="text-[10px] text-slate-500">
+                  {hybridResult.counts.doors} portas · {hybridResult.counts.windows} janelas
+                  {' '}· {hybridResult.elapsed_seconds.toFixed(1)} s
+                </div>
+                <div className="flex gap-2 text-[10px]">
+                  <a href={downloadUrl(hybridResult.png_url)} download
+                    className="text-violet-700 hover:underline">PNG</a>
+                  <a href={downloadUrl(hybridResult.predictions_url)} download
+                    className="text-violet-700 hover:underline">Decisões JSON</a>
+                  <a href={downloadUrl(hybridResult.model_url)} download
+                    className="text-violet-700 hover:underline">Modelo JSON</a>
+                </div>
+              </>
+            ) : hybridJob ? (
+              <div className="flex items-center gap-2 text-[11px] text-violet-700">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" /> {hybridEtapa}
+              </div>
+            ) : null}
+            <button type="button" onClick={() => void rodarHibrido()}
+              disabled={!!hybridJob || !!job || carregando || !bandas.length}
+              className="w-full flex items-center justify-center gap-2 rounded-lg bg-violet-600 px-3 py-2 text-xs font-semibold text-white hover:bg-violet-700 disabled:opacity-40">
+              {hybridJob ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+              {hybridResult ? 'Rodar novamente' : 'Rodar ML + heurística'}
+            </button>
+          </Painel>
+
+          {hybridResult && (
+            <button onClick={abrirEditorHibrido} disabled={!!job || carregando}
+              className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg
+                         text-sm font-semibold bg-violet-600 text-white hover:bg-violet-700
+                         disabled:opacity-40 transition-colors">
+              <PencilRuler className="w-4 h-4" />
+              Confirmar híbrido no editor
+            </button>
+          )}
+
+          <button onClick={abrirEditor} disabled={!!job || carregando || !preview}
             className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg
-                       text-sm font-semibold bg-blue-600 text-white hover:bg-blue-700
+                       text-sm font-semibold border border-blue-200 bg-white text-blue-700 hover:bg-blue-50
                        disabled:opacity-40 transition-colors">
-            {job ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-            {job ? `Gerando (${jobEtapa})...` : 'Gerar IFC com esses thresholds'}
+            <PencilRuler className="w-4 h-4" />
+            Revisar detector rápido
           </button>
 
-          <button onClick={abrirEditor} disabled={!!job || carregando || !preview?.eixos.length}
-            className="w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg
-                       text-sm font-medium border border-blue-300 text-blue-700 bg-white
-                       hover:bg-blue-50 disabled:opacity-40 transition-colors">
-            <PencilRuler className="w-4 h-4" />
-            Finalizar no editor (portas / janelas)
+          <button onClick={() => void gerar()} disabled={!!job || !bandas.length || carregando || !preview?.eixos.length}
+            className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg
+                       text-sm font-semibold bg-emerald-600 text-white hover:bg-emerald-700
+                       disabled:opacity-40 transition-colors">
+            {job ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+            {job ? `Gerando (${jobEtapa})...` : 'Gerar IFC'}
           </button>
 
           {detalhes && (
@@ -465,9 +808,13 @@ export const ScanToBim: React.FC = () => {
               </a>
             </div>
           )}
+
           {erro && <ErroBox msg={erro} />}
 
-          <button onClick={() => { setUp(null); setPreview(null); setIfcUrl(null); setJob(null); setLances(null); }}
+          <button onClick={() => {
+            setUp(null); setPreview(null); setIfcUrl(null); setJob(null); setLances(null);
+            setHybridJob(null); setHybridEtapa(''); setHybridResult(null);
+          }}
             className="flex items-center justify-center gap-1 text-xs text-slate-400 hover:text-slate-600">
             <RotateCcw className="w-3 h-3" /> Trocar nuvem
           </button>
@@ -597,7 +944,7 @@ const Cabecalho: React.FC = () => (
   <div>
     <h1 className="text-xl font-bold text-slate-800">Scan → BIM</h1>
     <p className="text-sm text-slate-500">
-      Calibre por fases — lajes, paredes, escadas — vendo o que o sistema capta, e gere o IFC.
+      O Detector V2 monta a planta automaticamente; revise no editor 2D/3D e gere o IFC.
     </p>
   </div>
 );
