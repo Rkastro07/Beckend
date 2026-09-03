@@ -46,7 +46,9 @@ SINGLE_LINE_FRAC = 0.30  # se o pareamento cobre menos que isso das faces, a pla
 
 CORES = {  # RGB 0-255 pro preview
     "IfcWall":   (230, 126, 34),
+    "IfcColumn": (139, 92, 246),
     "IfcSlab":   (52, 152, 219),
+    "IfcCovering": (241, 196, 15),
     "IfcDoor":   (46, 204, 113),
     "IfcWindow": (93, 173, 226),
 }
@@ -66,6 +68,72 @@ WINDOW_TOKENS  = ("window", "janela", "ventana", "glaz")
 # aberturas genericas ou combinadas (ex "PUERYVENTA" = puertas y ventanas):
 # esquadria de tipo indefinido — decide porta/janela pelo tamanho do vao depois
 OPENING_TOKENS = ("opening", "abertura", "pueryventa", "vano", "vao")
+
+
+def _arco_tres_pontos(A, C, B):
+    """Retorna a geometria circular de P1 -> C -> P2, ou None se colinear."""
+    ax, ay = map(float, A)
+    cx, cy = map(float, C)
+    bx, by = map(float, B)
+    denominator = 2.0 * (
+        ax * (cy - by) + cx * (by - ay) + bx * (ay - cy)
+    )
+    chord = float(np.linalg.norm(np.asarray(B) - np.asarray(A)))
+    if chord < 1e-6 or abs(denominator) < chord * chord * 1e-7:
+        return None
+    a2, c2, b2 = ax * ax + ay * ay, cx * cx + cy * cy, bx * bx + by * by
+    ox = (a2 * (cy - by) + c2 * (by - ay) + b2 * (ay - cy)) / denominator
+    oy = (a2 * (bx - cx) + c2 * (ax - bx) + b2 * (cx - ax)) / denominator
+    radius = math.hypot(ax - ox, ay - oy)
+    start = math.atan2(ay - oy, ax - ox)
+    control = math.atan2(cy - oy, cx - ox)
+    end = math.atan2(by - oy, bx - ox)
+    full_turn = 2.0 * math.pi
+    ccw_sweep = (end - start) % full_turn
+    ccw_control = (control - start) % full_turn
+    sweep = ccw_sweep if ccw_control <= ccw_sweep + 1e-7 else ccw_sweep - full_turn
+    length = abs(sweep) * radius
+    if not math.isfinite(length) or length < 1e-6:
+        return None
+    return {
+        "centro": np.array([ox, oy], dtype=float),
+        "raio": radius,
+        "angulo_inicio": start,
+        "varredura": sweep,
+        "comprimento": length,
+    }
+
+
+def _frame_parede(parede, s):
+    """Ponto, tangente e normal no comprimento longitudinal da parede."""
+    arco = parede.get("arco")
+    comprimento = float(parede["comprimento"])
+    s = max(0.0, min(comprimento, float(s)))
+    if arco:
+        t = s / comprimento
+        angle = arco["angulo_inicio"] + arco["varredura"] * t
+        direction = 1.0 if arco["varredura"] >= 0 else -1.0
+        tangent = np.array([-math.sin(angle) * direction,
+                            math.cos(angle) * direction], dtype=float)
+        point = arco["centro"] + arco["raio"] * np.array(
+            [math.cos(angle), math.sin(angle)], dtype=float)
+    else:
+        A, B = parede["eixo"]
+        tangent = (B - A) / np.linalg.norm(B - A)
+        point = A + tangent * s
+    normal = np.array([-tangent[1], tangent[0]], dtype=float)
+    return point, tangent, normal
+
+
+def _contorno_parede_curva(parede, max_segmento=0.12):
+    comprimento = float(parede["comprimento"])
+    passos = max(8, min(512, int(math.ceil(comprimento / max_segmento))))
+    half_width = float(parede["espessura"]) / 2.0
+    frames = [_frame_parede(parede, comprimento * i / passos)
+              for i in range(passos + 1)]
+    esquerda = [point + normal * half_width for point, _, normal in frames]
+    direita = [point - normal * half_width for point, _, normal in reversed(frames)]
+    return esquerda + direita
 
 
 def _norm_layer(nome):
@@ -610,11 +678,18 @@ def casar_esquadrias_com_paredes(blocos, paredes,
     aberturas = []
     for bl in blocos:
         pts = bl["pts"]
+        candidate_max_width = max(
+            float(larg_max),
+            float(bl.get("max_width", larg_max)),
+            float(bl.get("declared_width", 0.0) or 0.0) * 1.10,
+        )
         melhor = None  # (chave, idx, s_centro, largura)
         for i, p in enumerate(paredes):
             A, B = p["eixo"]
             d = B - A
             L = np.linalg.norm(d)
+            if L < 1e-9:
+                continue
             u = d / L
             nrm = np.array([-u[1], u[0]])
 
@@ -633,8 +708,20 @@ def casar_esquadrias_com_paredes(blocos, paredes,
             s_sub = s_all[sobre]
             larg = float(s_sub.max() - s_sub.min())
             if larg < larg_min:  # vao degenerado -> usa default por tipo
-                larg = larg_default_door if bl["tipo"] == "door" else larg_default_window
-            larg = float(np.clip(larg, larg_min, larg_max))
+                larg = float(
+                    bl.get("declared_width")
+                    or (
+                        larg_default_door
+                        if bl["tipo"] == "door"
+                        else larg_default_window
+                    )
+                )
+            declared_width = bl.get("declared_width")
+            if declared_width is not None and abs(larg - float(declared_width)) <= max(
+                0.20, float(declared_width) * 0.30,
+            ):
+                larg = float(declared_width)
+            larg = float(np.clip(larg, larg_min, candidate_max_width))
             # NAO forca o centro pra dentro da parede: se o vao real fica na
             # ponta/fora da parede (vao-de-canto), a posicao certa eh essa.
             s_centro = float((s_sub.max() + s_sub.min()) / 2)
@@ -646,8 +733,22 @@ def casar_esquadrias_com_paredes(blocos, paredes,
 
         if melhor:
             _, i, s_centro, larg = melhor
-            aberturas.append({"parede_idx": i, "tipo": bl["tipo"],
-                              "s_centro": s_centro, "largura": larg})
+            abertura = {
+                "parede_idx": i,
+                "tipo": bl["tipo"],
+                "s_centro": s_centro,
+                "largura": larg,
+            }
+            for campo in (
+                "origem", "confidence", "source_layer", "block_name",
+                "source_text", "semantic_subtype", "semantic_reason",
+            ):
+                if bl.get(campo) is not None:
+                    abertura[campo] = bl[campo]
+            for campo in ("declared_width", "declared_height"):
+                if bl.get(campo) is not None:
+                    abertura[campo] = float(bl[campo])
+            aberturas.append(abertura)
     return aberturas
 
 
@@ -682,7 +783,8 @@ def construir_ifc(paredes, laje_poly, altura, esp_laje, pavimento, projeto, out_
                   aberturas=None, cobertura=True,
                   porta_altura=2.10, janela_altura=1.20, janela_peitoril=1.00,
                   esquadria_detalhada=False,
-                  piso_ativo=True, piso_esp=None, teto_esp=None):
+                  piso_ativo=True, piso_esp=None, teto_esp=None, spaces=None,
+                  forro=None, esquadria_sobreposicao=0.02):
     f = api.run("project.create_file", version="IFC4")
     proj = api.run("root.create_entity", f, ifc_class="IfcProject", name=projeto)
     # METROS explicitos (o default do assign_unit eh MILIMETRO, o que faria
@@ -770,6 +872,30 @@ def construir_ifc(paredes, laje_poly, altura, esp_laje, pavimento, projeto, out_
         _placement(prod, x, y, z, ang)
         return prod
 
+    def _parede_curva(prod_classe, nome, parede, alt, z, meta=None):
+        """Extruda a faixa circular como um único IfcWall semanticamente selecionável."""
+        prod = api.run("root.create_entity", f, ifc_class=prod_classe, name=nome)
+        _aplicar_metadados(prod, meta)
+        vertices = _contorno_parede_curva(parede)
+        points = [
+            f.create_entity(
+                "IfcCartesianPoint",
+                Coordinates=(float(point[0]), float(point[1])),
+            )
+            for point in vertices
+        ]
+        points.append(points[0])
+        outer_curve = f.create_entity("IfcPolyline", Points=points)
+        profile = f.create_entity(
+            "IfcArbitraryClosedProfileDef",
+            ProfileType="AREA",
+            OuterCurve=outer_curve,
+        )
+        rep = _rep_extrusao(profile, alt)
+        api.run("geometry.assign_representation", f, product=prod, representation=rep)
+        _placement(prod, 0.0, 0.0, z, 0.0)
+        return prod
+
     def _solid_box(x0, x1, y0, y1, z0, z1):
         """Caixa extrudada no frame LOCAL da esquadria (x=largura, y=espessura,
         z=altura). Varios _solid_box compoem o desenho da porta/janela."""
@@ -804,22 +930,24 @@ def construir_ifc(paredes, laje_poly, altura, esp_laje, pavimento, projeto, out_
     def _porta_detalhada(nome, larg, esp, alt, x, y, z, ang, meta=None):
         tl = min(0.05, larg / 4)   # batente
         tp = min(0.04, esp / 2)    # folha
+        ov = max(0.0, min(float(esquadria_sobreposicao), larg / 4))
         solids = [
-            _solid_box(0, tl, -esp/2, esp/2, 0, alt),            # batente esq
-            _solid_box(larg - tl, larg, -esp/2, esp/2, 0, alt),  # batente dir
-            _solid_box(0, larg, -esp/2, esp/2, alt - tl, alt),   # batente topo
-            _solid_box(tl, larg - tl, -tp/2, tp/2, 0, alt - tl), # folha
+            _solid_box(-ov, tl, -esp/2, esp/2, 0, alt + ov),
+            _solid_box(larg - tl, larg + ov, -esp/2, esp/2, 0, alt + ov),
+            _solid_box(-ov, larg + ov, -esp/2, esp/2, alt - tl, alt + ov),
+            _solid_box(tl, larg - tl, -tp/2, tp/2, 0, alt - tl),
         ]
         return _esquadria_multi("IfcDoor", nome, solids, x, y, z, ang, meta)
 
     def _janela_detalhada(nome, larg, esp, alt, x, y, z, ang, meta=None):
         tl = min(0.05, larg / 6)   # moldura
         tg = 0.02                  # vidro fino
+        ov = max(0.0, min(float(esquadria_sobreposicao), larg / 6))
         solids = [
-            _solid_box(0, tl, -esp/2, esp/2, 0, alt),            # moldura esq
-            _solid_box(larg - tl, larg, -esp/2, esp/2, 0, alt),  # moldura dir
-            _solid_box(0, larg, -esp/2, esp/2, 0, tl),           # moldura base
-            _solid_box(0, larg, -esp/2, esp/2, alt - tl, alt),   # moldura topo
+            _solid_box(-ov, tl, -esp/2, esp/2, -ov, alt + ov),
+            _solid_box(larg - tl, larg + ov, -esp/2, esp/2, -ov, alt + ov),
+            _solid_box(-ov, larg + ov, -esp/2, esp/2, -ov, tl),
+            _solid_box(-ov, larg + ov, -esp/2, esp/2, alt - tl, alt + ov),
             _solid_box(larg/2 - tl/2, larg/2 + tl/2, -esp/2, esp/2, tl, alt - tl),  # travessa
             _solid_box(tl, larg - tl, -tg/2, tg/2, tl, alt - tl),  # vidro
         ]
@@ -830,11 +958,24 @@ def construir_ifc(paredes, laje_poly, altura, esp_laje, pavimento, projeto, out_
     for i, p in enumerate(paredes, 1):
         A, B = p["eixo"]
         ang = math.atan2(*(B - A)[::-1])  # atan2(dy, dx)
-        wall_altura = float(p.get("altura") or altura)
+        wall_altura = float(
+            p.get("altura")
+            or p.get("altura_observada")
+            or altura
+        )
         wall_z = float(p.get("elevacao", 0.0) or 0.0)
-        wall = _caixa("IfcWall", p.get("nome") or f"Parede-{i:03d}",
-                      p["comprimento"], p["espessura"], wall_altura,
-                      float(A[0]), float(A[1]), wall_z, ang, p)
+        is_column = p.get("ifc_class") == "IfcColumn" or p.get("tipo") == "column"
+        product_class = "IfcColumn" if is_column else "IfcWall"
+        default_name = f"Pilar-{i:03d}" if is_column else f"Parede-{i:03d}"
+        if p.get("arco") and not is_column:
+            wall = _parede_curva(
+                product_class, p.get("nome") or default_name,
+                p, wall_altura, wall_z, p,
+            )
+        else:
+            wall = _caixa(product_class, p.get("nome") or default_name,
+                          p["comprimento"], p["espessura"], wall_altura,
+                          float(A[0]), float(A[1]), wall_z, ang, p)
         api.run("spatial.assign_container", f, products=[wall], relating_structure=storey)
         walls.append(wall)
 
@@ -844,7 +985,7 @@ def construir_ifc(paredes, laje_poly, altura, esp_laje, pavimento, projeto, out_
         p = paredes[ab["parede_idx"]]
         wall = walls[ab["parede_idx"]]
         A, B = p["eixo"]
-        u = (B - A) / np.linalg.norm(B - A)
+        center, u, _normal = _frame_parede(p, ab["s_centro"])
         ang = math.atan2(u[1], u[0])
         larg = ab["largura"]
         if ab["tipo"] == "door":
@@ -861,11 +1002,28 @@ def construir_ifc(paredes, laje_poly, altura, esp_laje, pavimento, projeto, out_
             classe, nome = "IfcWindow", ab.get("nome") or f"Janela-{n_j:03d}"
         wall_base = float(p.get("elevacao", 0.0) or 0.0)
         z0 += wall_base
-        # ponto inicial do vao ao longo do eixo da parede
-        P0 = A + u * (ab["s_centro"] - larg / 2)
+        wall_top = wall_base + float(
+            p.get("altura")
+            or p.get("altura_observada")
+            or altura
+        )
+        if z0 < wall_base:
+            alt -= wall_base - z0
+            z0 = wall_base
+        alt = min(alt, wall_top - z0)
+        if alt <= 0.05:
+            continue
+        # A esquadria é reta e tangente ao eixo no centro, mesmo em parede curva.
+        P0 = center - u * (larg / 2)
+        curvature_allowance = 0.0
+        if p.get("arco"):
+            radius = max(float(p["arco"]["raio"]), larg / 2 + 1e-6)
+            curvature_allowance = 2.0 * (
+                radius - math.sqrt(max(0.0, radius * radius - (larg / 2) ** 2))
+            )
         # opening (um pouco mais "gordo" que a parede pra cortar limpo)
         opening = _caixa("IfcOpeningElement", f"Vao-{nome}",
-                         larg, p["espessura"] + 0.02, alt,
+                         larg, p["espessura"] + 0.02 + curvature_allowance, alt,
                          float(P0[0]), float(P0[1]), z0, ang)
         api.run("feature.add_feature", f, feature=opening, element=wall)
         # elemento que preenche (porta/janela)
@@ -890,19 +1048,133 @@ def construir_ifc(paredes, laje_poly, altura, esp_laje, pavimento, projeto, out_
         # VERGA: se a esquadria fica (parcialmente) FORA da parede dona — caso
         # vao-de-canto —, nao ha parede acima do vao. Cria um trecho de parede
         # de z=topo_da_esquadria ate o pe-direito pra fechar o vao aberto.
-        L_par = float(np.linalg.norm(B - A))
+        L_par = float(p["comprimento"])
         s0, s1 = ab["s_centro"] - larg / 2, ab["s_centro"] + larg / 2
         dentro = max(0.0, min(s1, L_par) - max(s0, 0.0))
-        wall_top = wall_base + float(p.get("altura") or altura)
+        wall_top = wall_base + float(
+            p.get("altura")
+            or p.get("altura_observada")
+            or altura
+        )
         if (larg - dentro) > 0.05 and (z0 + alt) < wall_top - 1e-3:
             verga = _caixa("IfcWall", f"Verga-{nome}",
                            larg, p["espessura"], wall_top - (z0 + alt),
                            float(P0[0]), float(P0[1]), z0 + alt, ang)
             api.run("spatial.assign_container", f, products=[verga], relating_structure=storey)
 
+    # ---- ambientes fechados + forro por ambiente ----
+    # O editor calcula os ciclos pelas paredes antes da exportacao. Usar esses
+    # mesmos contornos aqui garante que o PNG aprovado e o IFC descrevam os
+    # mesmos comodos, sem uma segunda inferencia geometrica no exportador.
+    forro_config = dict(forro or {})
+    forro_ativo = bool(forro_config.get("ativo", False))
+    forro_espessura = float(forro_config.get("espessura", 0.03))
+    forro_altura = float(
+        forro_config.get(
+            "altura",
+            max(0.0, float(altura) - forro_espessura),
+        )
+    )
+    if forro_espessura <= 0:
+        raise ValueError("espessura do forro deve ser positiva")
+    if forro_altura <= 0:
+        raise ValueError("altura do forro deve ser positiva")
+    if forro_altura + forro_espessura > float(altura) + 1e-6:
+        raise ValueError("forro ultrapassa a altura das paredes")
+    space_height = forro_altura if forro_ativo else float(altura)
+
+    for i, space_data in enumerate(spaces or [], 1):
+        vertices = [
+            (float(value[0]), float(value[1]))
+            for value in space_data.get("contorno", [])
+        ]
+        if len(vertices) > 1 and vertices[0] == vertices[-1]:
+            vertices.pop()
+        if len(vertices) < 3:
+            continue
+        signed_area = 0.5 * sum(
+            ax * by - bx * ay
+            for (ax, ay), (bx, by) in zip(vertices, vertices[1:] + vertices[:1])
+        )
+        if abs(signed_area) <= 1e-6:
+            continue
+        if signed_area < 0:
+            vertices.reverse()
+
+        points = [
+            f.create_entity(
+                "IfcCartesianPoint",
+                Coordinates=(float(x), float(y)),
+            )
+            for x, y in vertices
+        ]
+        points.append(points[0])
+        curve = f.create_entity("IfcPolyline", Points=points)
+        profile = f.create_entity(
+            "IfcArbitraryClosedProfileDef",
+            ProfileType="AREA",
+            OuterCurve=curve,
+        )
+        space = api.run(
+            "root.create_entity",
+            f,
+            ifc_class="IfcSpace",
+            name=space_data.get("id") or f"SPACE-{i:03d}",
+            predefined_type="INTERNAL",
+        )
+        space.LongName = space_data.get("nome") or f"Comodo {i:03d}"
+        if space_data.get("area") is not None:
+            space.Description = f"area={float(space_data['area']):.3f} m2"
+        representation = _rep_extrusao(profile, space_height)
+        api.run(
+            "geometry.assign_representation",
+            f,
+            product=space,
+            representation=representation,
+        )
+        _placement(space, 0.0, 0.0, 0.0, 0.0)
+        api.run(
+            "aggregate.assign_object",
+            f,
+            products=[space],
+            relating_object=storey,
+        )
+        if forro_ativo:
+            ceiling = api.run(
+                "root.create_entity",
+                f,
+                ifc_class="IfcCovering",
+                name=f"Forro-{space.Name}",
+                predefined_type="CEILING",
+            )
+            ceiling.Description = (
+                f"Forro por ambiente | cota inferior={forro_altura:.3f} m | "
+                f"espessura={forro_espessura:.3f} m"
+            )
+            ceiling_representation = _rep_extrusao(profile, forro_espessura)
+            api.run(
+                "geometry.assign_representation",
+                f,
+                product=ceiling,
+                representation=ceiling_representation,
+            )
+            _placement(ceiling, 0.0, 0.0, forro_altura, 0.0)
+            api.run(
+                "spatial.assign_container",
+                f,
+                products=[ceiling],
+                relating_structure=space,
+            )
+
     # ---- lajes (piso + cobertura), com espessura propria cada ----
-    def _laje(nome, z_base, esp):
-        slab = api.run("root.create_entity", f, ifc_class="IfcSlab", name=nome)
+    def _laje(nome, z_base, esp, predefined_type):
+        slab = api.run(
+            "root.create_entity",
+            f,
+            ifc_class="IfcSlab",
+            name=nome,
+            predefined_type=predefined_type,
+        )
         pts = [f.create_entity("IfcCartesianPoint",
                                Coordinates=(float(p[0]), float(p[1])))
                for p in laje_poly]
@@ -919,9 +1191,19 @@ def construir_ifc(paredes, laje_poly, altura, esp_laje, pavimento, projeto, out_
     _teto_esp = teto_esp if teto_esp is not None else esp_laje
     if len(laje_poly) >= 3:
         if piso_ativo:
-            _laje("Laje-Piso", -_piso_esp, _piso_esp)   # topo do piso em z=0
+            _laje(
+                "Laje-Estrutural-Piso",
+                -_piso_esp,
+                _piso_esp,
+                "FLOOR",
+            )
         if cobertura:
-            _laje("Laje-Cobertura", altura, _teto_esp)  # base no topo das paredes
+            _laje(
+                "Laje-Estrutural-Superior",
+                altura,
+                _teto_esp,
+                "FLOOR",
+            )
 
     f.write(str(out_path))
     return f
@@ -992,24 +1274,103 @@ def contorno_laje(paredes):
     return hull_convexo(np.array(ext_pts)) if ext_pts else []
 
 
-def parse_dxf(dxf_path, escala_forcada=None, esp_default=0.15):
+def parse_dxf(
+    dxf_path,
+    escala_forcada=None,
+    esp_default=0.15,
+    layer_map=None,
+    cad_region=None,
+    linked_image=None,
+):
     """Le o DXF e devolve o MODELO estruturado (paredes + aberturas + laje), SEM
     gerar IFC. E a etapa de leitura do editor: o front mostra/edita esse modelo e
     so depois pede a geracao do IFC."""
-    segs, escala = ler_segmentos_parede(dxf_path, escala_forcada=escala_forcada)
-    segs = mesclar_colineares(segs)
-    paredes, sobras = parear_paredes(segs)
-    frac = fracao_pareada(paredes, segs)
-    single = frac < SINGLE_LINE_FRAC
-    if single:
-        paredes = paredes_single_line(segs, esp_default)
-        sobras = []
-    paredes, n_cost = costurar_cantos(paredes)
-    blocos = ler_blocos_esquadrias(dxf_path, escala)
-    aberturas = casar_esquadrias_com_paredes(blocos, paredes)
-    return {"paredes": paredes, "aberturas": aberturas, "escala": escala,
-            "single_line": single, "n_sobras": len(sobras), "n_cantos": n_cost,
-            "n_blocos_esq": len(blocos), "laje_contorno": contorno_laje(paredes)}
+    from cad_detection_v2 import parse_dxf_v2
+
+    return parse_dxf_v2(
+        dxf_path,
+        escala_forcada=escala_forcada,
+        esp_default=esp_default,
+        layer_map=layer_map,
+        cad_region=cad_region,
+        linked_image=linked_image,
+    )
+
+
+def referencia_vetorial(
+    segmentos,
+    *,
+    crop_bbox=None,
+    label="Planta original",
+    max_segments=40000,
+):
+    """Serializa a geometria-fonte como underlay leve e alinhado ao editor.
+
+    A referencia nunca participa da modelagem/IFC: ela preserva as linhas que
+    deram origem ao reconhecimento para que o usuario compare e corrija o BIM.
+    ``crop_bbox`` evita que outras plantas/pavimentos distantes do CAD deixem a
+    referencia atual minuscule no editor.
+    """
+    normalized = []
+    crop = None
+    if crop_bbox:
+        try:
+            xmin = float(crop_bbox["xmin"])
+            ymin = float(crop_bbox["ymin"])
+            xmax = float(crop_bbox["xmax"])
+            ymax = float(crop_bbox["ymax"])
+            span = max(xmax - xmin, ymax - ymin, 0.1)
+            pad = max(0.50, span * 0.08)
+            crop = (xmin - pad, ymin - pad, xmax + pad, ymax + pad)
+        except (KeyError, TypeError, ValueError):
+            crop = None
+
+    for segment in segmentos or []:
+        if len(segment) < 2:
+            continue
+        a, b = np.asarray(segment[0], dtype=float), np.asarray(segment[1], dtype=float)
+        if a.size < 2 or b.size < 2:
+            continue
+        x1, y1 = float(a[0]), float(a[1])
+        x2, y2 = float(b[0]), float(b[1])
+        if not np.isfinite([x1, y1, x2, y2]).all():
+            continue
+        if math.hypot(x2 - x1, y2 - y1) < 1e-5:
+            continue
+        if crop is not None:
+            cx0, cy0, cx1, cy1 = crop
+            if max(x1, x2) < cx0 or min(x1, x2) > cx1:
+                continue
+            if max(y1, y2) < cy0 or min(y1, y2) > cy1:
+                continue
+        normalized.append([x1, y1, x2, y2])
+
+    source_count = len(normalized)
+    limit = max(1, int(max_segments))
+    if source_count > limit:
+        # Amostragem uniforme preserva todas as regioes/layers melhor que reter
+        # somente as linhas mais longas (que apagaria arcos e esquadrias).
+        indexes = np.linspace(0, source_count - 1, limit, dtype=np.int64)
+        normalized = [normalized[int(index)] for index in indexes]
+    if not normalized:
+        return None
+
+    xs = [value for segment in normalized for value in (segment[0], segment[2])]
+    ys = [value for segment in normalized for value in (segment[1], segment[3])]
+    return {
+        "kind": "vector",
+        "label": str(label),
+        "bounds": [
+            round(min(xs), 6), round(min(ys), 6),
+            round(max(xs), 6), round(max(ys), 6),
+        ],
+        "segments": [
+            [round(value, 6) for value in segment]
+            for segment in normalized
+        ],
+        "source_count": source_count,
+        "truncated": source_count > len(normalized),
+    }
 
 
 def modelo_para_dict(modelo):
@@ -1027,7 +1388,7 @@ def modelo_para_dict(modelo):
         for campo in ("nome", "guid", "tipo", "ifc_class", "nivel", "origem"):
             if p.get(campo) is not None:
                 parede[campo] = p[campo]
-        for campo in ("altura", "elevacao"):
+        for campo in ("altura", "elevacao", "confidence"):
             if p.get(campo) is not None:
                 parede[campo] = round(float(p[campo]), 4)
         paredes.append(parede)
@@ -1040,10 +1401,16 @@ def modelo_para_dict(modelo):
             "s_centro": round(float(ab["s_centro"]), 4),
             "largura": round(float(ab["largura"]), 4),
         }
-        for campo in ("nome", "guid", "origem"):
+        for campo in (
+            "nome", "guid", "origem", "source_layer", "block_name",
+            "source_text", "semantic_subtype", "semantic_reason",
+        ):
             if ab.get(campo) is not None:
                 abertura[campo] = ab[campo]
-        for campo in ("altura", "peitoril"):
+        for campo in (
+            "altura", "peitoril", "confidence",
+            "declared_width", "declared_height",
+        ):
             if ab.get(campo) is not None:
                 abertura[campo] = round(float(ab[campo]), 4)
         aberturas.append(abertura)
@@ -1061,6 +1428,7 @@ def modelo_para_dict(modelo):
         "escala": modelo.get("escala"),
         "single_line": bool(modelo.get("single_line")),
         "source": modelo.get("source"),
+        "reference": modelo.get("reference"),
         "warnings": list(modelo.get("warnings", [])),
         "diagnostico": {
             "sobras": modelo.get("n_sobras", 0),
@@ -1084,16 +1452,34 @@ def dict_para_modelo(d):
     for w in d.get("paredes", []):
         A = np.array([float(w["ax"]), float(w["ay"])], dtype=float)
         B = np.array([float(w["bx"]), float(w["by"])], dtype=float)
-        L = float(np.linalg.norm(B - A))
+        arco = None
+        if w.get("geometria") == "arco" and isinstance(w.get("curva"), dict):
+            C = np.array([
+                float(w["curva"]["x"]),
+                float(w["curva"]["y"]),
+            ], dtype=float)
+            arco = _arco_tres_pontos(A, C, B)
+        L = float(arco["comprimento"] if arco else np.linalg.norm(B - A))
         if L < 1e-3:
             continue  # parede degenerada
         id2idx[w["id"]] = len(paredes)
-        parede = {"eixo": (A, B), "espessura": float(w["espessura"]),
-                  "comprimento": L, "layer": w.get("layer", "")}
+        parede = {
+            "eixo": (A, B),
+            "espessura": float(w["espessura"]),
+            "comprimento": L,
+            "layer": w.get("layer", ""),
+            "nome": w.get("nome") or str(w["id"]),
+        }
+        if arco:
+            parede["geometria"] = "arco"
+            parede["curva"] = C
+            parede["arco"] = arco
         for campo in ("nome", "guid", "tipo", "ifc_class", "nivel", "origem"):
             if w.get(campo) is not None:
                 parede[campo] = w[campo]
-        for campo in ("altura", "elevacao"):
+        for campo in (
+            "altura", "altura_observada", "elevacao", "confidence",
+        ):
             if w.get(campo) is not None:
                 parede[campo] = float(w[campo])
         paredes.append(parede)
@@ -1101,20 +1487,64 @@ def dict_para_modelo(d):
     for o in d.get("aberturas", []):
         if o.get("parede_id") not in id2idx:
             continue  # abertura orfa (parede foi apagada)
-        abertura = {"parede_idx": id2idx[o["parede_id"]], "tipo": o["tipo"],
-                    "s_centro": float(o["s_centro"]), "largura": float(o["largura"])}
-        for campo in ("nome", "guid", "origem"):
+        parent = paredes[id2idx[o["parede_id"]]]
+        if parent.get("ifc_class") == "IfcColumn" or parent.get("tipo") == "column":
+            continue  # pilares não hospedam portas ou janelas
+        abertura = {
+            "parede_idx": id2idx[o["parede_id"]],
+            "tipo": o["tipo"],
+            "s_centro": float(o["s_centro"]),
+            "largura": float(o["largura"]),
+            "nome": o.get("nome") or str(o["id"]),
+        }
+        for campo in (
+            "nome", "guid", "origem", "source_layer", "block_name",
+            "source_text", "semantic_subtype", "semantic_reason",
+        ):
             if o.get(campo) is not None:
                 abertura[campo] = o[campo]
-        for campo in ("altura", "peitoril"):
+        for campo in (
+            "altura", "peitoril", "confidence",
+            "declared_width", "declared_height",
+        ):
             if o.get(campo) is not None:
                 abertura[campo] = float(o[campo])
         aberturas.append(abertura)
+    spaces = []
+    for index, space in enumerate(d.get("spaces", []), 1):
+        contorno = [
+            [float(value[0]), float(value[1])]
+            for value in space.get("contorno", [])
+        ]
+        if len(contorno) < 3:
+            continue
+        spaces.append({
+            "id": str(space.get("id") or f"SPACE-{index:03d}"),
+            "nome": space.get("nome"),
+            "contorno": contorno,
+            "area": (
+                float(space["area"])
+                if space.get("area") is not None
+                else None
+            ),
+        })
     laje = d.get("laje")
-    return {"paredes": paredes, "aberturas": aberturas, "laje": laje}
+    return {
+        "paredes": paredes,
+        "aberturas": aberturas,
+        "laje": laje,
+        "spaces": spaces,
+    }
 
 
-def gerar_ifc_do_modelo(paredes, aberturas, out_path, config=None, laje=None):
+def gerar_ifc_do_modelo(
+    paredes,
+    aberturas,
+    out_path,
+    config=None,
+    laje=None,
+    spaces=None,
+):
     """paredes+aberturas (formato interno) -> IFC no out_path. `laje` (opcional):
     {contorno:[[x,y]...], piso:{ativo,espessura}, teto:{ativo,espessura}}. Sem ela,
     recalcula o contorno pelo hull e usa piso+teto default."""
@@ -1141,7 +1571,10 @@ def gerar_ifc_do_modelo(paredes, aberturas, out_path, config=None, laje=None):
         janela_peitoril=config.get("janela_peitoril", 1.00),
         esquadria_detalhada=config.get("esquadria_detalhada", False),
         piso_ativo=piso_ativo,
-        piso_esp=piso.get("espessura"), teto_esp=teto.get("espessura"))
+        piso_esp=piso.get("espessura"), teto_esp=teto.get("espessura"),
+        spaces=spaces,
+        forro=config.get("forro"),
+        esquadria_sobreposicao=config.get("esquadria_sobreposicao", 0.02))
 
 
 # ============================================================
