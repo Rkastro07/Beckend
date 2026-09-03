@@ -403,51 +403,196 @@ def walls_from_segmentation_mask(
 def fuse_wall_sets(
     geometry_walls: list[dict[str, Any]],
     yolo_walls: list[dict[str, Any]],
+    *,
+    typical_wall_thickness_px: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Create one deduplicated carrier set supported by 2D and/or YOLO."""
+    """Create one physical carrier per wall from 2D and YOLO evidence.
 
-    tagged = [
-        {**wall, "_fusion_origin": "geometry"}
-        for wall in geometry_walls
-    ] + [
-        {**wall, "_fusion_origin": "yolo"}
+    The semantic mask already describes the full wall band, so its axis is the
+    most stable carrier.  The classic geometry detector often returns the two
+    outline strokes of that same band.  Concatenating both sets before merging
+    can therefore create two or three parallel walls over one drawn wall.
+    Associate every compatible geometry fragment to one YOLO carrier first;
+    only unmatched geometry is allowed to become a recovery wall.
+    """
+
+    yolo_thicknesses = [
+        float(wall.get("thickness", 6.0))
         for wall in yolo_walls
+        if float(wall.get("thickness", 0.0)) > 0
     ]
-    fused = merge_collinear_walls(tagged)
-    for wall in fused:
-        supports: list[str] = []
-        for origin, source_walls in (
-            ("geometry", geometry_walls),
-            ("yolo", yolo_walls),
-        ):
-            for source in source_walls:
-                if source.get("orientation") != wall.get("orientation"):
-                    continue
-                fixed_tolerance = max(
-                    4.0,
-                    float(source.get("thickness", 6.0)) * 0.9,
-                    float(wall.get("thickness", 6.0)) * 0.9,
-                )
-                if abs(float(source["fixed"]) - float(wall["fixed"])) > fixed_tolerance:
-                    continue
-                overlap = interval_overlap(
-                    float(source["start"]),
-                    float(source["end"]),
-                    float(wall["start"]),
-                    float(wall["end"]),
-                )
-                source_length = max(1.0, float(source["end"]) - float(source["start"]))
-                if overlap / source_length >= 0.18:
-                    supports.append(origin)
-                    break
-        supports = sorted(set(supports))
-        wall["fusion_sources"] = supports
-        if supports == ["geometry", "yolo"]:
-            wall["source"] = "2d-yolo-wall-fusion"
-        elif supports == ["geometry"]:
-            wall["source"] = "2d-wall-fusion-recovery"
+    reference_thickness = float(typical_wall_thickness_px or 0.0)
+    if not math.isfinite(reference_thickness) or reference_thickness <= 0:
+        reference_thickness = float(np.median(yolo_thicknesses)) if yolo_thicknesses else 12.0
+
+    assignments: dict[int, list[dict[str, Any]]] = {
+        index: [] for index in range(len(yolo_walls))
+    }
+    unmatched_geometry: list[dict[str, Any]] = []
+    for geometry in geometry_walls:
+        geometry_length = max(
+            1.0,
+            float(geometry["end"]) - float(geometry["start"]),
+        )
+        choices: list[tuple[float, int]] = []
+        for carrier_index, carrier in enumerate(yolo_walls):
+            if geometry.get("orientation") != carrier.get("orientation"):
+                continue
+            carrier_length = max(
+                1.0,
+                float(carrier["end"]) - float(carrier["start"]),
+            )
+            normal_distance = abs(
+                float(geometry["fixed"]) - float(carrier["fixed"])
+            )
+            normal_limit = max(
+                6.0,
+                reference_thickness * 0.65,
+                float(carrier.get("thickness", 6.0)) * 0.75,
+                float(geometry.get("thickness", 6.0)) * 1.4,
+            )
+            if normal_distance > normal_limit:
+                continue
+            overlap = interval_overlap(
+                float(geometry["start"]),
+                float(geometry["end"]),
+                float(carrier["start"]),
+                float(carrier["end"]),
+            )
+            overlap_ratio = overlap / min(geometry_length, carrier_length)
+            if overlap_ratio < 0.30:
+                continue
+            score = normal_distance / normal_limit + (1.0 - overlap_ratio) * 0.35
+            choices.append((score, carrier_index))
+        if choices:
+            assignments[min(choices)[1]].append(geometry)
         else:
-            wall["source"] = "yolo-wall-fusion-recovery"
+            unmatched_geometry.append(geometry)
+
+    fused: list[dict[str, Any]] = []
+    absorbed_geometry_count = 0
+    for carrier_index, carrier in enumerate(yolo_walls):
+        supports = assignments[carrier_index]
+        fused_wall = dict(carrier)
+        if supports:
+            carrier_length = max(
+                1.0,
+                float(carrier["end"]) - float(carrier["start"]),
+            )
+            maximum_extension = max(
+                reference_thickness * 1.5,
+                carrier_length * 0.12,
+            )
+            fused_wall["start"] = min(
+                float(carrier["start"]),
+                *(
+                    max(
+                        float(item["start"]),
+                        float(carrier["start"]) - maximum_extension,
+                    )
+                    for item in supports
+                ),
+            )
+            fused_wall["end"] = max(
+                float(carrier["end"]),
+                *(
+                    min(
+                        float(item["end"]),
+                        float(carrier["end"]) + maximum_extension,
+                    )
+                    for item in supports
+                ),
+            )
+            fused_wall["thickness"] = max(
+                float(carrier.get("thickness", 6.0)),
+                *(float(item.get("thickness", 6.0)) for item in supports),
+            )
+            fused_wall["source_segment_count"] = int(
+                carrier.get("source_segment_count", 1)
+            ) + sum(int(item.get("source_segment_count", 1)) for item in supports)
+            fused_wall["fusion_sources"] = ["geometry", "yolo"]
+            fused_wall["source"] = "2d-yolo-wall-fusion"
+            absorbed_geometry_count += len(supports)
+        else:
+            fused_wall["fusion_sources"] = ["yolo"]
+            fused_wall["source"] = "yolo-wall-fusion-recovery"
+        fused.append(fused_wall)
+
+    # If YOLO misses a wall, the geometry fallback may still contain both of
+    # its thin outline strokes. Pair only those narrow, strongly overlapping
+    # faces; broad axes and genuinely separate parallel walls remain distinct.
+    face_limit = max(6.0, reference_thickness * 0.45)
+    separation_limit = max(8.0, reference_thickness * 0.90)
+    recovery_candidates: list[tuple[float, int, int]] = []
+    for first_index, first in enumerate(unmatched_geometry):
+        if float(first.get("thickness", 6.0)) > face_limit:
+            continue
+        for second_index in range(first_index + 1, len(unmatched_geometry)):
+            second = unmatched_geometry[second_index]
+            if second.get("orientation") != first.get("orientation"):
+                continue
+            if float(second.get("thickness", 6.0)) > face_limit:
+                continue
+            separation = abs(float(first["fixed"]) - float(second["fixed"]))
+            if not 3.0 <= separation <= separation_limit:
+                continue
+            first_length = max(1.0, float(first["end"]) - float(first["start"]))
+            second_length = max(1.0, float(second["end"]) - float(second["start"]))
+            overlap = interval_overlap(
+                float(first["start"]),
+                float(first["end"]),
+                float(second["start"]),
+                float(second["end"]),
+            )
+            overlap_ratio = overlap / min(first_length, second_length)
+            if overlap_ratio < 0.65:
+                continue
+            recovery_candidates.append(
+                (separation - overlap_ratio * 2.0, first_index, second_index)
+            )
+
+    consumed_recovery: set[int] = set()
+    recovered: list[dict[str, Any]] = []
+    recovery_face_pairs = 0
+    for _, first_index, second_index in sorted(recovery_candidates):
+        if first_index in consumed_recovery or second_index in consumed_recovery:
+            continue
+        first = unmatched_geometry[first_index]
+        second = unmatched_geometry[second_index]
+        separation = abs(float(first["fixed"]) - float(second["fixed"]))
+        recovered.append({
+            "orientation": first["orientation"],
+            "fixed": (float(first["fixed"]) + float(second["fixed"])) / 2.0,
+            "start": min(float(first["start"]), float(second["start"])),
+            "end": max(float(first["end"]), float(second["end"])),
+            "thickness": separation + float(np.median([
+                float(first.get("thickness", 6.0)),
+                float(second.get("thickness", 6.0)),
+            ])),
+            "source_segment_count": int(first.get("source_segment_count", 1))
+            + int(second.get("source_segment_count", 1)),
+            "fusion_sources": ["geometry"],
+            "source": "2d-wall-fusion-recovery",
+        })
+        consumed_recovery.update((first_index, second_index))
+        recovery_face_pairs += 1
+    recovered.extend(
+        {
+            **wall,
+            "fusion_sources": ["geometry"],
+            "source": "2d-wall-fusion-recovery",
+        }
+        for index, wall in enumerate(unmatched_geometry)
+        if index not in consumed_recovery
+    )
+    fused.extend(recovered)
+    fused.sort(
+        key=lambda wall: (
+            str(wall.get("orientation")),
+            float(wall["fixed"]),
+            float(wall["start"]),
+        )
+    )
 
     def connected(first: dict[str, Any], second: dict[str, Any]) -> bool:
         tolerance = max(
@@ -512,6 +657,9 @@ def fuse_wall_sets(
         "yolo_only": yolo_only_count,
         "rejected_isolated_geometry_only": rejected_geometry_only,
         "minimum_recovery_length_px": round(minimum_recovery_length, 3),
+        "absorbed_geometry_segments": absorbed_geometry_count,
+        "paired_geometry_recovery_faces": recovery_face_pairs,
+        "reference_wall_thickness_px": round(reference_thickness, 3),
     }
 
 
@@ -1250,7 +1398,13 @@ def main() -> None:
         minimum_reasonable_count = max(4, round(len(geometry_walls) * 0.45))
         if len(yolo_walls) >= minimum_reasonable_count:
             if args.wall_source == "hybrid":
-                walls, fusion_diagnostic = fuse_wall_sets(geometry_walls, yolo_walls)
+                walls, fusion_diagnostic = fuse_wall_sets(
+                    geometry_walls,
+                    yolo_walls,
+                    typical_wall_thickness_px=float(
+                        detection_scale.get("typical_wall_thickness_px") or 0.0
+                    ),
+                )
                 wall_segmentation["fusion"] = fusion_diagnostic
                 wall_geometry_source = "hybrid-2d-yolo-fusion"
                 wall_segmentation["used"] = True
