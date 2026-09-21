@@ -1,0 +1,41 @@
+{
+  "schema": "bim.edit-operations.v1",
+  "base_revision": "R00",
+  "revision": "R01-client-wall-review",
+  "operations": [
+    {
+      "op": "delete_elements",
+      "ids": [
+        "W-S01-002",
+        "W-S01-009",
+        "W-S01-011",
+        "W-S01-013",
+        "W-S01-017",
+        "W-S01-021",
+        "W-S01-023",
+        "W-S01-026",
+        "W-S01-027",
+        "W-S01-028"
+      ]
+    }
+  ],
+  "recalculate": [
+    "openings",
+    "topology",
+    "spaces",
+    "slabs",
+    "validation"
+  ],
+  "policies": {
+    "opening_out_of_bounds": "clamp",
+    "topology_snap_tolerance": 0.03,
+    "minimum_space_area": 1.0,
+    "slab_fit_mode": "outer_faces_hull"
+  },
+  "render": {
+    "selected": [
+      "W-S01-003",
+      "W-S01-005"
+    ]
+  }
+}

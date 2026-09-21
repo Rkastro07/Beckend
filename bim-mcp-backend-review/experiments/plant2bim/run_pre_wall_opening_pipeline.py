@@ -16,7 +16,9 @@ from typing import Any
 
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
+from ultralytics.utils.ops import scale_masks
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
@@ -46,154 +48,7 @@ def write_image(path: Path, image: np.ndarray) -> None:
     encoded.tofile(str(path))
 
 
-def detect_building_bbox(image: np.ndarray) -> tuple[int, int, int, int]:
-    """Find thick, long ink while ignoring dimensions, text and view arrows."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    height, width = gray.shape
-
-    # Thin CAD drawings often have no thick wall core, but their architectural
-    # contours enclose large regions. Join overlapping contour envelopes while
-    # discarding sparse dimension lines.
-    contour_binary = (gray < 180).astype(np.uint8) * 255
-    contour_binary = cv2.morphologyEx(
-        contour_binary,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-    )
-    raw_contours = cv2.findContours(
-        contour_binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
-    )[0]
-    contour_boxes: list[tuple[int, int, int, int, float]] = []
-    image_area = float(width * height)
-    for contour in raw_contours:
-        x, y, box_width, box_height = cv2.boundingRect(contour)
-        box_area = float(box_width * box_height)
-        fill = float(cv2.contourArea(contour)) / max(1.0, box_area)
-        if box_area / image_area >= 0.02 and fill >= 0.045:
-            contour_boxes.append((x, y, x + box_width, y + box_height, float(cv2.contourArea(contour))))
-
-    contour_groups: list[list[tuple[int, int, int, int, float]]] = []
-    for box in sorted(contour_boxes, key=lambda item: item[4], reverse=True):
-        matching_groups = []
-        for group in contour_groups:
-            if any(
-                box[0] <= other[2] + 5
-                and box[2] + 5 >= other[0]
-                and box[1] <= other[3] + 5
-                and box[3] + 5 >= other[1]
-                for other in group
-            ):
-                matching_groups.append(group)
-        if not matching_groups:
-            contour_groups.append([box])
-            continue
-        primary = matching_groups[0]
-        primary.append(box)
-        for extra in matching_groups[1:]:
-            primary.extend(extra)
-            contour_groups.remove(extra)
-
-    contour_candidate: tuple[int, int, int, int] | None = None
-    if contour_groups:
-        def group_bounds(
-            group: list[tuple[int, int, int, int, float]],
-        ) -> tuple[int, int, int, int]:
-            return (
-                min(item[0] for item in group),
-                min(item[1] for item in group),
-                max(item[2] for item in group),
-                max(item[3] for item in group),
-            )
-
-        def box_area(box: tuple[int, int, int, int]) -> float:
-            return float(max(0, box[2] - box[0]) * max(0, box[3] - box[1]))
-
-        def group_score(group: list[tuple[int, int, int, int, float]]) -> float:
-            bounds = group_bounds(group)
-            return box_area(bounds) + sum(item[4] for item in group) * 0.15
-
-        best_group = max(contour_groups, key=group_score)
-        best_bounds = group_bounds(best_group)
-        best_area = box_area(best_bounds)
-
-        # A planta pode ter alas separadas por circulacoes abertas. Selecionar
-        # apenas o maior componente corta metade do pavimento. Agregamos grupos
-        # arquitetonicos relevantes que compartilham a mesma faixa horizontal
-        # ou vertical com o grupo principal; blocos de legenda isolados ficam de
-        # fora por tamanho e falta de sobreposicao.
-        selected_bounds: list[tuple[int, int, int, int]] = []
-        for group in contour_groups:
-            bounds = group_bounds(group)
-            area = box_area(bounds)
-            horizontal_overlap = interval_overlap(
-                float(bounds[0]), float(bounds[2]),
-                float(best_bounds[0]), float(best_bounds[2]),
-            ) / max(1.0, min(bounds[2] - bounds[0], best_bounds[2] - best_bounds[0]))
-            vertical_overlap = interval_overlap(
-                float(bounds[1]), float(bounds[3]),
-                float(best_bounds[1]), float(best_bounds[3]),
-            ) / max(1.0, min(bounds[3] - bounds[1], best_bounds[3] - best_bounds[1]))
-            relevant_size = area >= max(image_area * 0.018, best_area * 0.07)
-            aligned_with_plan = max(horizontal_overlap, vertical_overlap) >= 0.20
-            if group is best_group or (relevant_size and aligned_with_plan):
-                selected_bounds.append(bounds)
-
-        if selected_bounds:
-            pad = max(1, int(round(min(width, height) * 0.002)))
-            contour_candidate = (
-                max(0, min(item[0] for item in selected_bounds) - pad),
-                max(0, min(item[1] for item in selected_bounds) - pad),
-                min(width, max(item[2] for item in selected_bounds) + pad),
-                min(height, max(item[3] for item in selected_bounds) + pad),
-            )
-            if box_area(contour_candidate) / image_area >= 0.15:
-                return contour_candidate
-
-    dark = (gray < 135).astype(np.uint8)
-    distance = cv2.distanceTransform(dark, cv2.DIST_L2, 3)
-    thick = (distance >= 1.35).astype(np.uint8) * 255
-    horizontal_size = max(7, int(round(width * 0.018)))
-    vertical_size = max(7, int(round(height * 0.018)))
-    horizontal = cv2.morphologyEx(
-        thick,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (horizontal_size, 1)),
-    )
-    vertical = cv2.morphologyEx(
-        thick,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (1, vertical_size)),
-    )
-    structural = cv2.bitwise_or(horizontal, vertical)
-    if np.count_nonzero(structural) < 40:
-        return 0, 0, width, height
-
-    # Join wall fragments across normal door/window gaps. The largest resulting
-    # component is the building; isolated title text and view arrows stay out.
-    join_width = max(25, int(round(min(width, height) * 0.12)))
-    join_height = max(17, int(round(min(width, height) * 0.075)))
-    if join_width % 2 == 0:
-        join_width += 1
-    if join_height % 2 == 0:
-        join_height += 1
-    connected = cv2.morphologyEx(
-        structural,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (join_width, join_height)),
-    )
-    contours = cv2.findContours(connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
-    if not contours:
-        return 0, 0, width, height
-    building = max(contours, key=cv2.contourArea)
-    x, y, box_width, box_height = cv2.boundingRect(building)
-    pad = max(1, int(round(min(width, height) * 0.002)))
-    left = max(0, x - pad)
-    top = max(0, y - pad)
-    right = min(width, x + box_width + pad)
-    bottom = min(height, y + box_height + pad)
-    if (right - left) * (bottom - top) < width * height * 0.12:
-        return 0, 0, width, height
-    return left, top, right, bottom
+from plantatobim.plan_image_framing import detect_building_bbox
 
 
 def box_orientation(box: list[float]) -> str:
@@ -258,6 +113,36 @@ def predict_multiscale(
     return detections
 
 
+def region_windows(shape: tuple, tile_size: int = 1536) -> list[tuple[int, int, int, int]]:
+    """Bounded 25%-overlapping coverage, in original crop pixel coordinates."""
+    height, width = shape[:2]
+    if max(height, width) <= 1800:
+        return []
+    # At most 4 windows per axis, even for images larger than our PDF budget.
+    tile_size = max(tile_size, math.ceil(max(height, width) / 3))
+    def starts(length):
+        if length <= tile_size:
+            return [0]
+        count = math.ceil((length - tile_size) / (tile_size * 0.75)) + 1
+        return [round(i * (length - tile_size) / (count - 1)) for i in range(count)]
+    return [(x, y, min(width, x + tile_size), min(height, y + tile_size))
+            for y in starts(height) for x in starts(width)]
+
+
+def translate_region_detection(detection: dict, region: tuple, shape: tuple) -> dict | None:
+    """Discard truncated interior-edge boxes and translate intact boxes once."""
+    left, top, right, bottom = region
+    height, width = shape[:2]
+    x1, y1, x2, y2 = detection['box_crop_px']
+    margin = 8
+    if ((left > 0 and x1 < margin) or (top > 0 and y1 < margin)
+            or (right < width and x2 > right - left - margin)
+            or (bottom < height and y2 > bottom - top - margin)):
+        return None
+    return {**detection, 'view': f'{left},{top},{right},{bottom}',
+            'box_crop_px': [x1 + left, y1 + top, x2 + left, y2 + top]}
+
+
 def predict_wall_segmentation(
     model: YOLO,
     crop: np.ndarray,
@@ -276,7 +161,9 @@ def predict_wall_segmentation(
         imgsz=image_size,
         device=device,
         max_det=300,
-        retina_masks=True,
+        # Keep instance masks at inference resolution. Expanding every instance
+        # to an A0 raster at once can allocate gigabytes; resize one at a time below.
+        retina_masks=False,
         verbose=False,
     )[0]
     combined = np.zeros((height, width), dtype=np.uint8)
@@ -286,11 +173,11 @@ def predict_wall_segmentation(
         confidences = [float(value) for value in result.boxes.conf.cpu().numpy()]
         for mask in masks:
             if mask.shape != combined.shape:
-                mask = cv2.resize(
-                    mask.astype(np.float32),
-                    (width, height),
-                    interpolation=cv2.INTER_LINEAR,
-                )
+                # Undo inference letterboxing before resizing, otherwise masks
+                # shift relative to walls/boxes on non-square PDF pages.
+                mask = scale_masks(
+                    torch.from_numpy(mask)[None, None], (height, width)
+                )[0, 0].numpy()
             combined[mask >= 0.50] = 255
     if np.count_nonzero(combined):
         combined = cv2.morphologyEx(
@@ -692,8 +579,21 @@ def consolidate_detections(
         strongest = max(cluster, key=lambda item: item["confidence"])
         if strongest["confidence"] < minimum_confidence or len(scales) < minimum_scale_support:
             continue
-        class_scores: dict[str, float] = {}
+        regional = [item for item in cluster if item.get('view')]
+        global_confidence = max((item['confidence'] for item in cluster if not item.get('view')), default=0)
+        # Recovery from detail views needs stronger evidence than a weak
+        # global proposal: enlarged furniture should not become extra windows.
+        if regional and global_confidence < 0.15 and strongest['confidence'] < 0.45:
+            continue
+        # Overlap must not multiply a class vote. Keep its strongest vote at
+        # each inference scale, irrespective of how many tiles saw the object.
+        votes: dict[tuple, dict] = {}
         for item in cluster:
+            key = (item['class'], item['scale'])
+            if key not in votes or item['confidence'] > votes[key]['confidence']:
+                votes[key] = item
+        class_scores: dict[str, float] = {}
+        for item in votes.values():
             class_scores[item["class"]] = class_scores.get(item["class"], 0.0) + item["confidence"]
         chosen_class = max(class_scores, key=class_scores.get)
         representative = max(
@@ -1299,6 +1199,8 @@ def main() -> None:
         default="geometry",
         help="Use classic geometry, YOLO-Seg, or a true deduplicated 2D+YOLO fusion.",
     )
+    parser.add_argument('--regions', action=argparse.BooleanOptionalAction, default=True,
+                        help='Combine the global pass with bounded overlapping detail regions.')
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1311,6 +1213,17 @@ def main() -> None:
 
     opening_model = YOLO(str(args.weights))
     raw = predict_multiscale(opening_model, crop, args.sizes, args.raw_confidence, args.device)
+    regions = region_windows(crop.shape) if args.regions else []
+    region_detection_count = 0
+    for region in regions:
+        x1, y1, x2, y2 = region
+        details = predict_multiscale(opening_model, crop[y1:y2, x1:x2],
+                                    [640, 960], max(0.15, args.raw_confidence), args.device)
+        for detection in details:
+            translated = translate_region_detection(detection, region, crop.shape)
+            if translated is not None:
+                raw.append(translated)
+                region_detection_count += 1
     candidates = consolidate_detections(
         raw,
         minimum_confidence=args.consensus_confidence,
@@ -1341,6 +1254,23 @@ def main() -> None:
                 device=args.device,
             )
             wall_segmentation.update(mask_diagnostic)
+            region_wall_pixels = 0
+            for region in regions:
+                x1, y1, x2, y2 = region
+                detail_mask, _ = predict_wall_segmentation(
+                    wall_model, crop[y1:y2, x1:x2], image_size=args.wall_size,
+                    confidence=max(0.35, args.wall_confidence), device=args.device,
+                )
+                # Ignore uncertain tile boundaries; overlapping neighbours and
+                # the full-plan pass retain coverage there.
+                if x1: detail_mask[:, :8] = 0
+                if y1: detail_mask[:8, :] = 0
+                if x2 < crop.shape[1]: detail_mask[:, -8:] = 0
+                if y2 < crop.shape[0]: detail_mask[-8:, :] = 0
+                target = predicted_wall_mask[y1:y2, x1:x2]
+                region_wall_pixels += int(np.count_nonzero((detail_mask > 0) & (target == 0)))
+                np.maximum(target, detail_mask, out=target)
+            wall_segmentation['region_recovered_pixels'] = region_wall_pixels
             write_image(args.output_dir / "yolo_wall_mask.png", predicted_wall_mask)
             write_image(
                 args.output_dir / "yolo_wall_mask_overlay.png",
@@ -1486,6 +1416,8 @@ def main() -> None:
         "source_image": str(args.image),
         "weights": str(args.weights),
         "crop_bbox_original_px": list(crop_bbox),
+        "regional_detection": {"enabled": args.regions, "regions": regions,
+                               "raw_opening_detections": region_detection_count},
         "crop_size_px": [crop.shape[1], crop.shape[0]],
         "canvas_width_m": args.canvas_width_m,
         "meters_per_pixel": meters_per_pixel,

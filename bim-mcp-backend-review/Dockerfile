@@ -23,9 +23,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY requirements-plan2bim.txt ./
-RUN pip install --no-cache-dir -r requirements-plan2bim.txt
+# The service is CPU-only. Installing PyTorch from the default index currently
+# pulls several gigabytes of CUDA 13 libraries that can never be used here.
+RUN pip install --no-cache-dir \
+      --index-url https://download.pytorch.org/whl/cpu \
+      torch==2.5.1+cpu torchvision==0.20.1+cpu \
+    && pip install --no-cache-dir -r requirements-plan2bim.txt
 
 COPY plan_to_bim_free_app.py ./
+COPY supabase_training_archive.py ./
 COPY plantatobim ./plantatobim
 COPY bim_editing ./bim_editing
 COPY experiments/plant2bim/run_pre_wall_opening_pipeline.py ./experiments/plant2bim/run_pre_wall_opening_pipeline.py
@@ -33,4 +39,4 @@ COPY models/plan2bim ./models/plan2bim
 
 EXPOSE 8080
 
-CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 2 --timeout 300 --graceful-timeout 30 --access-logfile - --error-logfile - plan_to_bim_free_app:app"]
+CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 2 --timeout 1800 --graceful-timeout 30 --access-logfile - --error-logfile - plan_to_bim_free_app:app"]

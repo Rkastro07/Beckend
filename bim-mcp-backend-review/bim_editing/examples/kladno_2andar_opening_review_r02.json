@@ -1,0 +1,45 @@
+{
+  "schema": "bim.edit-operations.v1",
+  "base_revision": "R01-client-wall-review",
+  "revision": "R02-opening-review",
+  "operations": [
+    {
+      "op": "delete_elements",
+      "ids": [
+        "W-S01-010",
+        "D-W-S01-014-01"
+      ]
+    },
+    {
+      "op": "set_opening_type",
+      "id": "J-W-S01-001-01",
+      "new_id": "D-W-S01-001-01",
+      "type": "door"
+    },
+    {
+      "op": "set_opening_type",
+      "id": "J-W-S01-006-01",
+      "new_id": "D-W-S01-006-03",
+      "type": "door"
+    },
+    {
+      "op": "move_opening",
+      "id": "D-W-S01-006-02",
+      "s_center": 7.115512377678734
+    }
+  ],
+  "recalculate": [
+    "openings",
+    "topology",
+    "spaces",
+    "slabs",
+    "validation"
+  ],
+  "render": {
+    "selected": [
+      "W-S01-001",
+      "W-S01-006",
+      "W-S01-014"
+    ]
+  }
+}

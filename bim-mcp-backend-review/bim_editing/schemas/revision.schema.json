@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.bim/schemas/revision.schema.json",
+  "title": "BIM edit revision",
+  "type": "object",
+  "required": [
+    "operations"
+  ],
+  "properties": {
+    "schema": {
+      "const": "bim.edit-operations.v1"
+    },
+    "base_revision": {
+      "type": "string"
+    },
+    "revision": {
+      "type": "string"
+    },
+    "operations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/operation"
+      }
+    },
+    "recalculate": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "openings",
+          "topology",
+          "spaces",
+          "slabs",
+          "validation"
+        ]
+      }
+    },
+    "policies": {
+      "type": "object",
+      "properties": {
+        "opening_out_of_bounds": {
+          "enum": [
+            "clamp",
+            "error"
+          ]
+        },
+        "topology_snap_tolerance": {
+          "type": "number",
+          "minimum": 0
+        },
+        "minimum_space_area": {
+          "type": "number",
+          "minimum": 0
+        },
+        "slab_fit_mode": {
+          "const": "outer_faces_hull"
+        }
+      },
+      "additionalProperties": true
+    },
+    "render": {
+      "type": "object",
+      "properties": {
+        "selected": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "operation": {
+      "type": "object",
+      "required": [
+        "op"
+      ],
+      "properties": {
+        "op": {
+          "enum": [
+            "delete_elements",
+            "add_wall",
+            "move_wall_endpoint",
+            "connect_endpoint",
+            "move_wall",
+            "set_wall_thickness",
+            "merge_walls",
+            "add_opening",
+            "insert_opening",
+            "move_opening",
+            "resize_opening",
+            "set_opening_type",
+            "change_opening_type",
+            "copy_opening_pattern",
+            "close_wall_junctions",
+            "close_small_gaps"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "selector": {
+          "type": "string"
+        },
+        "element": {
+          "type": "string"
+        },
+        "endpoint": {
+          "enum": [
+            "P1",
+            "P2"
+          ]
+        },
+        "target": {},
+        "from": {},
+        "p1": {},
+        "p2": {},
+        "direction": {},
+        "until": {},
+        "length": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "thickness": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "delta": {},
+        "wall_id": {
+          "type": "string"
+        },
+        "host_wall": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "door",
+            "window"
+          ]
+        },
+        "width": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "s_center": {
+          "type": "number"
+        },
+        "new_id": {
+          "type": "string"
+        },
+        "preserve_head": {
+          "type": "boolean"
+        },
+        "source_wall_id": {
+          "type": "string"
+        },
+        "target_wall_id": {
+          "type": "string"
+        },
+        "source_opening_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_distance": {
+          "type": "number",
+          "minimum": 0
+        },
+        "protect_openings": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

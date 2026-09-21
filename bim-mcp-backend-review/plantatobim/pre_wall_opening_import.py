@@ -107,6 +107,8 @@ def run_pre_wall_pipeline(
     if wall_source not in {"geometry", "yolo", "hybrid"}:
         wall_source = "hybrid"
     command.extend(["--wall-source", wall_source])
+    if str(os.environ.get('PLANT2BIM_REGIONS', 'true')).lower() in {'0', 'false', 'no'}:
+        command.append('--no-regions')
     if wall_weights_path.exists():
         command.extend(["--wall-weights", str(wall_weights_path)])
     try:
@@ -123,9 +125,11 @@ def run_pre_wall_pipeline(
             f"O detector YOLO excedeu {timeout_seconds} segundos."
         ) from exc
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "erro desconhecido").strip()
+        detail = (completed.stderr or completed.stdout or "sem saída de diagnóstico").strip()
+        if completed.returncode == -9:
+            detail += "; SIGKILL: processo encerrado externamente (possível limite de memória)"
         raise PreWallOpeningError(
-            f"Falha no detector YOLO pré-paredes: {detail[-1500:]}"
+            f"Falha no detector YOLO pré-paredes (código {completed.returncode}): {detail[-1500:]}"
         )
     result_path = output_dir / "result.json"
     if not result_path.exists():

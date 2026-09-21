@@ -1,190 +1,140 @@
-# 🏗️ BIM Analysis API - Backend
+# Plataforma BIM local
 
-This is the core backend service for the **BIM Analysis App**, submitted to the **Google AI Studio - Vibe Coding with Gemini 3 Pro Hackathon**.
+Raiz oficial dos sistemas BIM que compartilham o mesmo backend e a mesma
+interface.
 
-It is a robust Python/Flask application capable of auditing construction sites by comparing **As-Planned (IFC)** models against **As-Built (PLY)** point clouds.
+## Produtos ativos
 
-## 🔥 Key Features
+- **Vistoria OBB + Random Forest**: compara IFC e nuvem PLY para classificar o
+  progresso dos elementos. O backend oficial é `app_obb.py`.
+- **Geradores de simulação**: criam nuvens sintéticas de estágios de obra a
+  partir de IFC e geram o gabarito de status.
+- **Scan/Cloud-to-BIM V2**: processa E57, PLY e XYZ, detecta geometria e produz
+  PNG de aprovação antes do IFC final.
+- **Planta-to-BIM + referência OBB**: o foco principal é DWG/DXF com o detector
+  CAD V2, que combina layers, nomes de blocos, geometria, separação de plantas
+  e mapeamento manual. IFC/IFCZIP, SVG e PDF vetorial também entram no editor.
+  O modelo aprovado segue diretamente para o comparativo nuvem × IFC.
+- **CAD Object Grammar V3**: associa textos, dimensões, blocos anônimos e
+  geometria para reconhecer esquadrias antes do IFC, incluindo portões largos.
+- **Editor e biblioteca BIM**: operações determinísticas, spaces, lajes,
+  aberturas e receitas de modelagem compartilhadas pela plataforma e pelo MCP.
+- **Visita 3D híbrida**: abre Gaussian Splats e nuvens E57, PLY, XYZ, PTS,
+  PCD, LAS ou LAZ para navegação imersiva e captura PNG. Nuvens convencionais
+  são amostradas apenas para visualização; o pipeline BIM conserva o original.
+- **Conversão Pro durável**: no Cloud Run, o estado do pedido fica no Supabase
+  Postgres, plantas e resultados ficam no bucket privado `plan2bim-jobs` e o
+  processamento pago é disparado pelo Cloud Tasks. Sem essas variáveis, o
+  ambiente local mantém o executor em processo para testes.
 
-### 0. Unified Geometry → BIM Input
-The local modeler accepts IFC/IFCZIP, DXF and SVG through one editable model
-contract. IFC keeps storeys, names, GUIDs and openings; CAD/SVG keep vector
-geometry and infer semantics from layers. Meshes and point clouds are routed to
-the Cloud-to-BIM pipeline instead of being mislabeled as BIM objects. See
-[`docs/GEOMETRY_IMPORT.md`](docs/GEOMETRY_IMPORT.md).
+## Componentes retirados do runtime
 
-### Knowledge base for MCP
+Sonata, RandLA-Net e o antigo `pipeline_v2` não fazem parte da aplicação
+executável. A documentação histórica continua em `knowledge/` e `docs/` porque
+contém decisões e aprendizados úteis, mas não é carregada pelo backend.
 
-The original technical documentation, analysis notes, handoffs, Colab recipes,
-example configurations and notebooks are preserved under
-[`knowledge/`](knowledge/README.md). A tagged SHA-256 manifest is available for
-future MCP resources and semantic search.
+## Estrutura
 
-### BIM authoring recipe library
-
-[`bim_authoring/`](bim_authoring/README.md) is an executable engineering
-knowledge layer for BIM modeling. It currently creates metric walls and inserts
-doors or windows through the correct IFC opening/filling relationships. Seven
-versioned recipes are searchable through Python, local HTTP and MCP-ready
-resource payloads.
-
-### Implementation report
-
-The consolidated Portuguese report
-[`docs/RELATORIO_BIM_MCP_ATE_AGORA.md`](docs/RELATORIO_BIM_MCP_ATE_AGORA.md)
-records the architecture, implemented features, tests, Door Ground Floor case,
-R01 model revision, known limitations and next steps.
-
-The Cloud-to-BIM work session from 27/07/2026, including Opening Detector V2,
-IFC openings generation, the open-leaf experiment and the blind second-cloud
-test, is documented in
-[`docs/SESSAO_CLOUD2BIM_2026-07-27.md`](docs/SESSAO_CLOUD2BIM_2026-07-27.md).
-
-### 1. Hybrid Brute Force Alignment (Zero-Center)
-Solves the "floating model" problem where scan coordinates differ from BIM coordinates.
-* **Automatic Outlier Removal:** Uses statistical analysis to clean sensor noise.
-* **Zero-Center Normalization:** Temporarily moves both models to `(0,0,0)` to find the optimal rotation and translation match.
-* **Identity-first test:** Tries identity transform first, only replaces if another candidate is 1.30x better (avoids distorting already-aligned scans).
-
-### 2. Anti-Leaking Protection
-Prevents false positives in progress monitoring.
-* **T-Junction Detection:** Identifies wall intersections to shrink bounding boxes and avoid overlapping points.
-* **Dynamic Floor/Ceiling Cuts:** Automatically filters out points from slabs and roofs that "leak" into wall bounding boxes.
-
-### 3. Machine Learning Pipeline (COMPLETO / PARCIAL / AUSENTE)
-* **Random Forest classifier** (scikit-learn): 97.9% test accuracy, F1 macro 0.942
-* **MLP baseline** (PyTorch): 87.1% accuracy
-* **11 features** per object combining point cloud observations (completeness, height fill, Z distribution, density) + IFC metadata (type, axis, height)
-* **Split by building** to prevent variant leakage across train/val/test
-
-### 4. Instance Segmentation (RandLA-Net)
-Per-point instance labels to separate individual objects in the scan.
-
-### 5. Multi-Floor Mode
-Analyze all floors at once via `__TODOS__` sentinel, with subclass-aware IFC type matching (`IfcWallStandardCase` → `IfcWall`).
-
-### 6. AI-Powered Reporting
-Integrates with **DeepSeek LLM** to generate executive summaries based on the raw technical data extracted from the scan.
-
----
-
-## 🛠️ Tech Stack
-
-See [`STACK.md`](./STACK.md) for the full list.
-
-* **Python 3.10+** (backend)
-* **Flask** + **Flask-CORS** (API server — port 8080)
-* **Open3D** (point cloud processing & alignment)
-* **IfcOpenShell** (BIM geometry extraction)
-* **NumPy** (vector math & matrix transformations)
-* **scikit-learn** + **PyTorch** (ML models)
-* **React 19** + **TypeScript** + **Vite** (frontend — port 3000)
-* **three.js** + **@react-three/fiber** + **web-ifc** (3D viewer)
-
----
-
-## 🚀 Installation & Usage
-
-### 1. Clone the repository
-```bash
-git clone https://github.com/Rkastro07/Beckend.git
-cd Beckend
+```text
+app_obb.py                   backend Flask oficial
+bim-ai-superintendent/       plataforma React com todos os produtos
+simulation/                  geradores sintéticos do produto OBB
+bim_editing/                 operações e revisões BIM
+bim_authoring/               receitas BIM
+experiments/cloud2bim/       motor atual de detecção da nuvem
+plantatobim/                 importação e exportação IFC
+runtime/                     launchers, diagnóstico e runtime portátil
+knowledge/                   documentação consultável para o MCP
 ```
 
-### 2. Backend setup
-```bash
-pip install -r requirements.txt     # or install manually
-python app.py                       # starts on http://127.0.0.1:8080
+O modelo Random Forest ativo é empacotado em
+`.runtime/models/random_forest.pkl`. O diretório `.runtime` não deve ser
+versionado.
+
+## Executar
+
+Backend e frontend:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File runtime\run_platform.ps1
 ```
 
-### 3. Frontend setup
-```bash
-cd bim-ai-superintendent
-npm install
-npm run dev                         # starts on http://localhost:3000
+Somente o backend:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File runtime\run_backend.ps1
 ```
 
----
+Pipeline Cloud-to-BIM direto:
 
-## ⚠️ Files NOT included in git (must be regenerated/trained)
-
-To keep the repo lean, the following are listed in `.gitignore` and need to be recreated after cloning:
-
-### Dataset
-- `dataset/sintetico/` — synthetic training dataset (generated from IFC models)
-- `dataset/ply teste/` — test PLYs
-
-**Regenerate:** run the dataset generator scripts in `dataset/`:
-```bash
-python dataset/gerar_dataset_sintetico.py
-python dataset/gerar_ply_teste_especiais.py    # 19 test buildings × 3 stages
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File runtime\run_cloud2bim.ps1 `
+  -InputCloud "C:\caminho\nuvem.e57"
 ```
 
-### Trained ML models
-- `ml/models/random_forest.pkl` — trained RandomForest (~55MB)
-- MLP checkpoints (`.pt`)
-- RandLA-Net checkpoints (`randlanet/checkpoints/`)
+Diagnóstico offline:
 
-**Retrain:** takes ~1-2 minutes for RF+MLP on a modern CPU/GPU:
-```bash
-python ml/train.py
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File runtime\doctor.ps1
 ```
 
-This produces:
-- `ml/models/random_forest.pkl`
-- `ml/models/mlp_bim.pt`
+A API usa `http://localhost:8081` e o frontend usa
+`http://localhost:3000`. O processamento local não instala bibliotecas durante
+a execução.
 
-### Why not in git?
-- **Binaries don't belong in git** — they bloat history and slow clones
-- **Reproducibility** — training script is the source of truth
-- **Sizes:** RF `.pkl` ≈ 55 MB, dataset ≈ several GB
+## Referência para vistoria
 
-### If you need to share trained models
-Use **GitHub Releases** (up to 2GB per file) or **Git LFS** (`git lfs track "*.pkl"`).
+O painel **Modelo de referência** aceita um IFC pronto ou uma planta. O fluxo
+de planta é:
 
----
-
-## 📁 Project structure
-
-```
-Beckend/
-├── app.py                    # Main Flask backend (production)
-├── app1.py                   # OBB experiment branch
-├── usdz_to_ply.py           # USDZ (KIRI/RoomPlan) → PLY converter
-├── ml/
-│   ├── train.py             # RF + MLP training pipeline
-│   └── models/              # trained models (gitignored)
-├── randlanet/               # RandLA-Net instance segmentation
-├── dataset/
-│   ├── sintetico/          # training data (gitignored)
-│   ├── ply teste/          # test PLYs (gitignored)
-│   ├── ifc/                # source IFC files
-│   └── gerar_*.py          # dataset generators
-├── bim-ai-superintendent/   # React frontend
-│   ├── App.tsx
-│   ├── components/
-│   └── services/
-├── docs/
-│   └── RANDOM_FOREST.md    # RF deep dive
-└── STACK.md                 # full stack summary
+```text
+DXF/DWG/SVG/PDF/IFCZIP
+        ↓
+importação geométrica
+        ↓
+revisão no editor 2D
+        ↓
+IFC aprovado + token em cache
+        ↓
+comparação Cloud × IFC no OBB
 ```
 
----
+O PDF precisa conter vetores; PDF escaneado não é tratado como geometria. A
+escala inicial é 1:50 e pode ser corrigida e reprocessada no editor. DWG usa o
+GNU LibreDWG 0.13.4 local, com AutoCAD Core Console apenas como fallback, para
+gerar um DXF intermediário.
+DWF clássico é reconhecido para diagnóstico, mas deve ser exportado como DWG,
+DXF ou PDF vetorial antes da edição.
 
-## 🧪 Quick test
+Detalhes e contrato HTTP:
+[`docs/REFERENCE_INGESTION_V1.md`](docs/REFERENCE_INGESTION_V1.md).
 
-1. Start backend: `python app.py`
-2. Start frontend: `cd bim-ai-superintendent && npm run dev`
-3. Open http://localhost:3000
-4. Upload an IFC and a PLY
-5. Pick analysis mode: `BBox`, `ML`, `Both`, or `Instances`
-6. Click **Processar Análise**
+O detector e o painel de layers CAD estão documentados em
+[`docs/CAD_DETECTOR_V2.md`](docs/CAD_DETECTOR_V2.md).
 
----
+O visualizador de nuvens e Gaussian Splats, incluindo formatos, protocolo
+binário, limites e diagnóstico, está documentado em
+[`docs/VISUALIZADOR_3D_HIBRIDO.md`](docs/VISUALIZADOR_3D_HIBRIDO.md).
 
-## 📊 Current metrics
+## Servidor MCP BIM
 
-- **Dataset:** 1290 samples / 129 buildings (split 91/19/19 by building)
-- **RandomForest:** 97.9% accuracy, F1 macro 0.942
-- **MLP (PyTorch):** 87.1% accuracy
-- **Classes:** COMPLETO / PARCIAL / AUSENTE
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File runtime\run_mcp.ps1
+```
+
+O MCP usa o mesmo editor JSON e o mesmo gerador IFC da plataforma. O contrato
+obriga a gerar PNG de aprovacao antes de aceitar `approved=true` para exportar
+o IFC. As ferramentas retornam caminhos absolutos e URIs de todos os
+artefatos.
+
+A engenharia não fica implícita no prompt. O servidor publica:
+
+- `bim://engineering/stack`: responsabilidade de IfcOpenShell, Shapely,
+  Planta-to-BIM, receitas e catálogo;
+- `bim://authoring/recipes`: contratos geométricos e semânticos pesquisáveis;
+- `bim://ifc-library/summary`: evidência extraída de 262 modelos IFC;
+- `bim://ifc-library/relationship-patterns`: relações reais de parede, abertura,
+  porta e janela.
+
+As receitas são normativas e podem ser executáveis; o catálogo de modelos é
+referência somente leitura e não substitui o motor geométrico.

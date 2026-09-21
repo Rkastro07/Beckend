@@ -10,7 +10,7 @@ O contrato de saida e o mesmo usado por ``planta_to_ifc_v1``:
         "source": {...},
     }
 
-IFC e importado semanticamente. SVG/DXF passam pelo reconhecedor vetorial.
+IFC e importado semanticamente. SVG/DXF/PDF/DWG passam pelo reconhecedor vetorial.
 Malhas e nuvens aparecem no catalogo, mas sao encaminhadas ao Cloud-to-BIM:
 uma superficie triangulada nao deve virar uma parede BIM por adivinhacao.
 """
@@ -30,7 +30,7 @@ class GeometryImportError(ValueError):
     """Erro de entrada com mensagem apropriada para API/usuario."""
 
 
-DIRECT_EDIT_FORMATS = (".dxf", ".svg", ".ifc", ".ifczip")
+DIRECT_EDIT_FORMATS = (".dxf", ".svg", ".pdf", ".dwg", ".ifc", ".ifczip")
 
 FORMAT_CAPABILITIES = {
     ".ifc": {
@@ -65,12 +65,28 @@ FORMAT_CAPABILITIES = {
         "endpoint": "/api/planta/importar",
         "preserva": ["paths", "linhas", "polylines", "poligonos", "layers/grupos"],
     },
+    ".pdf": {
+        "familia": "documento_vetorial",
+        "modo": "vetorial",
+        "rota": "modelador",
+        "status": "disponivel",
+        "endpoint": "/api/referencia/importar",
+        "preserva": ["linhas", "retangulos", "curvas vetoriais tesselladas"],
+    },
     ".dwg": {
         "familia": "cad",
         "modo": "conversao",
-        "rota": "conversor-dwg-dxf",
-        "status": "requer_conversor_local",
+        "rota": "modelador",
+        "status": "disponivel_com_autocad_local",
+        "endpoint": "/api/referencia/importar",
         "preserva": ["geometria CAD apos conversao confiavel"],
+    },
+    ".dwf": {
+        "familia": "publicacao_cad",
+        "modo": "underlay",
+        "rota": "exportar-dwg-dxf-pdf",
+        "status": "diagnostico_sem_conversao_geometrica",
+        "preserva": ["metadados e preview; W2D não é editável pelo runtime"],
     },
     ".dgn": {
         "familia": "cad",
@@ -206,16 +222,15 @@ FORMAT_CAPABILITIES = {
         "familia": "nuvem",
         "modo": "geometria_3d",
         "rota": "cloud-to-bim",
-        "status": "disponivel_via_asc-to-ply",
-        "endpoint": "/api/tools/asc-to-ply",
+        "status": "nao_suportado",
         "preserva": ["pontos"],
     },
     ".xyz": {
         "familia": "nuvem",
         "modo": "geometria_3d",
         "rota": "cloud-to-bim",
-        "status": "disponivel_via_asc-to-ply",
-        "endpoint": "/api/tools/asc-to-ply",
+        "status": "disponivel",
+        "endpoint": "/api/scan/upload",
         "preserva": ["pontos"],
     },
     ".las": {
@@ -237,35 +252,118 @@ FORMAT_CAPABILITIES = {
 
 def format_capabilities():
     """Catalogo serializavel para front-end e futuro MCP resource."""
+    from cad_converters import converter_status
+
+    converters = converter_status()
+    formats = {
+        extension: dict(capability)
+        for extension, capability in FORMAT_CAPABILITIES.items()
+    }
+    dwg_converter = converters["dwg"]
+    formats[".dwg"]["converter_available"] = dwg_converter["available"]
+    formats[".dwg"]["status"] = (
+        "disponivel" if dwg_converter["available"]
+        else "requer_conversor_dwg"
+    )
+    formats[".dwg"]["converter"] = dwg_converter["preferred"]
     return {
         "entrada_editavel": list(DIRECT_EDIT_FORMATS),
-        "formatos": FORMAT_CAPABILITIES,
+        "formatos": formats,
+        "conversores": converters,
         "regra": (
-            "BIM preserva semantica; CAD/SVG preservam vetores; "
+            "BIM preserva semantica; CAD/SVG/PDF preservam vetores; "
             "malhas e nuvens seguem para Cloud-to-BIM."
         ),
     }
 
 
-def importar_geometria(path, escala_forcada=None, esp_default=0.15, pavimento=None):
+def importar_geometria(
+    path,
+    escala_forcada=None,
+    esp_default=0.15,
+    pavimento=None,
+    pdf_scale=50.0,
+    pagina=0,
+    cad_layer_map=None,
+    cad_region=None,
+    linked_image=None,
+):
     """Despacha uma entrada geometrica para o importador correto."""
     path = Path(path)
     ext = path.suffix.lower()
     if ext == ".dxf":
         import planta_to_ifc_v1 as pl
 
-        modelo = pl.parse_dxf(path, escala_forcada=escala_forcada,
-                              esp_default=esp_default)
-        modelo["source"] = {
+        modelo = pl.parse_dxf(
+            path,
+            escala_forcada=escala_forcada,
+            esp_default=esp_default,
+            layer_map=cad_layer_map,
+            cad_region=cad_region,
+            linked_image=linked_image,
+        )
+        source = dict(modelo.get("source") or {})
+        source.update({
             "format": "dxf",
             "family": "cad",
-            "mode": "vector",
-            "semantic_level": "inferred",
-        }
+            "mode": "cad-v2",
+            "semantic_level": "layer-block-text-raster-geometry",
+        })
+        modelo["source"] = source
         return modelo
     if ext == ".svg":
         return importar_svg(path, escala_forcada=escala_forcada,
                             esp_default=esp_default)
+    if ext == ".pdf":
+        return importar_pdf(
+            path,
+            escala_forcada=escala_forcada,
+            esp_default=esp_default,
+            pdf_scale=pdf_scale,
+            pagina=pagina,
+        )
+    if ext == ".dwg":
+        from cad_converters import (
+            CadConversionError,
+            convert_dwg_to_dxf_with_details,
+        )
+
+        with tempfile.TemporaryDirectory(prefix="plantatobim_dwg_") as temp_dir:
+            dxf_path = Path(temp_dir) / f"{path.stem}.dxf"
+            try:
+                _converted, conversion = convert_dwg_to_dxf_with_details(
+                    path, dxf_path,
+                )
+            except CadConversionError as exc:
+                raise GeometryImportError(str(exc)) from exc
+            import planta_to_ifc_v1 as pl
+
+            modelo = pl.parse_dxf(
+                dxf_path,
+                escala_forcada=escala_forcada,
+                esp_default=esp_default,
+                layer_map=cad_layer_map,
+                cad_region=cad_region,
+                linked_image=linked_image,
+            )
+        modelo["warnings"] = list(modelo.get("warnings") or [])
+        modelo["warnings"].append(
+            f"DWG convertido por {conversion['label']} antes do reconhecimento "
+            f"({conversion['validation']['geometric_entities']} entidades "
+            "geométricas validadas)."
+        )
+        source = dict(modelo.get("source") or {})
+        source.update({
+            "format": "dwg",
+            "family": "cad",
+            "mode": "conversion-to-dxf-cad-v2",
+            "semantic_level": "layer-block-text-raster-geometry",
+            "converter": conversion["label"],
+            "conversion_engine": conversion["engine"],
+            "conversion_validation": conversion["validation"],
+        })
+        modelo["source"] = source
+        return modelo
     if ext == ".ifc":
         return importar_ifc(path, pavimento=pavimento,
                             esp_default=esp_default)
@@ -590,6 +688,11 @@ def read_svg_geometry(svg_path, escala_forcada=None):
         for record in wall_records for a, b in record["segments"]
         if np.linalg.norm((b - a) * scale) >= 0.05
     ]
+    reference_segments = [
+        (a * scale, b * scale, record["label"])
+        for record in records for a, b in record["segments"]
+        if np.linalg.norm((b - a) * scale) >= 1e-5
+    ]
     openings = []
     for record in records:
         if record["role"] not in ("door", "window"):
@@ -605,6 +708,7 @@ def read_svg_geometry(svg_path, escala_forcada=None):
         warnings.append(f"{arc_chords} arco(s) de path SVG representado(s) pela corda.")
     return {
         "segments": wall_segments,
+        "reference_segments": reference_segments,
         "openings": openings,
         "scale": scale,
         "scale_source": scale_source,
@@ -635,6 +739,7 @@ def importar_svg(svg_path, escala_forcada=None, esp_default=0.15):
         "n_cantos": n_cost,
         "n_blocos_esq": len(data["openings"]),
         "laje_contorno": pl.contorno_laje(paredes),
+        "reference": pl.referencia_vetorial(data["reference_segments"]),
         "warnings": data["warnings"],
         "source": {
             "format": "svg",
@@ -643,6 +748,152 @@ def importar_svg(svg_path, escala_forcada=None, esp_default=0.15):
             "semantic_level": "layer-inferred" if not data["warnings"] else "geometry-inferred",
             "scale_source": data["scale_source"],
             "vector_records": data["records"],
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# PDF vetorial
+# ---------------------------------------------------------------------------
+def read_pdf_geometry(
+    pdf_path,
+    *,
+    escala_forcada=None,
+    pdf_scale=50.0,
+    pagina=0,
+):
+    """Extrai arestas vetoriais de uma página PDF e converte para metros.
+
+    PDF usa pontos tipográficos (1/72"). Sem ``escala_forcada``, o denominador
+    informado em ``pdf_scale`` transforma a medida do papel na medida real.
+    """
+    try:
+        import pdfplumber
+    except ImportError as exc:
+        raise GeometryImportError(
+            "pdfplumber não está instalado no runtime."
+        ) from exc
+
+    try:
+        page_index = int(pagina)
+        denominator = float(pdf_scale)
+    except (TypeError, ValueError) as exc:
+        raise GeometryImportError(
+            "Página e escala do PDF precisam ser numéricas."
+        ) from exc
+    if denominator <= 0:
+        raise GeometryImportError("A escala do PDF precisa ser maior que zero.")
+
+    with pdfplumber.open(str(pdf_path)) as document:
+        if not document.pages:
+            raise GeometryImportError("PDF sem páginas.")
+        if page_index < 0 or page_index >= len(document.pages):
+            raise GeometryImportError(
+                f"Página PDF {page_index + 1} inexistente; "
+                f"o arquivo possui {len(document.pages)} página(s)."
+            )
+        page = document.pages[page_index]
+        raw_edges = list(page.edges)
+        page_count = len(document.pages)
+
+    segments = []
+    seen = set()
+    for edge in raw_edges:
+        try:
+            a = np.array([float(edge["x0"]), float(edge["y0"])])
+            b = np.array([float(edge["x1"]), float(edge["y1"])])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if np.linalg.norm(b - a) < 0.5:
+            continue
+        ordered = sorted((
+            (round(float(a[0]), 4), round(float(a[1]), 4)),
+            (round(float(b[0]), 4), round(float(b[1]), 4)),
+        ))
+        key = tuple(ordered)
+        if key in seen:
+            continue
+        seen.add(key)
+        segments.append((a, b, "PDF-Vector"))
+    if not segments:
+        raise GeometryImportError(
+            "PDF sem linhas vetoriais. O arquivo pode ser apenas uma imagem "
+            "rasterizada; neste caso, use o leitor de imagem/planta."
+        )
+
+    if escala_forcada is not None:
+        scale = float(escala_forcada)
+        scale_source = "forced-meters-per-point"
+    else:
+        scale = (0.0254 / 72.0) * denominator
+        scale_source = f"pdf-paper-1:{denominator:g}"
+    return {
+        "segments": [(a * scale, b * scale, label) for a, b, label in segments],
+        "scale": scale,
+        "scale_source": scale_source,
+        "paper_scale_denominator": denominator,
+        "page_index": page_index,
+        "page_count": page_count,
+        "vector_records": len(segments),
+    }
+
+
+def importar_pdf(
+    pdf_path,
+    *,
+    escala_forcada=None,
+    esp_default=0.15,
+    pdf_scale=50.0,
+    pagina=0,
+):
+    import planta_to_ifc_v1 as pl
+
+    data = read_pdf_geometry(
+        pdf_path,
+        escala_forcada=escala_forcada,
+        pdf_scale=pdf_scale,
+        pagina=pagina,
+    )
+    segs = pl.mesclar_colineares(data["segments"])
+    paredes, sobras = pl.parear_paredes(segs)
+    frac = pl.fracao_pareada(paredes, segs)
+    single = frac < pl.SINGLE_LINE_FRAC
+    if single:
+        paredes = pl.paredes_single_line(segs, esp_default)
+        sobras = []
+    paredes, n_cost = pl.costurar_cantos(paredes)
+    warnings = [
+        (
+            f"PDF interpretado na página {data['page_index'] + 1} com escala "
+            f"de papel 1:{data['paper_scale_denominator']:g}; revise uma "
+            "dimensão conhecida antes de aprovar o IFC."
+        ),
+        (
+            "PDF não preserva layers CAD de forma padronizada; linhas "
+            "vetoriais foram classificadas geometricamente."
+        ),
+    ]
+    return {
+        "paredes": paredes,
+        "aberturas": [],
+        "escala": data["scale"],
+        "single_line": single,
+        "n_sobras": len(sobras),
+        "n_cantos": n_cost,
+        "n_blocos_esq": 0,
+        "laje_contorno": pl.contorno_laje(paredes),
+        "reference": pl.referencia_vetorial(data["segments"]),
+        "warnings": warnings,
+        "source": {
+            "format": "pdf",
+            "family": "document-vector",
+            "mode": "vector",
+            "semantic_level": "geometry-inferred",
+            "scale_source": data["scale_source"],
+            "paper_scale_denominator": data["paper_scale_denominator"],
+            "page_index": data["page_index"],
+            "page_count": data["page_count"],
+            "vector_records": data["vector_records"],
         },
     }
 
@@ -773,6 +1024,8 @@ def _select_storey(storeys, requested):
 
 def importar_ifc(ifc_path, pavimento=None, esp_default=0.15):
     """IFC -> modelo 2D editavel, preservando semantica e proveniencia."""
+    import planta_to_ifc_v1 as pl
+
     try:
         import ifcopenshell
         import ifcopenshell.geom as ifc_geom
@@ -816,11 +1069,18 @@ def importar_ifc(ifc_path, pavimento=None, esp_default=0.15):
     internal_walls = []
     wall_index = {}
     wall_world_base = {}
+    reference_segments = []
     approximated = 0
     for wall in walls:
         try:
             vertices = _ifc_shape_vertices(wall, ifc_geom)
             fitted = _fit_wall_from_vertices(vertices, esp_default=esp_default)
+            footprint = _convex_hull(vertices[:, :2])
+            if len(footprint) >= 2:
+                reference_segments.extend(
+                    (a, b, "IFC-Wall")
+                    for a, b in zip(footprint, footprint[1:] + footprint[:1])
+                )
         except Exception as exc:
             warnings.append(
                 f"Parede {_entity_name(wall, str(wall.id()))} ignorada: {exc}"
@@ -917,6 +1177,12 @@ def importar_ifc(ifc_path, pavimento=None, esp_default=0.15):
             vertices = _ifc_shape_vertices(slab, ifc_geom)
             slab_points.extend(vertices[:, :2])
             slab_thicknesses.append(float(np.ptp(vertices[:, 2])))
+            footprint = _convex_hull(vertices[:, :2])
+            if len(footprint) >= 2:
+                reference_segments.extend(
+                    (a, b, "IFC-Slab")
+                    for a, b in zip(footprint, footprint[1:] + footprint[:1])
+                )
         except Exception as exc:
             warnings.append(f"Laje {_entity_name(slab, str(slab.id()))} ignorada: {exc}")
     if slab_points:
@@ -953,6 +1219,7 @@ def importar_ifc(ifc_path, pavimento=None, esp_default=0.15):
         "n_elementos": len(internal_walls) + len(openings) + len(slabs),
         "n_aproximados": approximated,
         "laje_contorno": contour,
+        "reference": pl.referencia_vetorial(reference_segments),
         "laje_faces": {
             "piso": {"ativo": bool(slabs), "espessura": slab_thickness},
             "teto": {"ativo": False, "espessura": slab_thickness},
