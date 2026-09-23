@@ -45,6 +45,18 @@ def test_order_limit_is_separate_from_upload_limit(monkeypatch):
         guard.check_order(owner_id="user-1", client_ip="203.0.113.8")
 
 
+def test_first_preview_has_global_and_ip_cost_caps(monkeypatch):
+    monkeypatch.setenv("PLAN_BIM_FIRST_PREVIEWS_PER_DAY", "2")
+    monkeypatch.setenv("PLAN_BIM_FIRST_PREVIEWS_PER_IP_DAY", "1")
+    guard = OperationalGuard(secret="test-secret", clock=lambda: 1000.0)
+    guard.check_first_preview(client_ip="203.0.113.8")
+    with pytest.raises(RateLimitExceeded):
+        guard.check_first_preview(client_ip="203.0.113.8")
+    guard.check_first_preview(client_ip="203.0.113.9")
+    with pytest.raises(RateLimitExceeded):
+        guard.check_first_preview(client_ip="203.0.113.10")
+
+
 def test_durable_store_receives_only_hashed_identity(monkeypatch):
     monkeypatch.setenv("PLAN_BIM_UPLOADS_PER_IP_HOUR", "1")
     store = FakeDurableStore()
@@ -60,6 +72,7 @@ def test_durable_store_receives_only_hashed_identity(monkeypatch):
 
 
 def test_upload_endpoint_returns_429_and_retry_after(monkeypatch):
+    monkeypatch.setattr(free_app, "PAID_ONLY_FLOW", False)
     class RejectingGuard:
         def check_upload(self, **_kwargs):
             raise RateLimitExceeded("Limite de teste atingido.", 123)

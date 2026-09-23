@@ -80,6 +80,16 @@ class OperationalGuard:
             _positive_int("PLAN_BIM_ORDERS_PER_IP_DAY", 10),
             24 * 60 * 60,
         )
+        self.preview_global = LimitRule(
+            "first-preview-global",
+            _positive_int("PLAN_BIM_FIRST_PREVIEWS_PER_DAY", 15),
+            24 * 60 * 60,
+        )
+        self.preview_ip = LimitRule(
+            "first-preview-ip",
+            _positive_int("PLAN_BIM_FIRST_PREVIEWS_PER_IP_DAY", 2),
+            24 * 60 * 60,
+        )
 
     def fingerprint(self, value: str) -> str:
         normalized = str(value or "unknown").strip().lower() or "unknown"
@@ -139,4 +149,16 @@ class OperationalGuard:
             self.order_ip,
             f"ip:{client_ip}",
             "Muitos pedidos foram iniciados desta conexão hoje. Tente novamente mais tarde.",
+        )
+
+    def check_first_preview(self, *, client_ip: str) -> None:
+        self._consume(
+            self.preview_ip,
+            f"ip:{client_ip}",
+            "O limite de prévias desta conexão foi atingido hoje. Tente novamente amanhã.",
+        )
+        self._consume(
+            self.preview_global,
+            "plan2bim:first-preview",
+            "As prévias de hoje se esgotaram. Tente novamente amanhã.",
         )

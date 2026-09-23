@@ -194,6 +194,17 @@ class SupabaseJobStore:
         )
         return [deepcopy(row["state"]) for row in json.loads(body or b"[]")]
 
+    def claim_first_preview(self, *, owner_id: str, job: str) -> bool:
+        """Atomically reserve the single introductory analysis for an account."""
+        body = self._call(
+            "POST",
+            "/rest/v1/rpc/claim_plan_bim_first_preview",
+            data=_json_bytes({"p_owner_id": owner_id, "p_job_id": job}),
+            content_type="application/json",
+            expected=(200,),
+        )
+        return json.loads(body or b"false") is True
+
     def find_by_external_reference(
         self, external_reference: str
     ) -> dict[str, Any] | None:
@@ -371,6 +382,17 @@ class SupabaseJobStore:
             if not isinstance(state, dict) or state.get("files_purged_at"):
                 skipped += 1
                 continue
+            expiration_value = str((state.get("retention") or {}).get("files_delete_after") or "")
+            if expiration_value:
+                try:
+                    expiration = datetime.fromisoformat(expiration_value.replace("Z", "+00:00"))
+                    if expiration.tzinfo is None:
+                        expiration = expiration.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    expiration = None
+                if expiration is not None and expiration > datetime.now(timezone.utc):
+                    skipped += 1
+                    continue
             source = state.get("source") if isinstance(state.get("source"), dict) else {}
             object_paths = [
                 source.get("original_object"),

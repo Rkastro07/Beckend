@@ -397,6 +397,55 @@ class OpenAIResponsesClient:
             raise GptPlanError("A API não devolveu conteúdo estruturado.")
         return "".join(parts)
 
+    def create_background_structured(
+        self, *, schema_name, schema, instructions, user_text, images,
+        reasoning_effort="high", store=False,
+    ):
+        """Submit once; the caller must persist intent BEFORE calling this method.
+
+        Kept separate from structured(): architectural calls retain store=False
+        and their existing behavior. No HTTP retry is installed here.
+        """
+        if not self.configured():
+            raise GptPlanUnavailable("OPENAI_API_KEY não configurada no servidor.")
+        content = [{"type": "input_text", "text": user_text}]
+        content.extend({"type": "input_image", "image_url": image, "detail": "original"}
+                       for image in images)
+        response = self.session.post(
+            OPENAI_RESPONSES_URL,
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            json={
+                "model": self.model, "background": True, "store": store,
+                "instructions": instructions,
+                "input": [{"role": "user", "content": content}],
+                "reasoning": {"effort": reasoning_effort},
+                "max_output_tokens": self.max_output_tokens,
+                "text": {"verbosity": "low", "format": {
+                    "type": "json_schema", "name": schema_name, "strict": True, "schema": schema,
+                }},
+            },
+            timeout=min(self.timeout_seconds, 60),
+        )
+        if response.status_code >= 400:
+            raise GptPlanError(f"Submissão OpenAI recusada (HTTP {response.status_code}).")
+        return response.json()
+
+    def retrieve_background(self, response_id):
+        """Retrieve only: never create a replacement response after timeout."""
+        import re
+        if not self.configured():
+            raise GptPlanUnavailable("OPENAI_API_KEY não configurada no servidor.")
+        if not re.fullmatch(r"resp_[A-Za-z0-9_-]+", response_id or ""):
+            raise GptPlanError("Identificador de resposta inválido.")
+        response = self.session.get(
+            f"{OPENAI_RESPONSES_URL}/{response_id}",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=min(self.timeout_seconds, 60),
+        )
+        if response.status_code >= 400:
+            raise GptPlanError(f"Consulta OpenAI falhou (HTTP {response.status_code}).")
+        return response.json()
+
     def structured(
         self,
         *,

@@ -20,8 +20,9 @@ from PIL import Image
 from werkzeug.utils import secure_filename
 
 from plantatobim.astra_local_flow import AstraLocalFlowManager
+from plantatobim.sol_low_review_stage import SolLowReviewStage
 from plantatobim.assisted_order import AssistedOrderManager
-from plantatobim.mercadopago_checkout import MercadoPagoError
+from plantatobim.mercadopago_checkout import MercadoPagoCheckout, MercadoPagoError
 from plantatobim.operational_guard import OperationalGuard, RateLimitExceeded
 from plantatobim.local_area_estimator import estimate_local_area
 from plantatobim.supabase_auth import COOKIE_NAME, SupabaseAuth, cookie_options
@@ -41,8 +42,34 @@ JOB_ID_PATTERN = re.compile(r"^[a-f0-9]{10}$")
 
 OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
 load_local_env(Path(__file__).with_name(".env"))
+LOW_COST_LOCAL_PILOT = str(os.environ.get("PLAN_BIM_SOL_LOW_PILOT", "false")).lower() in {
+    "1", "true", "yes", "on"
+}
+FIRST_PREVIEW_ENABLED = str(os.environ.get("PLAN_BIM_FIRST_PREVIEW_ENABLED", "false")).lower() in {
+    "1", "true", "yes", "on"
+}
+PAID_ONLY_FLOW = LOW_COST_LOCAL_PILOT or FIRST_PREVIEW_ENABLED
 TRAINING_ARCHIVE = SupabaseTrainingArchive.from_env()
-ASTRA_FLOW_MANAGER = AstraLocalFlowManager(OUTPUT_FOLDER / "astra_jobs")
+PILOT_PAYMENT_GATEWAY = None
+if LOW_COST_LOCAL_PILOT:
+    PILOT_PAYMENT_GATEWAY = MercadoPagoCheckout.from_env()
+    # The generic credential may be live. Never use it for this sandbox-only pilot.
+    PILOT_PAYMENT_GATEWAY.access_token = os.environ.get(
+        "MERCADOPAGO_ACCESS_TOKEN_TEST", ""
+    ).strip()
+    PILOT_PAYMENT_GATEWAY.webhook_secret = os.environ.get(
+        "MERCADOPAGO_WEBHOOK_SECRET_TEST", ""
+    ).strip()
+    # Local orders must not redirect to, or notify, the deployed production site.
+    PILOT_PAYMENT_GATEWAY.public_frontend_url = None
+    PILOT_PAYMENT_GATEWAY.public_backend_url = None
+ASTRA_FLOW_MANAGER = AstraLocalFlowManager(
+    OUTPUT_FOLDER / ("sol_low_pilot_jobs" if LOW_COST_LOCAL_PILOT else "astra_jobs"),
+    first_preview_enabled=FIRST_PREVIEW_ENABLED,
+    **({"sol_stage_factory": SolLowReviewStage, "low_cost_pilot": True,
+        "payment_gateway": PILOT_PAYMENT_GATEWAY}
+       if LOW_COST_LOCAL_PILOT else {}),
+)
 ASSISTED_ORDER_MANAGER = AssistedOrderManager(
     OUTPUT_FOLDER / "assisted_orders",
     payment_gateway=ASTRA_FLOW_MANAGER.payment_gateway,
@@ -72,7 +99,7 @@ def _truthy(value) -> bool:
 
 ASSISTED_ORDER_ENABLED = _truthy(
     os.environ.get("PLAN_BIM_ASSISTED_ORDER_ENABLED", "true")
-)
+) and not LOW_COST_LOCAL_PILOT
 
 
 def _safe_source_job(value) -> str | None:
@@ -193,14 +220,16 @@ def create_app() -> Flask:
     @app.get("/")
     @app.get("/api/health")
     def health():
-        capabilities = ["plan-to-bim", "editor-2d-3d", "ifc4", "dxf"]
+        capabilities = ["editor-2d-3d", "ifc4", "dxf"]
+        if not PAID_ONLY_FLOW:
+            capabilities.insert(0, "plan-to-bim")
         if ASTRA_FLOW_MANAGER.enabled:
-            capabilities.append("plan-to-bim-pro")
+            capabilities.append("plan-to-bim-paid" if LOW_COST_LOCAL_PILOT else "plan-to-bim-pro")
         if ASSISTED_ORDER_ENABLED and ASSISTED_ORDER_MANAGER.payment_gateway.configured:
             capabilities.append("assisted-order")
         return jsonify({
             "status": "online",
-            "service": "Plan-to-BIM Free",
+            "service": "Plan-to-BIM Local Pilot" if LOW_COST_LOCAL_PILOT else "Plan-to-BIM Free",
             "version": "2.1.0",
             "capabilities": capabilities,
             "pro_flow": {
@@ -225,7 +254,7 @@ def create_app() -> Flask:
             "auth": {
                 "configured": AUTH.configured,
                 "provider": "google",
-                "required_for_pro": AUTH.required,
+                "required_for_pro": AUTH.required or PAID_ONLY_FLOW,
             },
         })
 
@@ -317,6 +346,8 @@ def create_app() -> Flask:
     @app.post("/api/plan-to-bim")
     @app.post("/api/referencia/pre-wall-yolo")
     def plan_to_bim():
+        if PAID_ONLY_FLOW:
+            return jsonify({"error": "Entre na sua conta para iniciar sua primeira prévia ou contratar uma nova conversão."}), 403
         image_file = request.files.get("file")
         if not image_file or not _valid_upload(image_file):
             return jsonify({"error": "Envie uma planta em PDF, PNG ou JPG."}), 400
@@ -396,7 +427,7 @@ def create_app() -> Flask:
             return jsonify({"error": "Envie uma planta em PDF, PNG ou JPG."}), 400
         try:
             owner = _current_user()
-            if AUTH.required and owner is None:
+            if (AUTH.required or PAID_ONLY_FLOW) and owner is None:
                 return jsonify({"error": "Entre com o Google para iniciar a Conversão Pro."}), 401
             ASTRA_FLOW_MANAGER.assert_owner_idle(owner.id if owner else "")
             client_ip_hash = OPERATIONAL_GUARD.check_upload(
@@ -405,30 +436,50 @@ def create_app() -> Flask:
             )
             canvas_width_m = _form_number("canvas_width_m", 20.0, 1.0, 500.0)
             archive_consent = _truthy(request.form.get("archive_consent"))
+            service_tier = str(request.form.get("service_tier") or "essential").strip().lower()
+            if LOW_COST_LOCAL_PILOT and service_tier not in {"essential", "advanced"}:
+                return jsonify({"error": "Escolha uma versão de conversão válida."}), 400
+            if not LOW_COST_LOCAL_PILOT:
+                service_tier = "advanced"
+            if FIRST_PREVIEW_ENABLED:
+                service_tier = "advanced"
+            first_preview = bool(
+                FIRST_PREVIEW_ENABLED and owner
+                and not ASTRA_FLOW_MANAGER._states_for_owner(owner.id)
+            )
+            if first_preview:
+                OPERATIONAL_GUARD.check_first_preview(client_ip=_client_ip())
             sid = uuid.uuid4().hex[:10]
             job_dir = ASTRA_FLOW_MANAGER.job_dir(sid)
             preparation_started = time.perf_counter()
             image_path, original_path, original_name = _save_as_image(image_file, job_dir)
             document_profile = _astra_document_profile(image_path, original_path)
-            try:
-                area_inspection = estimate_local_area(
-                    original_path=original_path,
-                    image_path=image_path,
-                    output_dir=job_dir / "preanalysis",
-                    fallback_canvas_width_m=canvas_width_m,
-                )
-            except Exception as exc:
-                app.logger.warning(
-                    "Pré-análise local indisponível para %s: %s", sid, exc
-                )
+            if LOW_COST_LOCAL_PILOT and service_tier == "essential":
                 area_inspection = {
                     "status": "unavailable",
                     "estimated_area_m2": None,
-                    "message": (
-                        "Não foi possível estimar a área com confiança; "
-                        "o valor aplicado permanece fixo."
-                    ),
+                    "message": "Arquivo preparado. Preço fixo por uma página; análise após o pagamento.",
                 }
+            else:
+                try:
+                    area_inspection = estimate_local_area(
+                        original_path=original_path,
+                        image_path=image_path,
+                        output_dir=job_dir / "preanalysis",
+                        fallback_canvas_width_m=canvas_width_m,
+                    )
+                except Exception as exc:
+                    app.logger.warning(
+                        "Pré-análise local indisponível para %s: %s", sid, exc
+                    )
+                    area_inspection = {
+                        "status": "unavailable",
+                        "estimated_area_m2": None,
+                        "message": (
+                            "Não foi possível estimar a área com confiança; "
+                            "o valor aplicado permanece fixo."
+                        ),
+                    }
             preparation_seconds = time.perf_counter() - preparation_started
             response = ASTRA_FLOW_MANAGER.create_job(
                 job=sid,
@@ -443,6 +494,8 @@ def create_app() -> Flask:
                 owner_email=owner.email if owner else "",
                 client_ip_hash=client_ip_hash,
                 area_inspection=area_inspection,
+                service_tier=service_tier,
+                first_preview=first_preview,
             )
             return jsonify(response), 201
         except RateLimitExceeded as exc:
@@ -540,9 +593,11 @@ def create_app() -> Flask:
         body = request.get_json(silent=True) or {}
         try:
             owner = _current_user()
-            if AUTH.required and owner is None:
+            if (AUTH.required or FIRST_PREVIEW_ENABLED) and owner is None:
                 return jsonify({"error": "Entre com o Google para abrir o pagamento."}), 401
             token = str(body.get("access_token") or "")
+            if PAID_ONLY_FLOW:
+                ASTRA_FLOW_MANAGER.authorize_owner(job, token, owner.id if owner else "")
             current = ASTRA_FLOW_MANAGER.public_status(
                 job, token, include_result=False
             )
@@ -573,6 +628,11 @@ def create_app() -> Flask:
             return jsonify({"error": "Tarefa não encontrada."}), 404
         body = request.get_json(silent=True) or {}
         try:
+            if PAID_ONLY_FLOW:
+                owner = _current_user()
+                ASTRA_FLOW_MANAGER.authorize_owner(
+                    job, str(body.get("access_token") or ""), owner.id if owner else ""
+                )
             response = ASTRA_FLOW_MANAGER.sync_payment(
                 job, str(body.get("access_token") or "")
             )
@@ -591,6 +651,11 @@ def create_app() -> Flask:
             return jsonify({"error": "Tarefa não encontrada."}), 404
         body = request.get_json(silent=True) or {}
         try:
+            if PAID_ONLY_FLOW:
+                owner = _current_user()
+                ASTRA_FLOW_MANAGER.authorize_owner(
+                    job, str(body.get("access_token") or ""), owner.id if owner else ""
+                )
             response = ASTRA_FLOW_MANAGER.retry(
                 job, str(body.get("access_token") or "")
             )
@@ -676,6 +741,11 @@ def create_app() -> Flask:
         if not JOB_ID_PATTERN.fullmatch(job):
             return jsonify({"error": "Tarefa não encontrada."}), 404
         try:
+            if PAID_ONLY_FLOW:
+                owner = _current_user()
+                ASTRA_FLOW_MANAGER.authorize_owner(
+                    job, str(request.args.get("token") or ""), owner.id if owner else ""
+                )
             response = ASTRA_FLOW_MANAGER.public_status(
                 job, str(request.args.get("token") or ""), include_result=True
             )
@@ -703,6 +773,18 @@ def create_app() -> Flask:
     def finalize():
         try:
             body = request.get_json(force=True, silent=True) or {}
+            if PAID_ONLY_FLOW:
+                source_job = _safe_source_job(body.get("source_job"))
+                owner = _current_user()
+                if not source_job:
+                    return jsonify({"error": "Pedido pago obrigatório para exportar IFC."}), 403
+                try:
+                    ASTRA_FLOW_MANAGER.authorize_paid_export(
+                        source_job, str(body.get("access_token") or ""),
+                        owner.id if owner else "",
+                    )
+                except (LookupError, PermissionError):
+                    return jsonify({"error": "Pedido pago não encontrado ou ainda indisponível."}), 403
             model_payload = body.get("modelo") or body
             config = body.get("config", {})
             name = secure_filename(body.get("nome", "planta")) or "planta"
@@ -725,7 +807,7 @@ def create_app() -> Flask:
                 return jsonify({"error": "Nenhuma parede válida no modelo."}), 400
 
             sid = uuid.uuid4().hex[:10]
-            ifc_name = f"{sid}_{name}.ifc"
+            ifc_name = f"{source_job}_{sid}_{name}.ifc" if PAID_ONLY_FLOW else f"{sid}_{name}.ifc"
             ifc_path = OUTPUT_FOLDER / ifc_name
             with contextlib.redirect_stdout(io.StringIO()):
                 planta_module.gerar_ifc_do_modelo(
@@ -754,7 +836,10 @@ def create_app() -> Flask:
                 archive_status = "unavailable" if TRAINING_ARCHIVE is None else "missing-job"
             return jsonify({
                 "ok": True,
-                "ifc_url": f"/outputs/{ifc_name}",
+                "ifc_url": (
+                    f"/api/backend/outputs/{ifc_name}" if PAID_ONLY_FLOW
+                    else f"/outputs/{ifc_name}"
+                ),
                 "preview_url": None,
                 "ifc_token": None,
                 "ready_for_comparison": False,
@@ -771,6 +856,18 @@ def create_app() -> Flask:
     def export_dxf():
         try:
             body = request.get_json(force=True, silent=True) or {}
+            source_job = _safe_source_job(body.get("source_job"))
+            if PAID_ONLY_FLOW:
+                owner = _current_user()
+                if not source_job:
+                    return jsonify({"error": "Pedido pago obrigatório para exportar DXF."}), 403
+                try:
+                    ASTRA_FLOW_MANAGER.authorize_paid_export(
+                        source_job, str(body.get("access_token") or ""),
+                        owner.id if owner else "",
+                    )
+                except (LookupError, PermissionError):
+                    return jsonify({"error": "Pedido pago não encontrado ou ainda indisponível."}), 403
             approval = body.get("aprovacao_cliente") or {}
             if approval.get("confirmado") is not True:
                 return jsonify({
@@ -784,11 +881,15 @@ def create_app() -> Flask:
             from plantatobim.export_editor_model_dxf import export_model_to_dxf
 
             name = secure_filename(body.get("nome", "planta")) or "planta"
-            dxf_name = f"{uuid.uuid4().hex[:10]}_{name}.dxf"
+            sid = uuid.uuid4().hex[:10]
+            dxf_name = f"{source_job}_{sid}_{name}.dxf" if PAID_ONLY_FLOW else f"{sid}_{name}.dxf"
             report = export_model_to_dxf(model_payload, OUTPUT_FOLDER / dxf_name)
             return jsonify({
                 "ok": True,
-                "dxf_url": f"/outputs/{dxf_name}",
+                "dxf_url": (
+                    f"/api/backend/outputs/{dxf_name}" if PAID_ONLY_FLOW
+                    else f"/outputs/{dxf_name}"
+                ),
                 **{key: value for key, value in report.items() if key != "output"},
             })
         except Exception as exc:
@@ -797,6 +898,15 @@ def create_app() -> Flask:
 
     @app.get("/outputs/<path:filename>")
     def download_output(filename: str):
+        if PAID_ONLY_FLOW:
+            job = _safe_source_job(filename.split("_", 1)[0])
+            owner = _current_user()
+            if not job or not filename.lower().endswith((".ifc", ".dxf")):
+                return jsonify({"error": "Arquivo não encontrado."}), 404
+            try:
+                ASTRA_FLOW_MANAGER.authorize_paid_file(job, owner.id if owner else "")
+            except (LookupError, PermissionError):
+                return jsonify({"error": "Arquivo não encontrado."}), 404
         return send_from_directory(
             str(OUTPUT_FOLDER),
             filename,
@@ -816,4 +926,7 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+    app.run(
+        host="127.0.0.1" if LOW_COST_LOCAL_PILOT else "0.0.0.0",
+        port=int(os.environ.get("PORT", "8080")),
+    )

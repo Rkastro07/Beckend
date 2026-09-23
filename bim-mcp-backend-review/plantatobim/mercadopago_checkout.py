@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlparse
@@ -198,6 +199,7 @@ class MercadoPagoCheckout:
         external_reference: str,
         title: str,
         amount: Any,
+        expires_at: str | None = None,
     ) -> dict[str, Any]:
         price = _money(amount)
         if price <= 0:
@@ -217,6 +219,19 @@ class MercadoPagoCheckout:
             "metadata": {"plan2bim_job": job},
             "binary_mode": False,
         }
+        if expires_at:
+            try:
+                expiration = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise MercadoPagoRequestError("A validade do pagamento é inválida.") from exc
+            if expiration.tzinfo is None or expiration <= datetime.now(timezone.utc):
+                raise MercadoPagoRequestError("A validade do pagamento expirou.")
+            body.update({
+                "expires": True,
+                "expiration_date_from": datetime.now(timezone.utc).isoformat(),
+                "expiration_date_to": expiration.isoformat(),
+                "date_of_expiration": expiration.isoformat(),
+            })
         if self.public_frontend_url:
             body["back_urls"] = {
                 "success": f"{self.public_frontend_url}/?payment=success",

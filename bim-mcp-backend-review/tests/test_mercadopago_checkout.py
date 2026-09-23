@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 
@@ -108,6 +109,26 @@ def test_preference_adds_only_public_https_callbacks():
         "https://api.plan2bim.example/api/payments/mercadopago/webhook"
     )
     assert payload["auto_return"] == "approved"
+
+
+def test_first_preview_checkout_expires_with_retained_files():
+    session = FakeSession([FakeResponse(201, {
+        "id": "pref-preview",
+        "init_point": "https://www.mercadopago.com.br/checkout/v1/redirect",
+    })])
+    checkout = MercadoPagoCheckout(
+        access_token="backend-test-token", enabled=True, sandbox=True,
+        session=session,
+    )
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=20)).isoformat()
+    checkout.create_preference(
+        job="0123456789", external_reference="plan2bim-preview",
+        title="Desbloquear prévia", amount="59.90", expires_at=expires_at,
+    )
+    payload = session.calls[0][2]["json"]
+    assert payload["expires"] is True
+    assert payload["expiration_date_to"] == expires_at
+    assert payload["date_of_expiration"] == expires_at
 
 
 def test_webhook_signature_uses_documented_manifest_and_constant_time_hash():

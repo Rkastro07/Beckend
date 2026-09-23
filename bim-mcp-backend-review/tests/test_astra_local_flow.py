@@ -5,6 +5,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
+from types import SimpleNamespace
 import pytest
 
 from PIL import Image
@@ -158,6 +159,7 @@ class FakeDurableStore:
     def __init__(self):
         self.states = {}
         self.objects = {}
+        self.preview_claims = set()
 
     def save(self, state):
         import copy
@@ -174,6 +176,12 @@ class FakeDurableStore:
             for job, state in self.states.items()
             if (state.get("owner") or {}).get("id") == owner_id
         ]
+
+    def claim_first_preview(self, *, owner_id, job):
+        if owner_id in self.preview_claims or self.list_for_owner(owner_id):
+            return False
+        self.preview_claims.add(owner_id)
+        return True
 
     def find_by_external_reference(self, external_reference):
         for state in self.states.values():
@@ -318,6 +326,9 @@ def test_unconfirmed_job_refreshes_a_legacy_quote(monkeypatch, tmp_path):
 def test_local_flow_waits_for_verified_payment_then_processes_without_detector(
     monkeypatch, tmp_path
 ):
+    monkeypatch.setattr(free_app, "LOW_COST_LOCAL_PILOT", False)
+    monkeypatch.setattr(free_app, "FIRST_PREVIEW_ENABLED", False)
+    monkeypatch.setattr(free_app, "PAID_ONLY_FLOW", False)
     from plantatobim import pre_wall_opening_import
 
     gateway = FakePaymentGateway()
@@ -434,6 +445,325 @@ def test_local_flow_waits_for_verified_payment_then_processes_without_detector(
     assert "api" not in status
     assert status["ifc_generated"] is False
     assert not list(tmp_path.rglob("*.ifc"))
+
+
+def test_local_sol_pilot_charges_once_before_review_or_export(monkeypatch, tmp_path):
+    monkeypatch.setattr(free_app, "FIRST_PREVIEW_ENABLED", False)
+    monkeypatch.setattr(free_app, "PAID_ONLY_FLOW", True)
+    class FakeSolStage:
+        def analyze(self, image_path, *, canvas_width_m, original_name, user_message=""):
+            assert "Revise os candidatos geométricos" in user_message
+            assert image_path.is_file()
+            model = _editor_model()
+            model["paredes"][0]["origem"] = "gpt-6-sol-visual-review"
+            model["warnings"] = ["Revisão visual gpt-6-sol proposta."]
+            analysis = {"message": "Modelo revisado.", "unresolved": [], "_model": "gpt-6-sol"}
+            metadata = {"model": "gpt-6-sol", "usage": {"input_tokens": 1000, "output_tokens": 100}}
+            return model, analysis, metadata
+
+    class NoLimits:
+        def check_upload(self, **_kwargs):
+            return "test-ip-hash"
+
+        def check_order(self, **_kwargs):
+            return None
+
+    gateway = FakePaymentGateway()
+    manager = AstraLocalFlowManager(
+        tmp_path / "pilot-jobs", enabled=True, stage_factory=FakeSolStage,
+        low_cost_pilot=True, payment_gateway=gateway, max_workers=1,
+    )
+    monkeypatch.setattr(free_app, "LOW_COST_LOCAL_PILOT", True)
+    monkeypatch.setattr(free_app, "ASTRA_FLOW_MANAGER", manager)
+    monkeypatch.setattr(free_app, "OPERATIONAL_GUARD", NoLimits())
+    monkeypatch.setattr(
+        free_app, "_current_user", lambda: SimpleNamespace(id="owner-1", email="owner@example.com")
+    )
+    client = free_app.app.test_client()
+
+    assert client.post("/api/plan-to-bim").status_code == 403
+    preflight = client.post(
+        "/api/astra-flow/preflight",
+        data={"file": (io.BytesIO(_png_bytes()), "sample.png"), "canvas_width_m": "20"},
+        content_type="multipart/form-data",
+    )
+    assert preflight.status_code == 201
+    prepared = preflight.get_json()
+    job, token = prepared["job"], prepared["access_token"]
+    assert prepared["quote"]["customer_price"] == 3.5
+    assert prepared["quote"]["processing_price_brl"] == 3
+    assert prepared["quote"]["editing_price_brl"] == 0.5
+    assert prepared["service_tier"] == "essential"
+    assert "result" not in prepared
+    assert manager._read(job)["processing_mode"] == "sol-low-review"
+    assert not (manager.job_dir(job) / "sol_low_review").exists()
+    assert client.post("/api/referencia/finalizar", json={"source_job": job}).status_code == 403
+    assert client.post("/api/referencia/exportar-dxf", json={"source_job": job}).status_code == 403
+
+    monkeypatch.setenv("PLAN_BIM_MIN_PRICE_BRL", "59.90")
+    monkeypatch.setattr(free_app, "estimate_local_area", lambda **_kwargs: _inspection())
+    advanced = client.post(
+        "/api/astra-flow/preflight",
+        data={"file": (io.BytesIO(_png_bytes()), "advanced.png"),
+              "canvas_width_m": "20", "service_tier": "advanced"},
+        content_type="multipart/form-data",
+    )
+    assert advanced.status_code == 201
+    advanced_quote = advanced.get_json()
+    assert advanced_quote["service_tier"] == "advanced"
+    assert advanced_quote["quote"]["customer_price"] == 59.90
+    assert manager._read(advanced_quote["job"])["processing_mode"] == "astra-direct"
+    assert client.post(
+        "/api/astra-flow/preflight",
+        data={"file": (io.BytesIO(_png_bytes()), "invalid.png"),
+              "service_tier": "invalid"},
+        content_type="multipart/form-data",
+    ).status_code == 400
+
+    monkeypatch.setattr(free_app, "_current_user", lambda: None)
+    assert client.get(f"/api/astra-flow/jobs/{job}?token={token}").status_code == 404
+    assert client.post("/api/referencia/finalizar", json={"source_job": job}).status_code == 403
+    monkeypatch.setattr(
+        free_app, "_current_user", lambda: SimpleNamespace(id="owner-1", email="owner@example.com")
+    )
+
+    checkout = client.post(
+        f"/api/astra-flow/jobs/{job}/checkout", json={"access_token": token}
+    )
+    assert checkout.status_code == 201
+    assert checkout.get_json()["quote"]["test_payment"] is True
+    assert len(gateway.preferences) == 1
+    assert gateway.preferences[0]["amount"] == 3.5
+    assert manager._read(job)["status"] == "awaiting_payment"
+    assert "result" not in client.get(f"/api/astra-flow/jobs/{job}?token={token}").get_json()
+
+    gateway.payments = [_approved_payment(manager, job)]
+    assert client.post(
+        f"/api/astra-flow/jobs/{job}/payment/sync", json={"access_token": token}
+    ).status_code == 200
+    deadline = time.monotonic() + 3
+    status = None
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/astra-flow/jobs/{job}?token={token}").get_json()
+        if status["status"] == "completed":
+            break
+        time.sleep(0.02)
+    manager.close()
+    assert status and status["status"] == "completed"
+    assert status["result"]["paredes"][0]["origem"] == "conversao-pro"
+    assert "gpt-6-sol" not in str(status["result"]).lower()
+    assert status["result"]["job"] == job
+    assert client.post("/api/referencia/finalizar", json={"source_job": job}).status_code == 400
+
+
+def test_first_preview_is_view_only_then_same_job_unlocks_after_payment(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only-key")
+    monkeypatch.setenv("PLAN_BIM_MIN_PRICE_BRL", "59.90")
+    calls = {"count": 0}
+
+    class CountingStage(FakeStage):
+        def analyze(self, *args, **kwargs):
+            calls["count"] += 1
+            return super().analyze(*args, **kwargs)
+
+    store = FakeDurableStore()
+    dispatcher = FakeDispatcher()
+    gateway = FakePaymentGateway()
+    manager = AstraLocalFlowManager(
+        tmp_path / "first-preview-jobs", enabled=True, stage_factory=CountingStage,
+        payment_gateway=gateway, job_store=store, dispatcher=dispatcher,
+        first_preview_enabled=True,
+    )
+    source = tmp_path / "sample.png"
+    source.write_bytes(_png_bytes())
+
+    def create(job, *, first_preview):
+        return manager.create_job(
+            job=job, original_name="sample.png", original_path=source,
+            image_path=source, document_profile=_profile(width=64, height=32),
+            canvas_width_m=20, archive_consent=False, preparation_seconds=0.02,
+            owner_id="owner-1", owner_email="owner@example.com",
+            service_tier="advanced", first_preview=first_preview,
+        )
+
+    prepared = create("0123456789", first_preview=True)
+    token = prepared["access_token"]
+    assert prepared["status"] == "queued"
+    assert prepared["preview_only"] is True
+    assert "result" not in prepared
+    assert len(dispatcher.tasks) == 1
+    assert manager.run_worker("0123456789")["status"] == "completed"
+    preview = manager.public_status("0123456789", token)
+    assert preview["preview_only"] is True
+    assert len(preview["preview"]["walls"]) >= 2
+    assert any(wall["base"] > 0 for wall in preview["preview"]["walls"])
+    assert "paredes" not in preview
+    assert "result" not in preview
+    assert "nome" not in str(preview["preview"])
+    assert calls["count"] == 1
+    monkeypatch.setattr(free_app, "PAID_ONLY_FLOW", True)
+    monkeypatch.setattr(free_app, "FIRST_PREVIEW_ENABLED", True)
+    monkeypatch.setattr(free_app, "ASTRA_FLOW_MANAGER", manager)
+    monkeypatch.setattr(
+        free_app, "_current_user", lambda: SimpleNamespace(id="owner-1", email="owner@example.com")
+    )
+    client = free_app.app.test_client()
+    assert client.post("/api/plan-to-bim").status_code == 403
+    public_preview = client.get(f"/api/astra-flow/jobs/0123456789?token={token}")
+    assert public_preview.status_code == 200
+    assert "result" not in public_preview.get_json()
+    assert client.post("/api/referencia/finalizar", json={"source_job": "0123456789", "access_token": token}).status_code == 403
+    assert client.post("/api/referencia/exportar-dxf", json={"source_job": "0123456789", "access_token": token}).status_code == 403
+    with pytest.raises(PermissionError):
+        manager.authorize_paid_export("0123456789", token, "owner-1")
+    with pytest.raises(ValueError):
+        create("abcde12345", first_preview=True)
+
+    checkout = manager.create_checkout("0123456789", token)
+    assert checkout["checkout_url"].startswith("https://sandbox.mercadopago.com.br/")
+    assert gateway.preferences[0]["expires_at"] == prepared["retention"]["files_delete_after"]
+    rejected = _approved_payment(manager, "0123456789")
+    rejected["status"] = "rejected"
+    gateway.payments = [rejected]
+    declined = manager.sync_payment("0123456789", token)
+    assert declined["status"] == "completed"
+    assert declined["payment"]["status"] == "not_approved"
+    assert "preview" in declined and "result" not in declined
+    gateway.payments = [_approved_payment(manager, "0123456789")]
+    paid = manager.sync_payment("0123456789", token)
+    assert paid["status"] == "completed"
+    assert paid["preview_only"] is False
+    assert paid["retention"]["files_delete_after"] >= prepared["retention"]["files_delete_after"]
+    assert paid["result"]["paredes"][0]["nome"] == "Parede Astra"
+    assert client.get(f"/api/astra-flow/jobs/0123456789?token={token}").get_json()["result"]["paredes"]
+    assert client.post("/api/referencia/finalizar", json={"source_job": "0123456789", "access_token": token}).status_code == 400
+    assert client.post("/api/referencia/exportar-dxf", json={"source_job": "0123456789", "access_token": token}).status_code == 409
+    assert "preview" not in paid
+    assert calls["count"] == 1
+    assert len(dispatcher.tasks) == 1
+    manager.authorize_paid_export("0123456789", token, "owner-1")
+
+    next_job = create("fedcba9876", first_preview=False)
+    assert next_job["status"] == "awaiting_payment"
+    assert next_job["preview_only"] is False
+    assert len(dispatcher.tasks) == 1
+    manager.close()
+
+
+def test_expired_or_purged_first_preview_cannot_be_sold(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only-key")
+    store = FakeDurableStore()
+    gateway = FakePaymentGateway()
+    manager = AstraLocalFlowManager(
+        tmp_path / "jobs", enabled=True, stage_factory=FakeStage,
+        payment_gateway=gateway, job_store=store, dispatcher=FakeDispatcher(),
+        first_preview_enabled=True,
+    )
+    source = tmp_path / "sample.png"
+    source.write_bytes(_png_bytes())
+    created = manager.create_job(
+        job="0123456789", original_name="sample.png", original_path=source,
+        image_path=source, document_profile=_profile(width=64, height=32),
+        canvas_width_m=20, archive_consent=False, preparation_seconds=0.02,
+        owner_id="owner-1", service_tier="advanced", first_preview=True,
+    )
+    token = created["access_token"]
+    manager.run_worker("0123456789")
+    manager.create_checkout("0123456789", token)
+    assert len(gateway.preferences) == 1
+    state = store.load("0123456789")
+    state["retention"]["files_delete_after"] = "2020-01-01T00:00:00+00:00"
+    store.save(state)
+    public = manager.public_status("0123456789", token)
+    assert public["retention"]["files_available"] is False
+    assert public["quote"]["checkout_available"] is False
+    assert "preview" not in public
+    with pytest.raises(ValueError, match="expirou"):
+        manager.create_checkout("0123456789", token)
+    assert len(gateway.preferences) == 1
+    state["retention"]["files_delete_after"] = "2099-01-01T00:00:00+00:00"
+    state["files_purged_at"] = "2020-01-01T00:00:00+00:00"
+    state["retention"]["files_available"] = False
+    state.pop("result_path", None)
+    state.pop("result_object", None)
+    store.save(state)
+    assert manager.public_status("0123456789", token)["quote"]["checkout_available"] is False
+    with pytest.raises(ValueError, match="resultado"):
+        manager.create_checkout("0123456789", token)
+    gateway.payments = [_approved_payment(manager, "0123456789")]
+    late_payment = manager.sync_payment("0123456789", token)
+    assert late_payment["payment"]["status"] == "review_required"
+    assert "result" not in late_payment
+    manager.close()
+
+
+def test_local_sol_pilot_rejects_live_payment_gateway(tmp_path):
+    gateway = FakePaymentGateway()
+    gateway.sandbox = False
+    with pytest.raises(RuntimeError, match="sandbox"):
+        AstraLocalFlowManager(
+            tmp_path / "pilot-jobs", enabled=True, low_cost_pilot=True,
+            payment_gateway=gateway,
+        )
+
+
+def test_local_dual_version_runs_the_stage_chosen_for_each_paid_job(monkeypatch, tmp_path):
+    calls = []
+
+    class AdvancedStage:
+        def analyze(self, image_path, *, canvas_width_m, original_name, user_message=""):
+            assert "Não use detector heurístico" in user_message
+            calls.append("advanced")
+            return _editor_model(), {"message": "Pronto.", "_model": "gpt-6-astra"}, {
+                "model": "gpt-6-astra", "usage": {"input_tokens": 100, "output_tokens": 10},
+            }
+
+    class EssentialStage:
+        def analyze(self, image_path, *, canvas_width_m, original_name, user_message=""):
+            assert "Revise os candidatos geométricos" in user_message
+            calls.append("essential")
+            return _editor_model(), {"message": "Pronto.", "_model": "gpt-6-sol"}, {
+                "model": "gpt-6-sol", "usage": {"input_tokens": 100, "output_tokens": 10},
+            }
+
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-test-key")
+    monkeypatch.setenv("PLAN_BIM_MIN_PRICE_BRL", "59.90")
+    gateway = FakePaymentGateway()
+    manager = AstraLocalFlowManager(
+        tmp_path / "jobs", enabled=True, stage_factory=AdvancedStage,
+        sol_stage_factory=EssentialStage, low_cost_pilot=True,
+        payment_gateway=gateway, max_workers=1,
+    )
+    source = tmp_path / "sample.png"
+    source.write_bytes(_png_bytes())
+    jobs = {}
+    for tier, job in (("essential", "1111111111"), ("advanced", "2222222222")):
+        response = manager.create_job(
+            job=job, original_name="sample.png", original_path=source,
+            image_path=source, document_profile=_profile(width=64, height=32),
+            canvas_width_m=20, archive_consent=False, preparation_seconds=0.01,
+            owner_id="customer-1", service_tier=tier,
+        )
+        jobs[tier] = (job, response["access_token"])
+    assert manager._read(jobs["essential"][0])["quote"]["customer_price"] == 3.5
+    assert manager._read(jobs["advanced"][0])["quote"]["customer_price"] == 59.9
+
+    for tier in ("essential", "advanced"):
+        job, token = jobs[tier]
+        manager.create_checkout(job, token)
+        gateway.payments.append(_approved_payment(manager, job))
+        manager.sync_payment(job, token)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            status = manager.public_status(job, token)
+            if status["status"] == "completed":
+                break
+            time.sleep(0.02)
+        assert status["status"] == "completed"
+        assert status["service_tier"] == tier
+        assert status["result"]["job"] == job
+    manager.close()
+    assert calls == ["essential", "advanced"]
 
 
 def test_payment_amount_mismatch_never_starts_processing(monkeypatch, tmp_path):

@@ -42,6 +42,17 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _file_expiration(state: dict[str, Any]) -> datetime | None:
+    value = str((state.get("retention") or {}).get("files_delete_after") or "")
+    if not value:
+        return None
+    try:
+        expiry = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return expiry if expiry.tzinfo else expiry.replace(tzinfo=timezone.utc)
+
+
 def _finite_canvas_width(value: Any) -> float | None:
     try:
         number = float(value)
@@ -104,8 +115,24 @@ def _cost_reference(profile: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def quote_for_document(profile: dict[str, Any], inspection: dict | None = None) -> dict[str, Any]:
+def quote_for_document(
+    profile: dict[str, Any], inspection: dict | None = None, *, low_cost_pilot: bool = False
+) -> dict[str, Any]:
     """Show an area reference while freezing the launch price charged at checkout."""
+    if low_cost_pilot:
+        page_count = max(1, int(profile.get("page_count") or 1))
+        return {
+            "currency": "BRL", "customer_price": 3.50,
+            "pricing_version": "sol-low-local-pilot-v1", "pricing_mode": "single-page-fixed",
+            "payment_mode": "mercado-pago", "page_count": page_count,
+            "processed_pages": 1, "price_per_page": 3.50, "minimum_price": 3.50,
+            "minimum_applied": True, "applied_price_brl": 3.50,
+            "processing_price_brl": 3.00, "editing_price_brl": 0.50,
+            "estimated_processing_seconds": {"min": 60, "max": 300},
+            "scope": "Uma página por pedido. Análise, edição 2D/3D e exportação IFC/DXF incluídas.",
+            "ready": True,
+            "disclaimer": "A análise começa somente após a aprovação do pagamento.",
+        }
     quote = _cost_reference(profile)
     applied = Decimal(os.environ.get("PLAN_BIM_MIN_PRICE_BRL", "59.90"))
     rate = Decimal(os.environ.get("PLAN_BIM_PRICE_PER_M2", "0.50"))
@@ -178,7 +205,7 @@ def _customer_quote(quote: dict[str, Any]) -> dict[str, Any]:
                 "minimum_price", "minimum_applied", "scope", "ready",
                 "pricing_mode", "applied_price_brl", "price_per_m2",
                 "calculated_price_brl", "estimated_area_m2", "scale_source",
-                "scale_confidence",
+                "scale_confidence", "processing_price_brl", "editing_price_brl",
             )
         },
         "payment_mode": quote.get("payment_mode", "mercado-pago"),
@@ -213,10 +240,93 @@ def _customer_result(model: dict[str, Any]) -> dict[str, Any]:
     result.pop("gpt_plan", None)
     for element in [*(result.get("paredes") or []), *(result.get("aberturas") or [])]:
         if isinstance(element, dict) and str(element.get("origem") or "").startswith(
-            "gpt-6-astra"
+            ("gpt-6-astra", "gpt-6-sol")
         ):
             element["origem"] = "conversao-pro"
+    if isinstance(result.get("warnings"), list):
+        result["warnings"] = [
+            "Revise a geometria no editor antes de exportar."
+            if isinstance(item, str) and ("gpt-6-sol" in item.lower() or "gpt-6-astra" in item.lower())
+            else item
+            for item in result["warnings"]
+        ]
     return result
+
+
+def _view_only_preview(model: dict[str, Any]) -> dict[str, Any]:
+    """Return render solids without editable BIM fields or source documents."""
+    walls: list[dict[str, float]] = []
+    endpoints: list[tuple[float, float]] = []
+    openings_by_wall: dict[str, list[dict[str, Any]]] = {}
+    for opening in model.get("aberturas") or []:
+        if isinstance(opening, dict):
+            openings_by_wall.setdefault(str(opening.get("parede_id") or ""), []).append(opening)
+    for wall in model.get("paredes") or []:
+        try:
+            ax, ay = float(wall["ax"]), float(wall["ay"])
+            bx, by = float(wall["bx"]), float(wall["by"])
+            height = float(wall.get("altura") or 2.8)
+            width = float(wall.get("espessura") or 0.15)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if not all(math.isfinite(v) for v in (ax, ay, bx, by, height, width)):
+            continue
+        length = math.hypot(bx - ax, by - ay)
+        if length < 0.05:
+            continue
+        endpoints.extend([(ax, ay), (bx, by)])
+        ux, uy = (bx - ax) / length, (by - ay) / length
+        height, width = max(0.5, min(height, 8)), max(0.1, min(width, 0.8))
+        angle = -math.atan2(by - ay, bx - ax)
+
+        def add_solid(start: float, end: float, bottom: float, top: float) -> None:
+            if end - start < 0.05 or top - bottom < 0.05:
+                return
+            center = (start + end) / 2
+            walls.append({
+                "x": round(ax + ux * center, 2),
+                "z": round(ay + uy * center, 2),
+                "length": round(end - start, 2),
+                "base": round(bottom, 2),
+                "height": round(top - bottom, 2),
+                "width": round(width, 2),
+                "angle": round(angle, 3),
+            })
+
+        cuts: list[tuple[float, float, float, float]] = []
+        for opening in openings_by_wall.get(str(wall.get("id") or ""), []):
+            try:
+                center = float(opening["s_centro"])
+                span = float(opening["largura"])
+                kind = str(opening.get("tipo") or "")
+                sill = float(opening.get("peitoril") or (0.9 if kind == "window" else 0))
+                opening_height = float(opening.get("altura") or (1.2 if kind == "window" else 2.1))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not all(math.isfinite(v) for v in (center, span, sill, opening_height)) or span <= 0:
+                continue
+            start, end = max(0, center - span / 2), min(length, center + span / 2)
+            if end - start >= 0.05:
+                cuts.append((start, end, max(0, min(sill, height)), max(0, min(sill + opening_height, height))))
+
+        cursor = 0.0
+        for start, end, sill, opening_top in sorted(cuts):
+            if start < cursor:
+                continue
+            add_solid(cursor, start, 0, height)
+            add_solid(start, end, 0, sill)
+            add_solid(start, end, opening_top, height)
+            cursor = end
+        add_solid(cursor, length, 0, height)
+    if not walls:
+        return {"walls": [], "bounds": [0, 0, 10, 10]}
+    xs = [point[0] for point in endpoints]
+    zs = [point[1] for point in endpoints]
+    return {
+        "walls": walls,
+        "bounds": [round(min(xs) - 2, 1), round(min(zs) - 2, 1),
+                   round(max(xs) + 2, 1), round(max(zs) + 2, 1)],
+    }
 
 
 class AstraLocalFlowManager:
@@ -226,14 +336,19 @@ class AstraLocalFlowManager:
         *,
         enabled: bool | None = None,
         stage_factory: Callable[[], Any] = AstraDirectPlanStage,
+        sol_stage_factory: Callable[[], Any] | None = None,
+        low_cost_pilot: bool = False,
         payment_gateway: Any | None = None,
         max_workers: int | None = None,
         inspector_factory: Callable[[], Any] | None = None,
         job_store: Any | None = None,
         dispatcher: Any | None = None,
+        first_preview_enabled: bool = False,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.root_dir.mkdir(parents=True, exist_ok=True)
+        self.low_cost_pilot = bool(low_cost_pilot)
+        self.first_preview_enabled = bool(first_preview_enabled)
         self.enabled = (
             str(os.environ.get("ASTRA_LOCAL_FLOW_ENABLED", "false")).lower()
             in {"1", "true", "yes", "on"}
@@ -251,10 +366,13 @@ class AstraLocalFlowManager:
             else ThreadPoolExecutor(max_workers=max(1, min(workers, 4)))
         )
         self._stage_factory = stage_factory
+        self._sol_stage_factory = sol_stage_factory or stage_factory
         # Kept as an optional compatibility argument for older callers. Pricing
         # no longer invokes a vision model or depends on a printed area.
         self._inspector_factory = inspector_factory
         self.payment_gateway = payment_gateway or MercadoPagoCheckout.from_env()
+        if self.low_cost_pilot and self.payment_gateway.configured and not self.payment_gateway.sandbox:
+            raise RuntimeError("O piloto Sol low exige pagamento sandbox; produção não foi autorizada.")
         self._lock = threading.RLock()
         self._inflight: set[str] = set()
         self._recover_orphaned_jobs()
@@ -398,6 +516,7 @@ class AstraLocalFlowManager:
                     continue
                 if (state.get("quote") or {}).get("pricing_version") in {
                     "single-page-minimum-v1", "launch-fixed-area-reference-v1",
+                    "sol-low-local-pilot-v1",
                 }:
                     continue
                 state["document"] = profile
@@ -427,6 +546,30 @@ class AstraLocalFlowManager:
             raise PermissionError("Tarefa não encontrada.")
         return state
 
+    def authorize_paid_export(self, job: str, token: str, owner_id: str) -> None:
+        """Require a completed, paid job owned by the signed-in customer."""
+        state = self._authorized(job, token) if token else self._read(job)
+        if not owner_id or str((state.get("owner") or {}).get("id") or "") != owner_id:
+            raise PermissionError("Tarefa não encontrada.")
+        if (state.get("payment") or {}).get("status") != "approved":
+            raise PermissionError("Pagamento não aprovado.")
+        if state.get("status") != "completed":
+            raise PermissionError("O modelo ainda não está pronto.")
+
+    def authorize_owner(self, job: str, token: str, owner_id: str) -> dict[str, Any]:
+        state = self._authorized(job, token)
+        if not owner_id or str((state.get("owner") or {}).get("id") or "") != owner_id:
+            raise PermissionError("Tarefa não encontrada.")
+        return state
+
+    def authorize_paid_file(self, job: str, owner_id: str) -> None:
+        """A downloaded export remains private to the paid account."""
+        state = self._read(job)
+        if not owner_id or str((state.get("owner") or {}).get("id") or "") != owner_id:
+            raise PermissionError("Arquivo não encontrado.")
+        if state.get("status") != "completed" or (state.get("payment") or {}).get("status") != "approved":
+            raise PermissionError("Arquivo não disponível.")
+
     def create_job(
         self,
         *,
@@ -442,14 +585,22 @@ class AstraLocalFlowManager:
         owner_email: str = "",
         client_ip_hash: str = "",
         area_inspection: dict[str, Any] | None = None,
+        service_tier: str | None = None,
+        first_preview: bool = False,
     ) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("O fluxo Astra local está desativado.")
+        tier = service_tier or ("essential" if self.low_cost_pilot else "advanced")
+        if tier not in {"essential", "advanced"} or (tier == "essential" and not self.low_cost_pilot):
+            raise ValueError("Versão de conversão inválida.")
+        low_cost_job = tier == "essential"
+        if first_preview and (not self.first_preview_enabled or not owner_id or low_cost_job):
+            raise ValueError("Prévia inicial indisponível para este pedido.")
         token = secrets.token_urlsafe(32)
         directory = self.job_dir(job)
         directory.mkdir(parents=True, exist_ok=True)
         profile = deepcopy(document_profile)
-        profile["heuristic_detector_used"] = False
+        profile["heuristic_detector_used"] = low_cost_job
         inspection = deepcopy(area_inspection) if isinstance(area_inspection, dict) else {
             "status": "unavailable",
             "estimated_area_m2": None,
@@ -471,7 +622,9 @@ class AstraLocalFlowManager:
             "status": "awaiting_payment",
             "stage": "quote_ready",
             "progress": 25,
-            "processing_mode": "astra-direct",
+            "processing_mode": "sol-low-review" if low_cost_job else "astra-direct",
+            "service_tier": tier,
+            "first_preview": bool(first_preview),
             "created_at": _now(),
             "updated_at": _now(),
             "access_token_hash": self._token_hash(token),
@@ -496,7 +649,7 @@ class AstraLocalFlowManager:
             "document": profile,
             "preanalysis": self._preanalysis(profile, preparation_seconds, inspection),
             "area_inspection": inspection,
-            "quote": quote_for_document(profile, inspection),
+            "quote": quote_for_document(profile, inspection, low_cost_pilot=low_cost_job),
             "payment": {
                 "mode": "mercado-pago",
                 "status": "not_started",
@@ -520,7 +673,18 @@ class AstraLocalFlowManager:
             },
         }
         with self._lock:
+            if first_preview:
+                claimed = (
+                    self.job_store.claim_first_preview(owner_id=owner_id, job=job)
+                    if self.job_store is not None else not self._states_for_owner(owner_id)
+                )
+                if not claimed:
+                    raise ValueError("Sua prévia gratuita já foi utilizada. Envie uma nova planta com pagamento antes da análise.")
             self._write(state)
+            if first_preview:
+                state.update(status="queued", stage="preview_queued", progress=30)
+                self._write(state)
+                self._enqueue(job)
         response = self.public_status(job, token, include_result=False)
         response["access_token"] = token
         return response
@@ -567,6 +731,20 @@ class AstraLocalFlowManager:
     def _public_status_from_state(
         self, state: dict[str, Any], *, include_result: bool = True
     ) -> dict[str, Any]:
+        expiration = _file_expiration(state)
+        files_available = bool(
+            not state.get("files_purged_at")
+            and (state.get("retention") or {}).get("files_available", True)
+            and (expiration is None or expiration > datetime.now(timezone.utc))
+        )
+        preview_checkout_ready = bool(
+            not state.get("first_preview")
+            or state.get("status") != "completed"
+            or (
+                files_available
+                and self._preview_result_present(state)
+            )
+        )
         public = {
             key: deepcopy(value)
             for key, value in state.items()
@@ -598,6 +776,7 @@ class AstraLocalFlowManager:
             public["quote"] = _customer_quote(state["quote"])
             public["quote"]["checkout_available"] = bool(
                 self.payment_gateway.configured and
+                preview_checkout_ready and
                 (state["quote"].get("ready") or (state.get("payment") or {}).get("preference_id"))
             )
             public["quote"]["test_payment"] = bool(
@@ -608,13 +787,14 @@ class AstraLocalFlowManager:
             "status": str(payment.get("status") or "not_started"),
             "test": bool(payment.get("sandbox", self.payment_gateway.sandbox)),
         }
+        public["preview_only"] = bool(
+            state.get("first_preview") and payment.get("status") != "approved"
+        )
         retention = state.get("retention") or {}
         public["retention"] = {
             "file_days": int(retention.get("file_days") or 30),
             "files_delete_after": retention.get("files_delete_after"),
-            "files_available": bool(
-                retention.get("files_available", not state.get("files_purged_at"))
-            ),
+            "files_available": files_available,
         }
         if isinstance(state.get("preanalysis"), dict):
             public["preanalysis"] = {
@@ -641,8 +821,10 @@ class AstraLocalFlowManager:
         if (
             include_result
             and state["status"] == "completed"
-            and not state.get("files_purged_at")
+            and files_available
         ):
+            if payment.get("status") != "approved" and not state.get("first_preview"):
+                return public
             result_path = Path(str(state.get("result_path") or ""))
             if result_path.is_file():
                 result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -650,8 +832,19 @@ class AstraLocalFlowManager:
                 result = self.job_store.load_json(str(state["result_object"]))
             else:
                 raise LookupError("Resultado da tarefa não está disponível.")
-            public["result"] = _customer_result(result)
+            if payment.get("status") == "approved":
+                public["result"] = _customer_result(result)
+            else:
+                public["preview"] = _view_only_preview(result)
         return public
+
+    def _preview_result_present(self, state: dict[str, Any]) -> bool:
+        if state.get("files_purged_at") or not (state.get("retention") or {}).get("files_available", True):
+            return False
+        return bool(
+            Path(str(state.get("result_path") or "")).is_file()
+            or (self.job_store is not None and state.get("result_object"))
+        )
 
     def public_status_for_owner(
         self, job: str, owner_id: str, *, include_result: bool = True
@@ -760,14 +953,25 @@ class AstraLocalFlowManager:
             raise RuntimeError("A Conversão Pro está desativada.")
         if not self.payment_gateway.configured:
             raise RuntimeError("O pagamento ainda não está configurado no servidor.")
-        if not os.environ.get("OPENAI_API_KEY"):
-            raise RuntimeError("O processamento ainda não está configurado no servidor.")
         with self._lock:
             state = self._authorized(job, token)
-            if state.get("status") != "awaiting_payment":
+            low_cost_job = state.get("processing_mode") == "sol-low-review"
+            api_key_available = (
+                bool(os.environ.get("OPENAI_API_KEY2") or os.environ.get("OPENAI_API_KEY"))
+                if low_cost_job else bool(os.environ.get("OPENAI_API_KEY"))
+            )
+            if state.get("status") == "awaiting_payment" and not api_key_available:
+                raise RuntimeError("O processamento ainda não está configurado no servidor.")
+            if state.get("status") != "awaiting_payment" and not (
+                state.get("first_preview") and state.get("status") == "completed"
+                and (state.get("payment") or {}).get("status") != "approved"
+            ):
                 if state.get("status") in {"queued", "running", "completed"}:
                     return self.public_status(job, token, include_result=True)
                 raise ValueError("Esta tarefa não pode iniciar um novo pagamento.")
+            if state.get("first_preview") and state.get("status") == "completed":
+                if not self._public_status_from_state(state, include_result=False)["quote"]["checkout_available"]:
+                    raise ValueError("Esta prévia expirou ou seu resultado não está disponível. Envie outra planta.")
             payment = deepcopy(state.get("payment") or {})
             if payment.get("checkout_url") and payment.get("preference_id"):
                 response = self.public_status(job, token, include_result=False)
@@ -789,8 +993,13 @@ class AstraLocalFlowManager:
             checkout = self.payment_gateway.create_preference(
                 job=job,
                 external_reference=external_reference,
-                title=f"Conversão Pro - {source_name}",
+                title=(
+                    f"Análise de planta + editor - {source_name}"
+                    if low_cost_job else f"Conversão Pro - {source_name}"
+                ),
                 amount=(state.get("quote") or {}).get("customer_price"),
+                expires_at=(state.get("retention") or {}).get("files_delete_after")
+                if state.get("first_preview") else None,
             )
             state["payment"] = {
                 "mode": "mercado-pago",
@@ -834,12 +1043,28 @@ class AstraLocalFlowManager:
                     state["stage"] = "payment_review_required"
                     self._write(state)
                     return job
+                if (
+                    state.get("first_preview") and state.get("status") == "completed"
+                    and not self._preview_result_present(state)
+                ):
+                    current["status"] = "review_required"
+                    current["delivery_issue"] = "preview_result_unavailable"
+                    state["payment"] = current
+                    state["stage"] = "payment_review_required"
+                    self._write(state)
+                    return job
                 current.update({
                     "status": "approved",
                     "confirmed": True,
                     "confirmed_at": current.get("confirmed_at") or _now(),
                 })
                 state["payment"] = current
+                if state.get("first_preview") and state.get("status") == "completed":
+                    retention = state.setdefault("retention", {})
+                    retention["files_delete_after"] = (
+                        datetime.now(timezone.utc)
+                        + timedelta(days=max(1, int(retention.get("file_days") or 30)))
+                    ).isoformat()
                 if state.get("status") == "awaiting_payment":
                     owner_id = str((state.get("owner") or {}).get("id") or "")
                     blocked = self._active_for_owner(owner_id, exclude_job=job)
@@ -854,7 +1079,10 @@ class AstraLocalFlowManager:
                 else:
                     self._write(state)
                 return job
-            if state.get("status") == "awaiting_payment":
+            if state.get("status") == "awaiting_payment" or (
+                state.get("first_preview") and state.get("status") == "completed"
+                and current.get("status") != "approved"
+            ):
                 if provider_status in {"pending", "in_process", "authorized"}:
                     current["status"] = "pending"
                     state["stage"] = "payment_pending"
@@ -869,7 +1097,10 @@ class AstraLocalFlowManager:
         """Reconcile a local checkout by querying Mercado Pago server-to-server."""
         with self._lock:
             state = self._authorized(job, token)
-            if state.get("status") != "awaiting_payment":
+            if state.get("status") != "awaiting_payment" and not (
+                state.get("first_preview") and state.get("status") == "completed"
+                and (state.get("payment") or {}).get("status") != "approved"
+            ):
                 if (
                     state.get("status") == "queued"
                     and self.dispatcher is not None
@@ -903,7 +1134,7 @@ class AstraLocalFlowManager:
         return self._apply_provider_payment(payment) is not None
 
     def retry(self, job: str, token: str) -> dict[str, Any]:
-        """Retry a failed paid conversion without charging the customer again."""
+        """Retry a failed paid conversion or one introductory preview attempt."""
         if not os.environ.get("OPENAI_API_KEY"):
             raise RuntimeError("O processamento ainda não está configurado no servidor.")
         with self._lock:
@@ -912,7 +1143,9 @@ class AstraLocalFlowManager:
                 return self.public_status(job, token, include_result=True)
             if state.get("status") != "failed":
                 raise ValueError("Esta tarefa não está disponível para nova tentativa.")
-            if (state.get("payment") or {}).get("status") != "approved":
+            if (state.get("payment") or {}).get("status") != "approved" and not (
+                state.get("first_preview") and int(state.get("retry_count") or 0) < 1
+            ):
                 raise ValueError("O pagamento desta tarefa ainda não foi aprovado.")
             self.assert_owner_idle(
                 str((state.get("owner") or {}).get("id") or ""),
@@ -971,7 +1204,7 @@ class AstraLocalFlowManager:
             state = self._read(job)
             if state.get("status") == "completed":
                 return state
-            if (state.get("payment") or {}).get("status") != "approved":
+            if (state.get("payment") or {}).get("status") != "approved" and not state.get("first_preview"):
                 raise PermissionError("A tarefa ainda não possui pagamento aprovado.")
             if state.get("status") not in {"queued", "running"}:
                 raise ValueError("A tarefa não está disponível para processamento.")
@@ -990,6 +1223,7 @@ class AstraLocalFlowManager:
             with self._lock:
                 state = self._read(job)
                 owner_id = str((state.get("owner") or {}).get("id") or "")
+                low_cost_job = state.get("processing_mode") == "sol-low-review"
                 if state.get("status") == "completed":
                     return True
                 if self.job_store is not None:
@@ -1004,13 +1238,16 @@ class AstraLocalFlowManager:
                 })
                 self._write(state)
             source = state.get("source") or {}
-            stage = self._stage_factory()
+            stage = (self._sol_stage_factory if low_cost_job else self._stage_factory)()
             api_started = time.perf_counter()
             editor_model, analysis, metadata = stage.analyze(
                 Path(str(source.get("image_path") or "")),
                 canvas_width_m=float(source.get("canvas_width_m") or 0),
                 original_name=str(source.get("original_name") or "planta.png"),
                 user_message=(
+                    "Revise os candidatos geométricos do detector pela planta, "
+                    "corrija-os e acrescente elementos ausentes. Não gere IFC."
+                    if low_cost_job else
                     "Crie diretamente toda a geometria editável desta planta. "
                     "Não use detector heurístico e não gere IFC."
                 ),
@@ -1019,16 +1256,17 @@ class AstraLocalFlowManager:
             returned_model = str(
                 metadata.get("model") or analysis.get("_model") or ""
             )
-            if not returned_model.startswith(ASTRA_MODEL):
+            expected_model = "gpt-6-sol" if low_cost_job else ASTRA_MODEL
+            if not returned_model.startswith(expected_model):
                 raise RuntimeError(
-                    f"Era esperado {ASTRA_MODEL}, mas a API devolveu "
+                    f"Era esperado {expected_model}, mas a API devolveu "
                     f"{returned_model or 'modelo desconhecido'}."
                 )
             self._update(job, stage="validating_astra_model", progress=88)
             if not editor_model.get("paredes"):
-                raise RuntimeError("O modelo Astra não contém paredes editáveis.")
+                raise RuntimeError("O modelo gerado não contém paredes editáveis.")
             editor_model["job"] = job
-            editor_model["engine"] = DIRECT_PIPELINE_VERSION
+            editor_model["engine"] = "sol-low-review-local-v1" if low_cost_job else DIRECT_PIPELINE_VERSION
             editor_model["archive_consent"] = bool(
                 source.get("archive_consent")
             )
@@ -1046,6 +1284,11 @@ class AstraLocalFlowManager:
                     job, editor_model, analysis
                 )
             usage = metadata.get("usage") or {}
+            if low_cost_job:
+                from .sol_low_review_stage import estimate_sol_cost
+                cost = estimate_sol_cost(usage)
+            else:
+                cost = estimate_astra_cost(usage)
             astra_editor = editor_model.get("astra_editor") or {}
             self._update(
                 job,
@@ -1058,8 +1301,8 @@ class AstraLocalFlowManager:
                 **durable_results,
                 semantic={
                     "model": returned_model,
-                    "geometry_source": "astra-only",
-                    "heuristic_detector_used": False,
+                    "geometry_source": "sol-low+detector" if low_cost_job else "astra-only",
+                    "heuristic_detector_used": low_cost_job,
                     "needs_human_review": bool(
                         astra_editor.get("needs_human_review")
                     ),
@@ -1078,7 +1321,7 @@ class AstraLocalFlowManager:
                     "reasoning_effort": metadata.get("reasoning_effort"),
                     "image_count": metadata.get("image_count"),
                     "usage": usage,
-                    "cost": estimate_astra_cost(usage),
+                    "cost": cost,
                 },
                 total_seconds=round(time.perf_counter() - started, 3),
                 ifc_generated=False,
